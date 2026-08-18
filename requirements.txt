@@ -1,0 +1,5 @@
+aiogram==3.13.1
+FunPayAPI==0.1.17.12
+sqlalchemy==2.0.32
+asyncpg==0.29.0
+pysocks==1.7.1
