@@ -1,4 +1,5 @@
 import threading
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -8,14 +9,20 @@ from bot import (
     format_chat_history,
     format_money,
     format_order,
+    format_sales_stats,
     load_detailed_balance,
     load_full_chat,
+    load_sales_stats,
+    main_keyboard,
     normalize_proxy,
+    normalize_review_reply,
     proxy_dict,
     proxy_label,
     render_template,
+    within_work_hours,
 )
 from FunPayAPI import Runner, types
+from plugin_system import CardinalBotFacade, PluginManager, PluginValidationError
 
 
 @pytest.mark.parametrize(
@@ -65,6 +72,23 @@ def test_message_variables_are_rendered():
     assert "123" in result
     assert "Seller" in result
     assert "$" not in result
+
+
+def test_review_variables_are_rendered():
+    review = SimpleNamespace(stars=4, text="Хорошо", reply="")
+    order = SimpleNamespace(
+        id="ABCD1234",
+        buyer_username="Buyer",
+        chat_id=10,
+        title="Lot",
+        review=review,
+    )
+    result = render_template(
+        "$username: $stars/5 — $review_text — $order_title",
+        order=order,
+        review=review,
+    )
+    assert result == "Buyer: 4/5 — Хорошо — Lot"
 
 
 def test_chat_history_is_escaped_and_split_into_valid_sized_chunks():
@@ -136,6 +160,136 @@ def test_order_card_omits_delivery_secrets():
     assert "1 200.5" in card
     assert "&lt;Buyer&gt;" in card
     assert "DO-NOT-SHOW" not in card
+
+
+def test_sales_statistics_uses_selected_period_and_closed_revenue():
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    orders = [
+        SimpleNamespace(
+            date=now - timedelta(days=1),
+            buyer_id=1,
+            currency=types.Currency.RUB,
+            status=types.OrderStatuses.CLOSED,
+            price=100,
+            description="Lot A",
+        ),
+        SimpleNamespace(
+            date=now - timedelta(days=2),
+            buyer_id=2,
+            currency=types.Currency.RUB,
+            status=types.OrderStatuses.REFUNDED,
+            price=50,
+            description="Lot B",
+        ),
+        SimpleNamespace(
+            date=now - timedelta(days=40),
+            buyer_id=3,
+            currency=types.Currency.RUB,
+            status=types.OrderStatuses.CLOSED,
+            price=999,
+            description="Old lot",
+        ),
+    ]
+
+    class Account:
+        def get_sales(self, **_kwargs):
+            return None, orders, "ru", {}
+
+    stats = load_sales_stats(Account(), 30)
+    assert stats.total == 2
+    assert stats.closed == 1
+    assert stats.refunded == 1
+    assert stats.revenue["₽"] == 100
+    assert "Lot A" in format_sales_stats(stats)
+
+
+def test_autoreply_schedule_and_review_limits():
+    assert within_work_hours(9, 22, 12)
+    assert not within_work_hours(9, 22, 23)
+    assert within_work_hours(22, 7, 2)
+    assert len(normalize_review_reply("x" * 1200)) == 999
+    assert normalize_review_reply("\n".join(str(i) for i in range(20))).count("\n") == 9
+
+
+def test_main_menu_has_no_direct_message_or_image_buttons():
+    callbacks = {
+        button.callback_data
+        for row in main_keyboard().inline_keyboard
+        for button in row
+    }
+    assert "send_message" not in callbacks
+    assert "images" not in callbacks
+    assert "plugins" in callbacks
+
+
+def test_cardinal_plugin_contract_is_loaded(tmp_path):
+    source = '''
+from cardinal import get_cardinal
+from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
+NAME = "Test"
+VERSION = "1.0"
+DESCRIPTION = "Plugin"
+CREDITS = "Tester"
+SETTINGS_PAGE = False
+UUID = "12345678-1234-4234-9234-123456789abc"
+BIND_TO_DELETE = None
+def on_message(cardinal, event):
+    return None
+BIND_TO_NEW_MESSAGE = [on_message]
+'''
+    manager = PluginManager(SimpleNamespace(), SimpleNamespace())
+    manager.root = tmp_path
+    plugin = manager._load_module(1, "test.py", source, True)
+    assert plugin.name == "Test"
+    assert len(plugin.hooks["BIND_TO_NEW_MESSAGE"]) == 1
+    with pytest.raises(PluginValidationError):
+        manager._load_module(1, "bad.txt", source, True)
+
+
+def test_cardinal_telegram_handler_bridge_dispatches_commands():
+    facade = CardinalBotFacade(SimpleNamespace(), SimpleNamespace())
+    received = []
+    facade.register_message_handler(lambda message: received.append(message.text), commands=["hello"])
+    source = SimpleNamespace(
+        message_id=1,
+        chat=SimpleNamespace(id=1),
+        from_user=SimpleNamespace(id=1),
+        text="/hello world",
+        caption=None,
+        document=None,
+        photo=None,
+    )
+    assert facade.dispatch_message(source)
+    assert received == ["/hello world"]
+
+
+def test_cardinal_telegram_handlers_follow_plugin_state():
+    uuid = "12345678-1234-4234-9234-123456789abc"
+    enabled = {uuid: False}
+    facade = CardinalBotFacade(
+        SimpleNamespace(),
+        SimpleNamespace(),
+        enabled_checker=lambda value: enabled.get(value, False),
+    )
+    facade.current_plugin_uuid = uuid
+    received = []
+    facade.register_message_handler(lambda message: received.append(message.text))
+    source = SimpleNamespace(
+        message_id=1,
+        chat=SimpleNamespace(id=1),
+        from_user=SimpleNamespace(id=1),
+        text="test",
+        caption=None,
+        document=None,
+        photo=None,
+    )
+
+    assert not facade.dispatch_message(source)
+    enabled[uuid] = True
+    assert facade.dispatch_message(source)
+    assert received == ["test"]
+    facade.unregister_plugin(uuid)
+    assert not facade.dispatch_message(source)
 
 
 class FakeAccount:

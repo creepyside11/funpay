@@ -8,8 +8,9 @@ import logging
 import os
 import re
 import threading
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from typing import Any
 from urllib.parse import urlsplit
@@ -33,6 +34,7 @@ from cryptography.fernet import Fernet, InvalidToken
 
 from FunPayAPI import Account, Runner, events, types
 from FunPayAPI import exceptions as fp_exceptions
+from plugin_system import PluginData, PluginManager, PluginValidationError
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -105,6 +107,17 @@ class Database:
                 keep_online_enabled BOOLEAN NOT NULL DEFAULT TRUE,
                 autoreply_enabled BOOLEAN NOT NULL DEFAULT FALSE,
                 autoreply_text TEXT NOT NULL DEFAULT 'Здравствуйте! Спасибо за сообщение. Скоро отвечу.',
+                autoreply_cooldown_minutes INTEGER NOT NULL DEFAULT 30,
+                autoreply_delay_seconds INTEGER NOT NULL DEFAULT 0,
+                autoreply_new_chats_only BOOLEAN NOT NULL DEFAULT FALSE,
+                autoreply_work_start SMALLINT NOT NULL DEFAULT 0,
+                autoreply_work_end SMALLINT NOT NULL DEFAULT 24,
+                review_reply_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+                review_reply_1 TEXT NOT NULL DEFAULT 'Спасибо за обратную связь. Мы разберёмся в ситуации.',
+                review_reply_2 TEXT NOT NULL DEFAULT 'Спасибо за отзыв. Нам жаль, что заказ вас разочаровал.',
+                review_reply_3 TEXT NOT NULL DEFAULT 'Спасибо за отзыв! Учтём ваши замечания.',
+                review_reply_4 TEXT NOT NULL DEFAULT 'Спасибо за хорошую оценку и ваш заказ!',
+                review_reply_5 TEXT NOT NULL DEFAULT 'Спасибо за отличную оценку! Будем рады видеть вас снова.',
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
@@ -114,12 +127,38 @@ class Database:
             ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS notify_system BOOLEAN NOT NULL DEFAULT TRUE;
             ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS auto_raise_enabled BOOLEAN NOT NULL DEFAULT FALSE;
             ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS keep_online_enabled BOOLEAN NOT NULL DEFAULT TRUE;
+            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS autoreply_cooldown_minutes INTEGER NOT NULL DEFAULT 30;
+            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS autoreply_delay_seconds INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS autoreply_new_chats_only BOOLEAN NOT NULL DEFAULT FALSE;
+            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS autoreply_work_start SMALLINT NOT NULL DEFAULT 0;
+            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS autoreply_work_end SMALLINT NOT NULL DEFAULT 24;
+            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS review_reply_enabled BOOLEAN NOT NULL DEFAULT FALSE;
+            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS review_reply_1 TEXT NOT NULL DEFAULT 'Спасибо за обратную связь. Мы разберёмся в ситуации.';
+            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS review_reply_2 TEXT NOT NULL DEFAULT 'Спасибо за отзыв. Нам жаль, что заказ вас разочаровал.';
+            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS review_reply_3 TEXT NOT NULL DEFAULT 'Спасибо за отзыв! Учтём ваши замечания.';
+            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS review_reply_4 TEXT NOT NULL DEFAULT 'Спасибо за хорошую оценку и ваш заказ!';
+            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS review_reply_5 TEXT NOT NULL DEFAULT 'Спасибо за отличную оценку! Будем рады видеть вас снова.';
 
             CREATE TABLE IF NOT EXISTS funpay_autoreply_log (
                 telegram_id BIGINT NOT NULL REFERENCES funpay_users(telegram_id) ON DELETE CASCADE,
                 chat_id TEXT NOT NULL,
                 last_sent TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 PRIMARY KEY (telegram_id, chat_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS funpay_plugins (
+                telegram_id BIGINT NOT NULL REFERENCES funpay_users(telegram_id) ON DELETE CASCADE,
+                uuid TEXT NOT NULL,
+                filename TEXT NOT NULL,
+                name TEXT NOT NULL,
+                version TEXT NOT NULL,
+                description TEXT NOT NULL,
+                credits TEXT NOT NULL,
+                settings_page BOOLEAN NOT NULL DEFAULT FALSE,
+                source TEXT NOT NULL,
+                enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                uploaded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (telegram_id, uuid)
             );
             """
         )
@@ -196,6 +235,8 @@ class Database:
             "auto_raise_enabled",
             "keep_online_enabled",
             "autoreply_enabled",
+            "autoreply_new_chats_only",
+            "review_reply_enabled",
         }
         if column not in allowed:
             raise ValueError("Недопустимая настройка")
@@ -212,20 +253,108 @@ class Database:
             text,
         )
 
-    async def claim_autoreply(self, telegram_id: int, chat_id: str) -> bool:
+    async def set_integer_setting(self, telegram_id: int, column: str, value: int) -> None:
+        allowed = {
+            "autoreply_cooldown_minutes": (0, 1440),
+            "autoreply_delay_seconds": (0, 300),
+            "autoreply_work_start": (0, 23),
+            "autoreply_work_end": (1, 24),
+        }
+        if column not in allowed or not allowed[column][0] <= value <= allowed[column][1]:
+            raise ValueError("Недопустимое значение настройки")
+        await self.execute(
+            f"UPDATE funpay_users SET {column}=$2, updated_at=NOW() WHERE telegram_id=$1",
+            telegram_id,
+            value,
+        )
+
+    async def set_review_reply(self, telegram_id: int, stars: int, text: str) -> None:
+        if stars not in range(1, 6):
+            raise ValueError("Оценка должна быть от 1 до 5")
+        await self.execute(
+            f"UPDATE funpay_users SET review_reply_{stars}=$2, updated_at=NOW() WHERE telegram_id=$1",
+            telegram_id,
+            text,
+        )
+
+    async def claim_autoreply(
+        self,
+        telegram_id: int,
+        chat_id: str,
+        cooldown_minutes: int = 30,
+        first_only: bool = False,
+    ) -> bool:
+        if first_only:
+            row = await self.fetchrow(
+                """
+                INSERT INTO funpay_autoreply_log (telegram_id, chat_id, last_sent)
+                VALUES ($1, $2, NOW())
+                ON CONFLICT DO NOTHING
+                RETURNING telegram_id
+                """,
+                telegram_id,
+                chat_id,
+            )
+            return row is not None
         row = await self.fetchrow(
             """
             INSERT INTO funpay_autoreply_log (telegram_id, chat_id, last_sent)
             VALUES ($1, $2, NOW())
             ON CONFLICT (telegram_id, chat_id) DO UPDATE
                SET last_sent=NOW()
-             WHERE funpay_autoreply_log.last_sent < NOW() - INTERVAL '30 minutes'
+             WHERE funpay_autoreply_log.last_sent < NOW() - make_interval(mins => $3)
             RETURNING telegram_id
             """,
             telegram_id,
             chat_id,
+            cooldown_minutes,
         )
         return row is not None
+
+    async def list_plugins(self, telegram_id: int) -> list[asyncpg.Record]:
+        return await self.fetch(
+            "SELECT * FROM funpay_plugins WHERE telegram_id=$1 ORDER BY uploaded_at, name",
+            telegram_id,
+        )
+
+    async def upsert_plugin(self, telegram_id: int, plugin: PluginData, source: str) -> None:
+        await self.execute(
+            """
+            INSERT INTO funpay_plugins
+                (telegram_id, uuid, filename, name, version, description, credits,
+                 settings_page, source, enabled, uploaded_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, TRUE, NOW())
+            ON CONFLICT (telegram_id, uuid) DO UPDATE
+                SET filename=EXCLUDED.filename, name=EXCLUDED.name, version=EXCLUDED.version,
+                    description=EXCLUDED.description, credits=EXCLUDED.credits,
+                    settings_page=EXCLUDED.settings_page, source=EXCLUDED.source,
+                    enabled=TRUE, uploaded_at=NOW()
+            """,
+            telegram_id,
+            plugin.uuid,
+            plugin.filename,
+            plugin.name,
+            plugin.version,
+            plugin.description,
+            plugin.credits,
+            plugin.settings_page,
+            source,
+        )
+
+    async def set_plugin_enabled(self, telegram_id: int, uuid: str, enabled: bool) -> None:
+        await self.execute(
+            "UPDATE funpay_plugins SET enabled=$3 WHERE telegram_id=$1 AND uuid=$2",
+            telegram_id,
+            uuid,
+            enabled,
+        )
+
+    async def delete_plugin(self, telegram_id: int, uuid: str) -> None:
+        await self.execute(
+            "DELETE FROM funpay_plugins WHERE telegram_id=$1 AND uuid=$2",
+            telegram_id,
+            uuid,
+        )
 
     async def active_users(self) -> list[asyncpg.Record]:
         return await self.fetch(
@@ -271,6 +400,7 @@ def render_template(
     *,
     message: Any | None = None,
     order: Any | None = None,
+    review: Any | None = None,
     account: Account | None = None,
     chat_id: int | str | None = None,
     chat_name: str | None = None,
@@ -287,6 +417,11 @@ def render_template(
     if order is not None:
         username = order.buyer_username or username
         chat_id = order.chat_id if chat_id is None else chat_id
+    if review is None and order is not None:
+        review = getattr(order, "review", None)
+    order_title = ""
+    if order is not None:
+        order_title = getattr(order, "title", None) or getattr(order, "description", None) or ""
     variables = {
         "$full_date": now.strftime("%d.%m.%Y"),
         "$date": now.strftime("%d.%m.%Y"),
@@ -300,7 +435,11 @@ def render_template(
         "$account_id": str(account.id if account else ""),
         "$order_id": str(order.id if order else ""),
         "$order_link": f"https://funpay.com/orders/{order.id}/" if order else "",
-        "$order_title": str(order.description if order else ""),
+        "$order_title": str(order_title),
+        "$stars": str(getattr(review, "stars", "") or ""),
+        "$rating": str(getattr(review, "stars", "") or ""),
+        "$review_text": str(getattr(review, "text", "") or ""),
+        "$review_reply": str(getattr(review, "reply", "") or ""),
     }
     for variable in sorted(variables, key=len, reverse=True):
         text = text.replace(variable, variables[variable])
@@ -309,6 +448,106 @@ def render_template(
 
 def format_money(value: float) -> str:
     return f"{value:,.2f}".replace(",", " ").rstrip("0").rstrip(".")
+
+
+def within_work_hours(start: int, end: int, hour: int) -> bool:
+    if start == 0 and end == 24:
+        return True
+    if start < end:
+        return start <= hour < end
+    return hour >= start or hour < end
+
+
+def extract_order_id(value: Any) -> str | None:
+    match = re.search(r"#([A-Za-z0-9_-]{4,40})", str(value or ""))
+    return match.group(1) if match else None
+
+
+def normalize_review_reply(value: str) -> str:
+    lines = value.strip().splitlines()[:10]
+    return "\n".join(lines)[:999].strip()
+
+
+@dataclass
+class SalesStats:
+    days: int | None
+    total: int = 0
+    closed: int = 0
+    paid: int = 0
+    refunded: int = 0
+    buyers: set[int] = field(default_factory=set)
+    revenue: dict[str, float] = field(default_factory=lambda: defaultdict(float))
+    refunded_sum: dict[str, float] = field(default_factory=lambda: defaultdict(float))
+    lot_counts: Counter[str] = field(default_factory=Counter)
+    truncated: bool = False
+
+
+def load_sales_stats(account: Account, days: int | None, max_pages: int = 200) -> SalesStats:
+    """Собирает статистику продаж, проходя страницы заказов до начала периода."""
+    moscow_now = datetime.now(timezone(timedelta(hours=3))).replace(tzinfo=None)
+    since = moscow_now - timedelta(days=days) if days else None
+    stats = SalesStats(days)
+    cursor = None
+    locale = None
+    subcategories = None
+    for _ in range(max_pages):
+        cursor, orders, locale, subcategories = account.get_sales(
+            start_from=cursor,
+            locale=locale,
+            subcategories=subcategories,
+        )
+        reached_period_start = False
+        for order in orders:
+            if since and order.date < since:
+                reached_period_start = True
+                continue
+            stats.total += 1
+            stats.buyers.add(order.buyer_id)
+            currency = str(order.currency)
+            if order.status is types.OrderStatuses.CLOSED:
+                stats.closed += 1
+                stats.revenue[currency] += order.price
+                stats.lot_counts[clipped(order.description, 120)] += 1
+            elif order.status is types.OrderStatuses.PAID:
+                stats.paid += 1
+            elif order.status in {
+                types.OrderStatuses.REFUNDED,
+                types.OrderStatuses.PARTIALLY_REFUNDED,
+            }:
+                stats.refunded += 1
+                stats.refunded_sum[currency] += order.price
+        if reached_period_start or not cursor:
+            break
+    else:
+        stats.truncated = bool(cursor)
+    return stats
+
+
+def format_sales_stats(stats: SalesStats) -> str:
+    period = "за всё время" if stats.days is None else f"за {stats.days} дн."
+    revenue = ", ".join(
+        f"{format_money(value)} {html.escape(currency)}"
+        for currency, value in sorted(stats.revenue.items())
+    ) or "0"
+    refunds = ", ".join(
+        f"{format_money(value)} {html.escape(currency)}"
+        for currency, value in sorted(stats.refunded_sum.items())
+    ) or "0"
+    top = "\n".join(
+        f"{index}. {html.escape(title)} — <b>{count}</b>"
+        for index, (title, count) in enumerate(stats.lot_counts.most_common(3), 1)
+    ) or "нет закрытых заказов"
+    note = "\n\n⚠️ Достигнут лимит 200 страниц заказов." if stats.truncated else ""
+    return (
+        f"📊 <b>Статистика {period}</b>\n\n"
+        f"Всего заказов: <b>{stats.total}</b>\n"
+        f"Закрыто: <b>{stats.closed}</b>\n"
+        f"Ожидают выполнения: <b>{stats.paid}</b>\n"
+        f"Возвратов: <b>{stats.refunded}</b> на {refunds}\n"
+        f"Уникальных покупателей: <b>{len(stats.buyers)}</b>\n"
+        f"Выручка по закрытым: <b>{revenue}</b>\n\n"
+        f"🏆 <b>Популярные лоты</b>\n{top}{note}"
+    )
 
 
 def order_status_label(status: types.OrderStatuses) -> str:
@@ -437,8 +676,10 @@ class AccountRuntime:
     account: Account
     runner: Runner
     keep_online_enabled: bool = True
+    auto_raise_enabled: bool = False
     stop_event: threading.Event = field(default_factory=threading.Event)
     tasks: list[asyncio.Task[Any]] = field(default_factory=list)
+    background_tasks: set[asyncio.Task[Any]] = field(default_factory=set)
     raise_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     last_raise_at: datetime | None = None
     next_raise_at: float = 0
@@ -453,6 +694,7 @@ class RuntimeManager:
         self.secrets = secrets
         self.runtimes: dict[int, AccountRuntime] = {}
         self.loop: asyncio.AbstractEventLoop | None = None
+        self.plugins = PluginManager(db, bot)
 
     async def start_saved(self) -> None:
         self.loop = asyncio.get_running_loop()
@@ -499,8 +741,10 @@ class RuntimeManager:
             account,
             runner,
             keep_online_enabled=bool(row["keep_online_enabled"]),
+            auto_raise_enabled=bool(row["auto_raise_enabled"]),
         )
         self.runtimes[telegram_id] = runtime
+        await self.plugins.load_runtime(telegram_id, runtime)
         runtime.tasks = [
             asyncio.create_task(asyncio.to_thread(runner.loop, runtime.stop_event)),
             asyncio.create_task(asyncio.to_thread(self._listen, runtime)),
@@ -547,27 +791,44 @@ class RuntimeManager:
             raise RuntimeError("FunPay Runner не запущен")
         async with runtime.raise_lock:
             profile = await asyncio.to_thread(runtime.account.get_user, runtime.account.id)
-            categories: dict[int, str] = {}
+            categories: dict[int, Any] = {}
             for subcategory in profile.get_sorted_lots(2):
                 if subcategory.type is types.SubCategoryTypes.COMMON:
-                    categories[subcategory.category.id] = subcategory.category.name
+                    categories[subcategory.category.id] = subcategory.category
             if not categories:
                 raise RuntimeError("В профиле нет обычных лотов для поднятия")
 
             results: list[str] = []
             waits: list[int] = []
             now = asyncio.get_running_loop().time()
-            for category_id, category_name in categories.items():
+            plugin_runtime = self.plugins.runtimes.get(telegram_id)
+            for category_id, category in categories.items():
+                category_name = category.name
                 scheduled = runtime.raise_schedule.get(category_id, 0)
                 if not force and scheduled > now:
                     waits.append(max(int(scheduled - now), 1))
                     continue
                 try:
+                    if plugin_runtime:
+                        await self.plugins.dispatch(
+                            telegram_id,
+                            "BIND_TO_PRE_LOTS_RAISE",
+                            plugin_runtime.adapter,
+                            category,
+                        )
                     wait = await asyncio.to_thread(runtime.account.raise_lots, category_id)
                     wait = max(int(wait or 3600), 60)
                     waits.append(wait)
                     runtime.raise_schedule[category_id] = now + wait
                     results.append(f"✅ {category_name}")
+                    if plugin_runtime:
+                        await self.plugins.dispatch(
+                            telegram_id,
+                            "BIND_TO_POST_LOTS_RAISE",
+                            plugin_runtime.adapter,
+                            category,
+                            f"Подождите {wait} сек.",
+                        )
                 except fp_exceptions.RaiseError as exc:
                     wait = int(exc.wait_time or 3600)
                     wait = max(wait, 60)
@@ -597,9 +858,19 @@ class RuntimeManager:
         runtime = self.runtimes.pop(telegram_id, None)
         if not runtime:
             return
+        await self.plugins.stop_runtime(telegram_id)
         runtime.stop_event.set()
+        for task in runtime.background_tasks:
+            task.cancel()
         try:
-            await asyncio.wait_for(asyncio.gather(*runtime.tasks, return_exceptions=True), timeout=12)
+            await asyncio.wait_for(
+                asyncio.gather(
+                    *runtime.tasks,
+                    *runtime.background_tasks,
+                    return_exceptions=True,
+                ),
+                timeout=12,
+            )
         except TimeoutError:
             logger.warning("Не все задачи runtime %s завершились вовремя", telegram_id)
 
@@ -616,10 +887,106 @@ class RuntimeManager:
         except Exception:
             logger.exception("Не удалось отправить Telegram-уведомление пользователю %s", telegram_id)
 
+    async def _send_autoreply(
+        self, runtime: AccountRuntime, message: Any, row: asyncpg.Record
+    ) -> None:
+        delay = int(row["autoreply_delay_seconds"])
+        if delay:
+            await asyncio.sleep(delay)
+        if self.get(runtime.telegram_id) is not runtime or runtime.stop_event.is_set():
+            return
+        try:
+            await asyncio.to_thread(
+                runtime.account.send_message,
+                message.chat_id,
+                render_template(
+                    row["autoreply_text"],
+                    message=message,
+                    account=runtime.account,
+                ),
+                message.chat_name,
+            )
+        except Exception:
+            logger.exception("Автоответ не отправлен в чат %s", message.chat_id)
+            if row["notify_system"]:
+                await self.safe_notify(
+                    runtime.telegram_id,
+                    f"⚠️ Не удалось отправить автоответ в чат <code>{message.chat_id}</code>.",
+                )
+
+    async def _process_review(
+        self, runtime: AccountRuntime, message: Any, row: asyncpg.Record
+    ) -> None:
+        order_id = extract_order_id(message)
+        order = None
+        if order_id:
+            try:
+                order = await asyncio.to_thread(runtime.account.get_order, order_id)
+            except Exception:
+                logger.exception("Не удалось получить заказ для отзыва %s", order_id)
+        review = getattr(order, "review", None)
+        title = (
+            getattr(order, "title", None)
+            or getattr(order, "description", None)
+            or "не удалось определить"
+        )
+        stars = int(getattr(review, "stars", 0) or 0)
+        comment = getattr(review, "text", None) or "без комментария"
+        reply_text = None
+        if (
+            order
+            and review
+            and stars in range(1, 6)
+            and order.seller_id == runtime.account.id
+            and row["review_reply_enabled"]
+        ):
+            template = row[f"review_reply_{stars}"]
+            reply_text = normalize_review_reply(
+                render_template(
+                    template,
+                    order=order,
+                    review=review,
+                    account=runtime.account,
+                )
+            )
+            if reply_text:
+                try:
+                    await asyncio.to_thread(
+                        runtime.account.send_review, order.id, reply_text
+                    )
+                except Exception:
+                    logger.exception("Не удалось ответить на отзыв заказа %s", order.id)
+                    reply_text = None
+
+        if row["notify_reviews"]:
+            rating = f"{'⭐' * stars} ({stars}/5)" if stars else "удалён или не определён"
+            text = (
+                "⭐ <b>Отзыв о заказе</b>\n"
+                f"Заказ: <code>{html.escape(order_id or '—')}</code>\n"
+                f"Лот: {html.escape(clipped(title, 900))}\n"
+                f"Оценка: <b>{rating}</b>\n"
+                f"Комментарий: <blockquote>{html.escape(clipped(comment, 1500))}</blockquote>"
+            )
+            if reply_text:
+                text += f"\n🤖 Ответ отправлен: <i>{html.escape(reply_text)}</i>"
+            buttons = []
+            if order_id:
+                buttons.append(
+                    [("📦 Заказ", f"order_view:{order_id}"), ("✍️ Ответить", f"review_manual:{order_id}")]
+                )
+            if str(message.chat_id).isdigit():
+                buttons.append([("💬 Открыть чат", f"chat_full:{message.chat_id}:0")])
+            await self.safe_notify(
+                runtime.telegram_id,
+                text,
+                reply_markup=keyboard(buttons) if buttons else None,
+            )
+
     async def handle_event(self, runtime: AccountRuntime, event: Any) -> None:
         row = await self.db.get_user(runtime.telegram_id)
         if not row or not row["account_active"]:
             return
+        await self.plugins.dispatch_event(runtime.telegram_id, event)
         if isinstance(event, events.NewMessageEvent):
             message = event.message
             review_types = {
@@ -631,15 +998,12 @@ class RuntimeManager:
                 types.MessageTypes.FEEDBACK_ANSWER_DELETED,
             }
             if message.type in review_types:
-                if row["notify_reviews"]:
-                    await self.safe_notify(
-                        runtime.telegram_id,
-                        "⭐ <b>Новый или изменённый отзыв</b>\n"
-                        f"{html.escape(clipped(message.text or 'Откройте чат для подробностей', 1400))}",
-                        reply_markup=keyboard([
-                            [("💬 Открыть чат", f"chat_full:{message.chat_id}:0")],
-                        ]),
-                    )
+                if message.type in {
+                    types.MessageTypes.NEW_FEEDBACK,
+                    types.MessageTypes.FEEDBACK_CHANGED,
+                    types.MessageTypes.FEEDBACK_DELETED,
+                }:
+                    await self._process_review(runtime, message, row)
                 return
             incoming = (
                 message.author_id not in {0, runtime.account.id}
@@ -664,22 +1028,22 @@ class RuntimeManager:
                         [InlineKeyboardButton(text="🌐 FunPay", url=f"https://funpay.com/chat/?node={chat_id}")],
                     ]),
                 )
-            if row["autoreply_enabled"] and await self.db.claim_autoreply(runtime.telegram_id, chat_id):
-                try:
-                    await asyncio.to_thread(
-                        runtime.account.send_message,
-                        message.chat_id,
-                        render_template(
-                            row["autoreply_text"],
-                            message=message,
-                            account=runtime.account,
-                        ),
-                        message.chat_name,
-                    )
-                except Exception:
-                    logger.exception("Автоответ не отправлен в чат %s", chat_id)
-                    if row["notify_system"]:
-                        await self.safe_notify(runtime.telegram_id, f"⚠️ Не удалось отправить автоответ в чат <code>{chat_id}</code>.")
+            hour = datetime.now().astimezone().hour
+            if (
+                row["autoreply_enabled"]
+                and within_work_hours(
+                    row["autoreply_work_start"], row["autoreply_work_end"], hour
+                )
+                and await self.db.claim_autoreply(
+                    runtime.telegram_id,
+                    chat_id,
+                    row["autoreply_cooldown_minutes"],
+                    row["autoreply_new_chats_only"],
+                )
+            ):
+                task = asyncio.create_task(self._send_autoreply(runtime, message, row))
+                runtime.background_tasks.add(task)
+                task.add_done_callback(runtime.background_tasks.discard)
         elif isinstance(event, events.NewOrderEvent) and row["notify_new_orders"]:
             order = event.order
             buttons = [[
@@ -708,7 +1072,8 @@ class RuntimeManager:
             await self.safe_notify(
                 runtime.telegram_id,
                 f"📦 Статус заказа <code>{html.escape(order.id)}</code>: "
-                f"<b>{html.escape(order_status_label(order.status))}</b>.",
+                f"<b>{html.escape(order_status_label(order.status))}</b>.\n"
+                f"Лот: {html.escape(clipped(order.description or '—', 1200))}",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
                     InlineKeyboardButton(text="📦 Подробности", callback_data=f"order_view:{order.id}"),
                     InlineKeyboardButton(text="🌐 FunPay", url=f"https://funpay.com/orders/{order.id}/"),
@@ -722,6 +1087,14 @@ class ConnectState(StatesGroup):
 
 
 class AutoReplyState(StatesGroup):
+    text = State()
+    cooldown = State()
+    delay = State()
+    hours = State()
+    review_text = State()
+
+
+class ReviewReplyState(StatesGroup):
     text = State()
 
 
@@ -741,6 +1114,10 @@ class OrderState(StatesGroup):
     order_id = State()
 
 
+class PluginState(StatesGroup):
+    file = State()
+
+
 def keyboard(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -754,9 +1131,9 @@ def main_keyboard() -> InlineKeyboardMarkup:
     return keyboard([
         [("👤 Подробный профиль", "profile"), ("💰 Баланс", "balance")],
         [("🔔 Уведомления", "notifications"), ("🤖 Автоответчик", "autoreply")],
-        [("💬 Последние чаты", "chats"), ("✉️ Отправить сообщение", "send_message")],
-        [("📦 Заказ по ID", "order_lookup"), ("🖼 Изображения", "images")],
-        [("🆙 Автоподнятие", "auto_raise"), ("⚙️ Аккаунт", "account")],
+        [("💬 Последние чаты", "chats"), ("📦 Заказ по ID", "order_lookup")],
+        [("🆙 Автоподнятие", "auto_raise"), ("🧩 Плагины", "plugins")],
+        [("⚙️ Аккаунт", "account")],
     ])
 
 
@@ -921,6 +1298,31 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
             logger.exception("Не удалось получить профиль")
             await callback.message.answer("❌ Не удалось загрузить профиль FunPay.")
             return
+        common_lots = [lot for lot in lots if lot.subcategory.type is types.SubCategoryTypes.COMMON]
+        currency_lots = [lot for lot in lots if lot.subcategory.type is types.SubCategoryTypes.CURRENCY]
+        auto_delivery = sum(bool(lot.auto) for lot in lots)
+        subcategories = {lot.subcategory.id for lot in lots}
+        categories = {lot.subcategory.category.id for lot in lots}
+        buttons = [
+            [InlineKeyboardButton(text="📊 Статистика", callback_data="statistics")],
+            [
+                InlineKeyboardButton(text="🔄 Обновить", callback_data="profile"),
+                InlineKeyboardButton(
+                    text="🌐 Профиль FunPay",
+                    url=f"https://funpay.com/users/{profile_obj.id}/",
+                ),
+            ],
+            [InlineKeyboardButton(text="⬅️ Меню", callback_data="menu")],
+        ]
+        if profile_obj.profile_photo:
+            buttons.insert(
+                2,
+                [
+                    InlineKeyboardButton(
+                        text="🖼 Аватар профиля", url=profile_obj.profile_photo
+                    )
+                ],
+            )
         await callback.message.answer(
             "👤 <b>Подробный профиль</b>\n"
             f"Ник: <b>{html.escape(profile_obj.username)}</b>\n"
@@ -929,8 +1331,47 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
             f"Заблокирован: {'да' if profile_obj.banned else 'нет'}\n"
             f"Активных продаж: <b>{runtime.account.active_sales}</b>\n"
             f"Активных покупок: <b>{runtime.account.active_purchases}</b>\n"
-            f"Лотов в профиле: <b>{len(lots)}</b>",
-            reply_markup=keyboard([[("⬅️ Меню", "menu")]]),
+            f"Опубликовано лотов: <b>{len(lots)}</b>\n"
+            f"　Обычных: <b>{len(common_lots)}</b>\n"
+            f"　Валютных: <b>{len(currency_lots)}</b>\n"
+            f"　С автовыдачей FunPay: <b>{auto_delivery}</b>\n"
+            f"Разделов: <b>{len(subcategories)}</b> · игр: <b>{len(categories)}</b>\n"
+            f"Runner: {'🟢 работает' if manager.get(callback.from_user.id) else '🔴 остановлен'}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        )
+
+    @router.callback_query(F.data == "statistics")
+    async def statistics(callback: CallbackQuery) -> None:
+        await callback.answer()
+        await callback.message.answer(
+            "📊 <b>Период статистики продаж</b>\n"
+            "Выручка считается только по закрытым заказам.",
+            reply_markup=keyboard([
+                [("24 часа", "stats:1"), ("7 дней", "stats:7"), ("30 дней", "stats:30")],
+                [("90 дней", "stats:90"), ("Год", "stats:365"), ("Всё время", "stats:all")],
+                [("⬅️ Профиль", "profile")],
+            ]),
+        )
+
+    @router.callback_query(F.data.startswith("stats:"))
+    async def statistics_period(callback: CallbackQuery) -> None:
+        await callback.answer("Собираю заказы…")
+        runtime = await require_runtime(callback.message, callback.from_user.id)
+        if not runtime:
+            return
+        raw_period = callback.data.split(":", 1)[1]
+        days = None if raw_period == "all" else int(raw_period)
+        try:
+            stats = await asyncio.to_thread(load_sales_stats, runtime.account, days)
+        except Exception:
+            logger.exception("Не удалось собрать статистику продаж")
+            await callback.message.answer("❌ FunPay не отдал статистику продаж.")
+            return
+        await callback.message.answer(
+            format_sales_stats(stats),
+            reply_markup=keyboard([
+                [("📅 Другой период", "statistics"), ("⬅️ Профиль", "profile")],
+            ]),
         )
 
     @router.callback_query(F.data == "balance")
@@ -996,6 +1437,8 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
             "auto_raise_enabled",
             "keep_online_enabled",
             "autoreply_enabled",
+            "autoreply_new_chats_only",
+            "review_reply_enabled",
         }
         if not row or column not in allowed_columns:
             await callback.answer("Неизвестная настройка", show_alert=True)
@@ -1009,9 +1452,14 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
                 logger.exception("Не удалось применить настройку поддержания сессии")
             await show_account(callback.message, callback.from_user.id)
         elif column == "auto_raise_enabled":
+            runtime = manager.get(callback.from_user.id)
+            if runtime:
+                runtime.auto_raise_enabled = not row[column]
             await show_auto_raise(callback.message, callback.from_user.id)
-        elif column == "autoreply_enabled":
+        elif column in {"autoreply_enabled", "autoreply_new_chats_only"}:
             await show_autoreply(callback.message, callback.from_user.id)
+        elif column == "review_reply_enabled":
+            await show_review_replies(callback.message, callback.from_user.id)
         else:
             await show_notifications(callback.message, callback.from_user.id)
 
@@ -1019,11 +1467,20 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
         row = await db.get_user(user_id)
         await target.answer(
             "🤖 <b>Автоответчик</b>\n"
-            "Ответ отправляется входящему собеседнику не чаще одного раза в 30 минут.\n\n"
+            f"Рабочее время: <b>{row['autoreply_work_start']:02d}:00–{row['autoreply_work_end']:02d}:00</b> "
+            "по времени сервера\n"
+            f"Задержка перед ответом: <b>{row['autoreply_delay_seconds']} сек.</b>\n"
+            f"Повтор в одном чате: <b>{row['autoreply_cooldown_minutes']} мин.</b>\n"
+            f"Только первый контакт: {bool_icon(row['autoreply_new_chats_only'])}\n\n"
             f"Текст: <i>{html.escape(clipped(row['autoreply_text'], 1000))}</i>",
             reply_markup=keyboard([
                 [(f"{bool_icon(row['autoreply_enabled'])} Включён", "toggle:autoreply_enabled")],
                 [("✏️ Изменить текст", "autoreply_text")],
+                [("⏱ Задержка", "autoreply_delay"), ("🔁 Интервал", "autoreply_cooldown")],
+                [("🕒 Рабочее время", "autoreply_hours")],
+                [(f"{bool_icon(row['autoreply_new_chats_only'])} Только новым", "toggle:autoreply_new_chats_only")],
+                [("⭐ Ответы на отзывы", "review_replies")],
+                [("👁 Предпросмотр", "autoreply_preview")],
                 [("🧩 Доступные переменные", "variables")],
                 [("⬅️ Меню", "menu")],
             ]),
@@ -1037,8 +1494,93 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
     @router.callback_query(F.data == "autoreply_text")
     async def autoreply_text(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer()
+        await state.clear()
         await state.set_state(AutoReplyState.text)
         await callback.message.answer("Отправьте новый текст автоответа (до 1500 символов) или /cancel.")
+
+    @router.callback_query(F.data == "autoreply_cooldown")
+    async def autoreply_cooldown(callback: CallbackQuery, state: FSMContext) -> None:
+        await callback.answer()
+        await state.clear()
+        await state.set_state(AutoReplyState.cooldown)
+        await callback.message.answer(
+            "Введите интервал повторного автоответа от 0 до 1440 минут. 0 — отвечать на каждое сообщение."
+        )
+
+    @router.message(AutoReplyState.cooldown, F.text)
+    async def save_autoreply_cooldown(message: Message, state: FSMContext) -> None:
+        if not message.text.strip().isdigit() or not 0 <= int(message.text) <= 1440:
+            await message.answer("Введите целое число от 0 до 1440.")
+            return
+        await db.set_integer_setting(
+            message.from_user.id, "autoreply_cooldown_minutes", int(message.text)
+        )
+        await state.clear()
+        await show_autoreply(message, message.from_user.id)
+
+    @router.callback_query(F.data == "autoreply_delay")
+    async def autoreply_delay(callback: CallbackQuery, state: FSMContext) -> None:
+        await callback.answer()
+        await state.clear()
+        await state.set_state(AutoReplyState.delay)
+        await callback.message.answer("Введите задержку от 0 до 300 секунд перед автоответом.")
+
+    @router.message(AutoReplyState.delay, F.text)
+    async def save_autoreply_delay(message: Message, state: FSMContext) -> None:
+        if not message.text.strip().isdigit() or not 0 <= int(message.text) <= 300:
+            await message.answer("Введите целое число от 0 до 300.")
+            return
+        await db.set_integer_setting(
+            message.from_user.id, "autoreply_delay_seconds", int(message.text)
+        )
+        await state.clear()
+        await show_autoreply(message, message.from_user.id)
+
+    @router.callback_query(F.data == "autoreply_hours")
+    async def autoreply_hours(callback: CallbackQuery, state: FSMContext) -> None:
+        await callback.answer()
+        await state.clear()
+        await state.set_state(AutoReplyState.hours)
+        await callback.message.answer(
+            "Введите рабочее время в формате <code>9-22</code>. Для круглосуточной работы: <code>0-24</code>."
+        )
+
+    @router.message(AutoReplyState.hours, F.text)
+    async def save_autoreply_hours(message: Message, state: FSMContext) -> None:
+        match = re.fullmatch(r"\s*(\d{1,2})\s*[-:]\s*(\d{1,2})\s*", message.text)
+        if not match:
+            await message.answer("Используйте формат 9-22 или 0-24.")
+            return
+        start, end = map(int, match.groups())
+        if not 0 <= start <= 23 or not 1 <= end <= 24 or start == end:
+            await message.answer("Начало: 0–23, окончание: 1–24; значения не должны совпадать.")
+            return
+        await db.set_integer_setting(message.from_user.id, "autoreply_work_start", start)
+        await db.set_integer_setting(message.from_user.id, "autoreply_work_end", end)
+        await state.clear()
+        await show_autoreply(message, message.from_user.id)
+
+    @router.callback_query(F.data == "autoreply_preview")
+    async def autoreply_preview(callback: CallbackQuery) -> None:
+        await callback.answer()
+        row = await db.get_user(callback.from_user.id)
+        runtime = manager.get(callback.from_user.id)
+
+        class PreviewMessage:
+            author = "Покупатель"
+            chat_name = "Покупатель"
+            chat_id = 123456
+
+            def __str__(self) -> str:
+                return "Здравствуйте, товар в наличии?"
+
+        sample = PreviewMessage()
+        rendered = render_template(
+            row["autoreply_text"], message=sample, account=runtime.account if runtime else None
+        )
+        await callback.message.answer(
+            f"👁 <b>Предпросмотр</b>\n<blockquote>{html.escape(rendered)}</blockquote>"
+        )
 
     @router.callback_query(F.data == "variables")
     async def variables(callback: CallbackQuery) -> None:
@@ -1051,7 +1593,9 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
             "<code>$date</code>, <code>$time</code>, <code>$full_time</code> — дата и время\n"
             "<code>$account_name</code>, <code>$account_id</code> — ваш аккаунт\n"
             "<code>$order_id</code>, <code>$order_link</code>, <code>$order_title</code> — заказ.\n\n"
-            "Переменные работают в автоответчике и ручных сообщениях.",
+            "Для отзывов: <code>$stars</code>, <code>$rating</code>, "
+            "<code>$review_text</code>, <code>$review_reply</code>.\n\n"
+            "Переменные работают в автоответчике, ручных сообщениях и ответах на отзывы.",
             reply_markup=keyboard([[("⬅️ Автоответчик", "autoreply")]]),
         )
 
@@ -1065,6 +1609,52 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
         await state.clear()
         await message.answer("✅ Текст автоответа сохранён.")
         await show_autoreply(message, message.from_user.id)
+
+    async def show_review_replies(target: Message, user_id: int) -> None:
+        row = await db.get_user(user_id)
+        previews = "\n".join(
+            f"{'⭐' * stars}: <i>{html.escape(clipped(row[f'review_reply_{stars}'], 150))}</i>"
+            for stars in range(1, 6)
+        )
+        await target.answer(
+            "⭐ <b>Автоответы на отзывы</b>\n"
+            "Для каждой оценки используется отдельный шаблон. При изменении отзыва ответ обновляется.\n\n"
+            f"{previews}",
+            reply_markup=keyboard([
+                [(f"{bool_icon(row['review_reply_enabled'])} Автоответы", "toggle:review_reply_enabled")],
+                [("⭐ 1", "review_template:1"), ("⭐⭐ 2", "review_template:2")],
+                [("⭐⭐⭐ 3", "review_template:3"), ("⭐⭐⭐⭐ 4", "review_template:4")],
+                [("⭐⭐⭐⭐⭐ 5", "review_template:5")],
+                [("🧩 Переменные", "variables"), ("⬅️ Назад", "autoreply")],
+            ]),
+        )
+
+    @router.callback_query(F.data == "review_replies")
+    async def review_replies(callback: CallbackQuery) -> None:
+        await callback.answer()
+        await show_review_replies(callback.message, callback.from_user.id)
+
+    @router.callback_query(F.data.startswith("review_template:"))
+    async def review_template(callback: CallbackQuery, state: FSMContext) -> None:
+        stars = int(callback.data.split(":", 1)[1])
+        await callback.answer()
+        await state.clear()
+        await state.update_data(stars=stars)
+        await state.set_state(AutoReplyState.review_text)
+        await callback.message.answer(
+            f"Отправьте шаблон ответа для оценки {'⭐' * stars}. До 999 символов и 10 строк."
+        )
+
+    @router.message(AutoReplyState.review_text, F.text)
+    async def save_review_template(message: Message, state: FSMContext) -> None:
+        value = normalize_review_reply(message.text)
+        if not value:
+            await message.answer("Шаблон не может быть пустым.")
+            return
+        data = await state.get_data()
+        await db.set_review_reply(message.from_user.id, data["stars"], value)
+        await state.clear()
+        await show_review_replies(message, message.from_user.id)
 
     async def show_auto_raise(target: Message, user_id: int) -> None:
         row = await db.get_user(user_id)
@@ -1102,6 +1692,191 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
             await callback.message.answer(f"❌ Не удалось поднять лоты: {html.escape(clipped(exc, 500))}")
             return
         await callback.message.answer(result, reply_markup=keyboard([[("⬅️ Автоподнятие", "auto_raise")]]))
+
+    async def show_plugins(target: Message, user_id: int) -> None:
+        runtime = await require_runtime(target, user_id)
+        if not runtime:
+            return
+        plugin_runtime = manager.plugins.runtimes.get(user_id)
+        plugins = list(plugin_runtime.plugins.values()) if plugin_runtime else []
+        rows = [
+            [(f"{'✅' if plugin.enabled else '❌'} {clipped(plugin.name, 28)} v{clipped(plugin.version, 12)}", f"plugin_info:{plugin.uuid}")]
+            for plugin in plugins
+        ]
+        rows.extend([
+            [("➕ Загрузить плагин", "plugin_upload_warning")],
+            [("📚 Документация", "plugin_docs")],
+            [("⬅️ Меню", "menu")],
+        ])
+        await target.answer(
+            "🧩 <b>Плагины FunPayCardinal</b>\n"
+            f"Установлено: <b>{len(plugins)}</b>\n\n"
+            "Поддерживаются одиночные .py-плагины с метаданными и списками хуков Cardinal.",
+            reply_markup=keyboard(rows),
+        )
+
+    @router.callback_query(F.data == "plugins")
+    async def plugins(callback: CallbackQuery) -> None:
+        await callback.answer()
+        await show_plugins(callback.message, callback.from_user.id)
+
+    @router.callback_query(F.data == "plugin_docs")
+    async def plugin_docs(callback: CallbackQuery) -> None:
+        await callback.answer()
+        await callback.message.answer(
+            "📚 <b>Формат плагинов FunPayCardinal</b>\n\n"
+            "Файл: одиночный UTF-8 <code>.py</code> до 512 КБ. Обязательные поля:\n"
+            "<code>NAME, VERSION, DESCRIPTION, CREDITS, SETTINGS_PAGE, UUID, BIND_TO_DELETE</code>.\n\n"
+            "Поддерживаемые хуки:\n"
+            "<code>BIND_TO_PRE_INIT, BIND_TO_POST_INIT, BIND_TO_PRE_START, BIND_TO_POST_START, "
+            "BIND_TO_PRE_STOP, BIND_TO_POST_STOP, BIND_TO_INIT_MESSAGE, "
+            "BIND_TO_MESSAGES_LIST_CHANGED, BIND_TO_LAST_CHAT_MESSAGE_CHANGED, "
+            "BIND_TO_NEW_MESSAGE, BIND_TO_INIT_ORDER, BIND_TO_NEW_ORDER, "
+            "BIND_TO_ORDERS_LIST_CHANGED, BIND_TO_ORDER_STATUS_CHANGED, "
+            "BIND_TO_PRE_DELIVERY, BIND_TO_POST_DELIVERY, BIND_TO_PRE_LOTS_RAISE, "
+            "BIND_TO_POST_LOTS_RAISE</code>.\n\n"
+            "Функции событий получают <code>(cardinal, event)</code>. Доступны импорты "
+            "<code>from cardinal import Cardinal, get_cardinal</code> и встроенный FunPayAPI.\n\n"
+            "⚠️ Плагин — произвольный Python-код и имеет доступ к аккаунту, окружению и процессу. "
+            "Устанавливайте только проверенные файлы.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(
+                    text="🌐 Исходный FunPayCardinal",
+                    url="https://github.com/sidor0912/FunPayCardinal",
+                )],
+                [InlineKeyboardButton(text="⬅️ Плагины", callback_data="plugins")],
+            ]),
+            disable_web_page_preview=True,
+        )
+
+    @router.callback_query(F.data == "plugin_upload_warning")
+    async def plugin_upload_warning(callback: CallbackQuery) -> None:
+        await callback.answer()
+        await callback.message.answer(
+            "⚠️ <b>Внимание</b>\n"
+            "Плагин выполняется с теми же правами, что и бот. Он может прочитать переменные окружения, "
+            "получить доступ к FunPay-аккаунту и базе данных. Продолжайте только если доверяете автору.",
+            reply_markup=keyboard([
+                [("Я понимаю риск", "plugin_upload_confirm")],
+                [("Отмена", "plugins")],
+            ]),
+        )
+
+    @router.callback_query(F.data == "plugin_upload_confirm")
+    async def plugin_upload_confirm(callback: CallbackQuery, state: FSMContext) -> None:
+        await callback.answer()
+        if not await require_runtime(callback.message, callback.from_user.id):
+            return
+        await state.clear()
+        await state.set_state(PluginState.file)
+        await callback.message.answer(
+            "Отправьте одиночный файл плагина <code>.py</code> до 512 КБ. Для отмены: /cancel"
+        )
+
+    @router.message(PluginState.file)
+    async def plugin_upload_file(message: Message, state: FSMContext) -> None:
+        document = message.document
+        if not document or not (document.file_name or "").lower().endswith(".py"):
+            await message.answer("❌ Отправьте документ с расширением .py.")
+            return
+        if document.file_size and document.file_size > 512 * 1024:
+            await message.answer("❌ Размер плагина не должен превышать 512 КБ.")
+            return
+        runtime = await require_runtime(message, message.from_user.id)
+        if not runtime:
+            await state.clear()
+            return
+        buffer = BytesIO()
+        await message.bot.download(document, destination=buffer)
+        try:
+            source = buffer.getvalue().decode("utf-8-sig")
+        except UnicodeDecodeError:
+            await message.answer("❌ Файл должен быть текстовым UTF-8 Python-модулем.")
+            return
+        try:
+            plugin = await manager.plugins.install(
+                message.from_user.id,
+                document.file_name,
+                source,
+                runtime,
+            )
+        except PluginValidationError as exc:
+            await message.answer(f"❌ Плагин отклонён: {html.escape(str(exc))}")
+            return
+        except Exception as exc:
+            logger.exception("Не удалось установить плагин")
+            await message.answer(
+                f"❌ Ошибка установки: {html.escape(clipped(exc, 600))}"
+            )
+            return
+        await state.clear()
+        await message.answer(
+            f"✅ Плагин <b>{html.escape(plugin.name)}</b> v{html.escape(plugin.version)} установлен."
+        )
+        await show_plugins(message, message.from_user.id)
+
+    @router.callback_query(F.data.startswith("plugin_info:"))
+    async def plugin_info(callback: CallbackQuery) -> None:
+        await callback.answer()
+        uuid = callback.data.split(":", 1)[1]
+        plugin_runtime = manager.plugins.runtimes.get(callback.from_user.id)
+        plugin = plugin_runtime.plugins.get(uuid) if plugin_runtime else None
+        if not plugin:
+            await callback.message.answer("Плагин не найден.")
+            return
+        hooks_count = sum(len(value) for value in plugin.hooks.values())
+        await callback.message.answer(
+            f"🧩 <b>{html.escape(plugin.name)}</b> v{html.escape(plugin.version)}\n"
+            f"{html.escape(plugin.description)}\n\n"
+            f"Автор: {html.escape(plugin.credits)}\n"
+            f"UUID: <code>{plugin.uuid}</code>\n"
+            f"Хуков: <b>{hooks_count}</b>\n"
+            f"Страница настроек Cardinal: {bool_icon(plugin.settings_page)}\n"
+            f"Состояние: {bool_icon(plugin.enabled)}",
+            reply_markup=keyboard([
+                [("Выключить" if plugin.enabled else "Включить", f"plugin_toggle:{uuid}")],
+                [("🗑 Удалить", f"plugin_delete_ask:{uuid}")],
+                [("⬅️ Плагины", "plugins")],
+            ]),
+        )
+
+    @router.callback_query(F.data.startswith("plugin_toggle:"))
+    async def plugin_toggle(callback: CallbackQuery) -> None:
+        uuid = callback.data.split(":", 1)[1]
+        try:
+            enabled = await manager.plugins.toggle(callback.from_user.id, uuid)
+        except KeyError:
+            await callback.answer("Плагин не найден", show_alert=True)
+            return
+        await callback.answer("Плагин включён" if enabled else "Плагин выключен")
+        await show_plugins(callback.message, callback.from_user.id)
+
+    @router.callback_query(F.data.startswith("plugin_delete_ask:"))
+    async def plugin_delete_ask(callback: CallbackQuery) -> None:
+        uuid = callback.data.split(":", 1)[1]
+        await callback.answer()
+        await callback.message.answer(
+            "Удалить плагин, его исходник и сохранённую запись?",
+            reply_markup=keyboard([
+                [("Да, удалить", f"plugin_delete_do:{uuid}")],
+                [("Отмена", f"plugin_info:{uuid}")],
+            ]),
+        )
+
+    @router.callback_query(F.data.startswith("plugin_delete_do:"))
+    async def plugin_delete_do(callback: CallbackQuery) -> None:
+        uuid = callback.data.split(":", 1)[1]
+        await callback.answer("Удаляю…")
+        try:
+            await manager.plugins.delete(callback.from_user.id, uuid, callback)
+        except Exception as exc:
+            logger.exception("Ошибка обработчика удаления плагина")
+            await callback.message.answer(
+                f"❌ Плагин не удалён: {html.escape(clipped(exc, 500))}"
+            )
+            return
+        await callback.message.answer("✅ Плагин удалён.")
+        await show_plugins(callback.message, callback.from_user.id)
 
     async def show_chat_carousel(target: Message, user_id: int, index: int) -> None:
         runtime = await require_runtime(target, user_id)
@@ -1470,6 +2245,50 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
             "Введите ответ покупателю. Переменные заказа и чата будут подставлены автоматически."
         )
 
+    @router.callback_query(F.data.startswith("review_manual:"))
+    async def review_manual(callback: CallbackQuery, state: FSMContext) -> None:
+        await callback.answer()
+        order_id = callback.data.split(":", 1)[1]
+        if not await require_runtime(callback.message, callback.from_user.id):
+            return
+        await state.clear()
+        await state.update_data(order_id=order_id)
+        await state.set_state(ReviewReplyState.text)
+        await callback.message.answer(
+            "Введите ответ на отзыв до 999 символов. Можно использовать переменные. Для отмены: /cancel"
+        )
+
+    @router.message(ReviewReplyState.text, F.text)
+    async def review_manual_text(message: Message, state: FSMContext) -> None:
+        runtime = await require_runtime(message, message.from_user.id)
+        if not runtime:
+            await state.clear()
+            return
+        data = await state.get_data()
+        try:
+            order = await asyncio.to_thread(runtime.account.get_order, data["order_id"])
+            if order.seller_id != runtime.account.id or not order.review:
+                raise RuntimeError("у заказа нет доступного отзыва покупателя")
+            text = normalize_review_reply(
+                render_template(
+                    message.text,
+                    order=order,
+                    review=order.review,
+                    account=runtime.account,
+                )
+            )
+            if not text:
+                raise RuntimeError("ответ не может быть пустым")
+            await asyncio.to_thread(runtime.account.send_review, order.id, text)
+        except Exception as exc:
+            logger.exception("Не удалось отправить ручной ответ на отзыв")
+            await message.answer(
+                f"❌ Ответ не отправлен: {html.escape(clipped(exc, 500))}"
+            )
+            return
+        await state.clear()
+        await message.answer("✅ Ответ на отзыв отправлен.", reply_markup=main_keyboard())
+
     @router.callback_query(F.data.startswith("refund_ask:"))
     async def refund_ask(callback: CallbackQuery) -> None:
         order_id = callback.data.split(":", 1)[1]
@@ -1577,7 +2396,25 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
 
     @router.message()
     async def fallback(message: Message) -> None:
+        try:
+            if await manager.plugins.dispatch_telegram_message(
+                message.from_user.id, message
+            ):
+                return
+        except Exception:
+            logger.exception("Ошибка Telegram-хэндлера плагина")
         await show_main(message, message.from_user.id)
+
+    @router.callback_query()
+    async def plugin_callback_fallback(callback: CallbackQuery) -> None:
+        try:
+            if await manager.plugins.dispatch_telegram_callback(
+                callback.from_user.id, callback
+            ):
+                return
+        except Exception:
+            logger.exception("Ошибка callback-хэндлера плагина")
+        await callback.answer("Действие устарело или не поддерживается", show_alert=True)
 
     return router
 
