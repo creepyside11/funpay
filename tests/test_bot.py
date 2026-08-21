@@ -5,9 +5,11 @@ from types import SimpleNamespace
 import pytest
 
 from bot import (
+    PLUGIN_DOCUMENTATION_PATH,
     READY_PLUGINS,
     SecretBox,
     apply_bulk_lot_action,
+    conversation_actions_keyboard,
     format_chat_history,
     format_money,
     format_order,
@@ -108,6 +110,8 @@ def test_chat_history_is_escaped_and_split_into_valid_sized_chunks():
     assert all(len(chunk) <= 3800 for chunk in chunks)
     assert all("<script>" not in chunk for chunk in chunks)
     assert "&lt;Buyer&gt;" in "".join(chunks)
+    assert "<pre>" in "".join(chunks)
+    assert "<code>5</code>" in chunks[0]
 
 
 def test_detailed_balance_uses_profile_lot():
@@ -223,6 +227,24 @@ def test_main_menu_has_no_direct_message_or_image_buttons():
     assert "send_message" not in callbacks
     assert "images" not in callbacks
     assert "plugins" in callbacks
+
+
+def test_conversation_actions_do_not_force_main_menu():
+    callbacks = {
+        button.callback_data
+        for row in conversation_actions_keyboard(123).inline_keyboard
+        for button in row
+    }
+    assert callbacks == {"reply:123", "chat_full:123:0", "image_chat:123"}
+    assert "menu" not in callbacks
+
+
+def test_downloadable_plugin_documentation_is_ai_readable():
+    text = PLUGIN_DOCUMENTATION_PATH.read_text(encoding="utf-8")
+    assert "Короткая инструкция для нейросети" in text
+    assert "BIND_TO_NEW_MESSAGE" in text
+    assert "автоответ на отзыв" in text.casefold()
+    assert "Финальный чек-лист" in text
 
 
 def test_cardinal_plugin_contract_is_loaded(tmp_path):

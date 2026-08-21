@@ -9,8 +9,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY bot.py .
+COPY bot.py plugin_system.py cardinal.py PLUGIN_DEVELOPMENT.md ./
 COPY FunPayAPI ./FunPayAPI
+COPY telebot ./telebot
 
 RUN useradd --create-home --uid 10001 botuser && chown -R botuser:botuser /app
 USER botuser

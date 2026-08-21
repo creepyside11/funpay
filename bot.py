@@ -12,6 +12,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -26,6 +27,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     BotCommand,
     CallbackQuery,
+    FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
@@ -46,6 +48,7 @@ USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
 )
+PLUGIN_DOCUMENTATION_PATH = Path(__file__).with_name("PLUGIN_DEVELOPMENT.md")
 
 AUTO_LOTS_PLUGIN_UUID = "77b095e0-13a1-4e12-9c52-3a7b83a89b11"
 ADVANCED_STATS_PLUGIN_UUID = "c55a4072-eab8-4d87-8f17-b111e4b8bb22"
@@ -752,16 +755,23 @@ def format_chat_history(chat: Any, account_id: int) -> list[str]:
             f"{html.escape(chat.looking_text or 'лот')}</a>"
         )
     for item in chat.messages:
+        incoming = False
         if item.author_id == 0:
             icon, author = "⚙️", "FunPay"
         elif item.author_id == account_id or item.by_bot or item.by_vertex:
             icon, author = "🟢", item.author or "Вы"
         else:
             icon, author = "🔵", item.author or chat.name or "Покупатель"
+            incoming = True
         body = item.text or (f'<a href="{html.escape(item.image_link, quote=True)}">Изображение</a>' if item.image_link else "[без текста]")
         if item.text:
             body = html.escape(clipped(body, 2600))
-        blocks.append(f"{icon} <b>{html.escape(author)}</b>\n<blockquote>{body}</blockquote>")
+        message_block = (
+            f"<pre>{body}</pre>"
+            if incoming and item.text
+            else f"<blockquote>{body}</blockquote>"
+        )
+        blocks.append(f"{icon} <b>{html.escape(author)}</b>\n{message_block}")
     if not blocks:
         blocks.append("Сообщений пока нет.")
 
@@ -1118,15 +1128,26 @@ class RuntimeManager:
 
         if row["notify_reviews"]:
             rating = f"{'⭐' * stars} ({stars}/5)" if stars else "удалён или не определён"
+            review_event_title = {
+                types.MessageTypes.NEW_FEEDBACK: "Новый отзыв",
+                types.MessageTypes.FEEDBACK_CHANGED: "Отзыв изменён",
+                types.MessageTypes.FEEDBACK_DELETED: "Отзыв удалён",
+            }.get(message.type, "Событие отзыва")
             text = (
-                "⭐ <b>Отзыв о заказе</b>\n"
-                f"Заказ: <code>{html.escape(order_id or '—')}</code>\n"
-                f"Лот: {html.escape(clipped(title, 900))}\n"
-                f"Оценка: <b>{rating}</b>\n"
-                f"Комментарий: <blockquote>{html.escape(clipped(comment, 1500))}</blockquote>"
+                f"⭐ <b>{review_event_title}</b>\n\n"
+                f"📦 Заказ: <code>#{html.escape(order_id or '—')}</code>\n"
+                f"🏷 Лот: <b>{html.escape(clipped(title, 900))}</b>\n"
+                f"🌟 Оценка: <b>{rating}</b>\n\n"
+                "💬 <b>Комментарий покупателя</b>\n"
+                f"<pre>{html.escape(clipped(comment, 1500))}</pre>"
             )
             if reply_text:
-                text += f"\n🤖 Ответ отправлен: <i>{html.escape(reply_text)}</i>"
+                text += (
+                    "\n🤖 <b>Автоответ отправлен</b>\n"
+                    f"<pre>{html.escape(reply_text)}</pre>"
+                )
+            elif row["review_reply_enabled"]:
+                text += "\n⚠️ Автоответ не отправлен: отзыв удалён, уже отвечен или данные заказа недоступны."
             buttons = []
             if order_id:
                 buttons.append(
@@ -1176,8 +1197,10 @@ class RuntimeManager:
             if row["notify_messages"]:
                 await self.safe_notify(
                     runtime.telegram_id,
-                    f"💬 <b>Новое сообщение от {chat_name}</b>\n{body}\n\n"
-                    f"Чат: <code>{html.escape(chat_id)}</code>",
+                    "💬 <b>Новое сообщение</b>\n\n"
+                    f"👤 От: <b>{chat_name}</b>\n"
+                    f"🆔 Чат: <code>{html.escape(chat_id)}</code>\n\n"
+                    f"<pre>{body}</pre>",
                     reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                         [
                             InlineKeyboardButton(text="↩️ Ответить", callback_data=f"reply:{chat_id}"),
@@ -1239,20 +1262,23 @@ class RuntimeManager:
             buttons.append([InlineKeyboardButton(text="💸 Вернуть деньги", callback_data=f"refund_ask:{order.id}")])
             await self.safe_notify(
                 runtime.telegram_id,
-                "🛒 <b>Новый заказ</b>\n"
-                f"ID: <code>{html.escape(order.id)}</code>\n"
-                f"Покупатель: {html.escape(order.buyer_username or '—')}\n"
-                f"Сумма: <b>{order.price} {html.escape(str(order.currency))}</b>\n"
-                f"Товар: {html.escape(clipped(order.description))}",
+                "🛒 <b>Новый заказ</b>\n\n"
+                f"🆔 Заказ: <code>#{html.escape(order.id)}</code>\n"
+                f"👤 Покупатель: <b>{html.escape(order.buyer_username or '—')}</b>\n"
+                f"💰 Сумма: <b>{format_money(order.price)} {html.escape(str(order.currency))}</b>\n\n"
+                "🏷 <b>Лот</b>\n"
+                f"<blockquote>{html.escape(clipped(order.description, 1400))}</blockquote>",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
             )
         elif isinstance(event, events.OrderStatusChangedEvent) and row["notify_order_status"]:
             order = event.order
             await self.safe_notify(
                 runtime.telegram_id,
-                f"📦 Статус заказа <code>{html.escape(order.id)}</code>: "
-                f"<b>{html.escape(order_status_label(order.status))}</b>.\n"
-                f"Лот: {html.escape(clipped(order.description or '—', 1200))}",
+                "📦 <b>Статус заказа изменён</b>\n\n"
+                f"🆔 Заказ: <code>#{html.escape(order.id)}</code>\n"
+                f"📌 Новый статус: <b>{html.escape(order_status_label(order.status))}</b>\n\n"
+                "🏷 <b>Лот</b>\n"
+                f"<blockquote>{html.escape(clipped(order.description or '—', 1200))}</blockquote>",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
                     InlineKeyboardButton(text="📦 Подробности", callback_data=f"order_view:{order.id}"),
                     InlineKeyboardButton(text="🌐 FunPay", url=f"https://funpay.com/orders/{order.id}/"),
@@ -1317,6 +1343,16 @@ def main_keyboard() -> InlineKeyboardMarkup:
         [("💬 Последние чаты", "chats"), ("📦 Заказ по ID", "order_lookup")],
         [("🆙 Автоподнятие", "auto_raise"), ("🧩 Плагины", "plugins")],
         [("⚙️ Аккаунт", "account")],
+    ])
+
+
+def conversation_actions_keyboard(chat_id: int | str) -> InlineKeyboardMarkup:
+    return keyboard([
+        [
+            ("✍️ Написать ещё", f"reply:{chat_id}"),
+            ("💬 Перейти к диалогу", f"chat_full:{chat_id}:0"),
+        ],
+        [("📷 Отправить фото", f"image_chat:{chat_id}")],
     ])
 
 
@@ -1796,7 +1832,7 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
     async def show_review_replies(target: Message, user_id: int) -> None:
         row = await db.get_user(user_id)
         previews = "\n".join(
-            f"{'⭐' * stars}: <i>{html.escape(clipped(row[f'review_reply_{stars}'], 150))}</i>"
+            f"{'⭐' * stars}: <code>{html.escape(clipped(row[f'review_reply_{stars}'], 150))}</code>"
             for stars in range(1, 6)
         )
         await target.answer(
@@ -1808,6 +1844,7 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
                 [("⭐ 1", "review_template:1"), ("⭐⭐ 2", "review_template:2")],
                 [("⭐⭐⭐ 3", "review_template:3"), ("⭐⭐⭐⭐ 4", "review_template:4")],
                 [("⭐⭐⭐⭐⭐ 5", "review_template:5")],
+                [("🧪 Проверить шаблон", "review_preview_menu")],
                 [("🧩 Переменные", "variables"), ("⬅️ Назад", "autoreply")],
             ]),
         )
@@ -1816,6 +1853,65 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
     async def review_replies(callback: CallbackQuery) -> None:
         await callback.answer()
         await show_review_replies(callback.message, callback.from_user.id)
+
+    @router.callback_query(F.data == "review_preview_menu")
+    async def review_preview_menu(callback: CallbackQuery) -> None:
+        await callback.answer()
+        await callback.message.answer(
+            "🧪 <b>Проверка автоответа на отзыв</b>\n\n"
+            "Выберите оценку. Бот подставит тестовые данные, но ничего не отправит на FunPay.",
+            reply_markup=keyboard([
+                [("⭐ 1", "review_preview:1"), ("⭐⭐ 2", "review_preview:2")],
+                [("⭐⭐⭐ 3", "review_preview:3"), ("⭐⭐⭐⭐ 4", "review_preview:4")],
+                [("⭐⭐⭐⭐⭐ 5", "review_preview:5")],
+                [("⬅️ Автоответы", "review_replies")],
+            ]),
+        )
+
+    @router.callback_query(F.data.startswith("review_preview:"))
+    async def review_preview(callback: CallbackQuery) -> None:
+        stars = int(callback.data.split(":", 1)[1])
+        row = await db.get_user(callback.from_user.id)
+        runtime = manager.get(callback.from_user.id)
+        await callback.answer()
+        if not row or stars not in range(1, 6):
+            await callback.message.answer("Шаблон не найден.")
+            return
+
+        class PreviewReview:
+            text = "Всё получил, спасибо!"
+            reply = ""
+
+            def __init__(self, value: int):
+                self.stars = value
+
+        class PreviewOrder:
+            id = "TEST1234"
+            buyer_username = "Покупатель"
+            chat_id = 123456
+            title = "Тестовый лот"
+
+            def __init__(self, review: PreviewReview):
+                self.review = review
+
+        review = PreviewReview(stars)
+        order = PreviewOrder(review)
+        rendered = normalize_review_reply(
+            render_template(
+                row[f"review_reply_{stars}"],
+                order=order,
+                review=review,
+                account=runtime.account if runtime else None,
+            )
+        )
+        await callback.message.answer(
+            f"🧪 <b>Предпросмотр для {'⭐' * stars}</b>\n\n"
+            f"<pre>{html.escape(rendered or '[пустой ответ]')}</pre>",
+            reply_markup=keyboard([
+                [("✏️ Изменить", f"review_template:{stars}")],
+                [("⬅️ Выбрать оценку", "review_preview_menu")],
+            ]),
+        )
 
     @router.callback_query(F.data.startswith("review_template:"))
     async def review_template(callback: CallbackQuery, state: FSMContext) -> None:
@@ -2031,11 +2127,31 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
                     InlineKeyboardButton(text="⚡ Хуки", callback_data="plugin_docs:hooks"),
                     InlineKeyboardButton(text="🤖 Telegram API", callback_data="plugin_docs:telegram"),
                 ],
+                [InlineKeyboardButton(text="📥 Скачать полную документацию", callback_data="plugin_docs_download")],
                 [InlineKeyboardButton(text="🛡 Совместимость и безопасность", callback_data="plugin_docs:safety")],
                 [InlineKeyboardButton(text="🌐 Исходный FunPayCardinal", url="https://github.com/sidor0912/FunPayCardinal")],
                 [InlineKeyboardButton(text="⬅️ Плагины", callback_data="plugins")],
             ]),
             disable_web_page_preview=True,
+        )
+
+    @router.callback_query(F.data == "plugin_docs_download")
+    async def plugin_docs_download(callback: CallbackQuery) -> None:
+        await callback.answer("Готовлю файл…")
+        if not PLUGIN_DOCUMENTATION_PATH.is_file():
+            await callback.message.answer(
+                "❌ Файл документации отсутствует в текущей сборке."
+            )
+            return
+        await callback.message.answer_document(
+            document=FSInputFile(
+                PLUGIN_DOCUMENTATION_PATH,
+                filename="PLUGIN_DEVELOPMENT.md",
+            ),
+            caption=(
+                "📚 Полный контракт плагинов <code>aiogram-compat-1</code>. "
+                "Файл можно передать нейросети вместе с описанием нужного плагина."
+            ),
         )
 
     @router.callback_query(F.data.startswith("plugin_docs:"))
@@ -2503,7 +2619,7 @@ BIND_TO_NEW_MESSAGE = [on_message]
             f"💬 <b>{html.escape(chat.name or '—')}</b>\n"
             f"Чат: <code>{chat.id}</code> · {unread}\n"
             f"Позиция: <b>{index + 1}/{len(chats_list)}</b>\n\n"
-            f"<blockquote>{html.escape(clipped(chat.last_message_text or '[изображение]', 1800))}</blockquote>"
+            f"<pre>{html.escape(clipped(chat.last_message_text or '[изображение]', 1800))}</pre>"
         )
         markup = InlineKeyboardMarkup(inline_keyboard=[
             [
@@ -2637,8 +2753,12 @@ BIND_TO_NEW_MESSAGE = [on_message]
             logger.exception("Ручное сообщение не отправлено")
             await message.answer(f"❌ FunPay не отправил сообщение: {html.escape(clipped(exc, 300))}")
             return
+        chat_id = data["chat_id"]
         await state.clear()
-        await message.answer("✅ Сообщение отправлено.", reply_markup=main_keyboard())
+        await message.answer(
+            "✅ Сообщение отправлено. Можно продолжить переписку или открыть весь диалог.",
+            reply_markup=conversation_actions_keyboard(chat_id),
+        )
 
     async def ask_for_image(target: Message, state: FSMContext, state_value: State, destination: str) -> None:
         await state.set_state(state_value)
@@ -2713,8 +2833,12 @@ BIND_TO_NEW_MESSAGE = [on_message]
             logger.exception("Не удалось отправить изображение в чат")
             await message.answer(f"❌ FunPay не принял изображение: {html.escape(clipped(exc, 400))}")
             return
+        chat_id = data["chat_id"]
         await state.clear()
-        await message.answer("✅ Изображение отправлено в чат FunPay.", reply_markup=main_keyboard())
+        await message.answer(
+            "✅ Изображение отправлено в чат FunPay.",
+            reply_markup=conversation_actions_keyboard(chat_id),
+        )
 
     @router.callback_query(F.data == "image_lot_begin")
     async def image_lot_begin(callback: CallbackQuery, state: FSMContext) -> None:
@@ -2888,8 +3012,15 @@ BIND_TO_NEW_MESSAGE = [on_message]
                 f"❌ Ответ не отправлен: {html.escape(clipped(exc, 500))}"
             )
             return
+        order_id = data["order_id"]
         await state.clear()
-        await message.answer("✅ Ответ на отзыв отправлен.", reply_markup=main_keyboard())
+        await message.answer(
+            "✅ Ответ на отзыв отправлен.",
+            reply_markup=keyboard([
+                [("📦 Открыть заказ", f"order_view:{order_id}")],
+                [("⭐ Настройки автоответов", "review_replies")],
+            ]),
+        )
 
     @router.callback_query(F.data.startswith("refund_ask:"))
     async def refund_ask(callback: CallbackQuery) -> None:
