@@ -1,3 +1,0 @@
-aiogram>=3.4.1
-requests>=2.31.0
-FunPayAPI>=1.1.0
