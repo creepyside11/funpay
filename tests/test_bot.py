@@ -5,7 +5,9 @@ from types import SimpleNamespace
 import pytest
 
 from bot import (
+    READY_PLUGINS,
     SecretBox,
+    apply_bulk_lot_action,
     format_chat_history,
     format_money,
     format_order,
@@ -18,6 +20,7 @@ from bot import (
     normalize_review_reply,
     proxy_dict,
     proxy_label,
+    ready_plugin_source,
     render_template,
     within_work_hours,
 )
@@ -244,6 +247,56 @@ BIND_TO_NEW_MESSAGE = [on_message]
     assert len(plugin.hooks["BIND_TO_NEW_MESSAGE"]) == 1
     with pytest.raises(PluginValidationError):
         manager._load_module(1, "bad.txt", source, True)
+
+
+def test_ready_plugins_have_valid_cardinal_sources(tmp_path):
+    manager = PluginManager(SimpleNamespace(), SimpleNamespace())
+    manager.root = tmp_path
+    loaded = [
+        manager._load_module(1, spec.filename, ready_plugin_source(spec), True)
+        for spec in READY_PLUGINS
+    ]
+    assert [plugin.uuid for plugin in loaded] == [spec.uuid for spec in READY_PLUGINS]
+    assert all(plugin.settings_page for plugin in loaded)
+
+
+def test_bulk_lot_action_updates_common_and_currency_lots():
+    common_subcategory = SimpleNamespace(type=types.SubCategoryTypes.COMMON, id=10)
+    currency_subcategory = SimpleNamespace(type=types.SubCategoryTypes.CURRENCY, id=20)
+    lots = [
+        SimpleNamespace(id=1, subcategory=common_subcategory),
+        SimpleNamespace(id="1-2-20-3", subcategory=currency_subcategory),
+    ]
+    lot_fields = SimpleNamespace(active=False)
+    lot_fields.renew_fields = lambda: lot_fields
+    chip_offer = SimpleNamespace(active=False)
+    chip_fields = SimpleNamespace(chip_offers={"offer": chip_offer})
+    chip_fields.renew_fields = lambda: chip_fields
+
+    class Account:
+        id = 42
+
+        def get_user(self, _user_id):
+            return SimpleNamespace(get_lots=lambda: lots)
+
+        def get_lot_fields(self, _lot_id):
+            return lot_fields
+
+        def save_lot(self, fields):
+            assert fields is lot_fields
+
+        def get_chip_fields(self, subcategory_id):
+            assert subcategory_id == 20
+            return chip_fields
+
+        def save_chip(self, fields):
+            assert fields is chip_fields
+
+    result = apply_bulk_lot_action(Account(), "activate")
+    assert result.changed == 2
+    assert not result.errors
+    assert lot_fields.active is True
+    assert chip_offer.active is True
 
 
 def test_cardinal_telegram_handler_bridge_dispatches_commands():

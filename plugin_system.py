@@ -397,6 +397,11 @@ class PluginManager:
         self.runtimes: dict[int, PluginRuntime] = {}
         self.root = Path("plugins_runtime")
 
+    def is_enabled(self, telegram_id: int, uuid: str) -> bool:
+        runtime = self.runtimes.get(telegram_id)
+        plugin = runtime.plugins.get(uuid) if runtime else None
+        return bool(plugin and plugin.enabled)
+
     @staticmethod
     def validate_uuid(value: str) -> str:
         try:

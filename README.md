@@ -36,15 +36,99 @@ Telegram-бот на **aiogram 3** для управления одним FunPay
 
 ## Плагины FunPayCardinal
 
-Бот принимает одиночные UTF-8 `.py`-плагины до 512 КБ с тем же обязательным контрактом,
-что и FunPayCardinal: `NAME`, `VERSION`, `DESCRIPTION`, `CREDITS`, `SETTINGS_PAGE`, `UUID`,
-`BIND_TO_DELETE` и списки `BIND_TO_*`. Поддержаны все 18 имён хуков Cardinal, включая события
-сообщений, заказов, запуска/остановки и поднятия лотов. Импорты `cardinal`, `FunPayAPI` и базовые
-`telebot.types` доступны через слой совместимости.
+В меню «Плагины» есть четыре раздела:
+
+- **Готовые плагины** — проверенные расширения, устанавливаемые одной кнопкой;
+- **Мои плагины** — все установленные расширения, их настройки, включение и удаление;
+- **Загрузить плагин** — установка собственного `.py`-файла;
+- **Документация** — интерактивное руководство прямо в Telegram.
+
+### Встроенный каталог
+
+| Плагин | Что делает |
+|---|---|
+| AutoLotsPlugin | Показывает состояние лотов, массово активирует и деактивирует обычные и валютные предложения, удаляет обычные лоты с отдельным подтверждением. При удалении валютные предложения деактивируются. |
+| Advanced Profile Stats | Статистика за 24 часа, 7/30/90/365 дней или всё время: продажи, возвраты, покупатели, выручка и популярные лоты. Также показывает общий баланс, доступную к выводу сумму и удержание. |
+| Status Plugin | Хранит настраиваемый статус продавца. Когда покупатель отправляет в чат FunPay команду `#status`, бот отвечает заданным текстом. |
+
+### Установка своего плагина
+
+1. Создайте одиночный UTF-8 `.py`-файл размером не более 512 КБ.
+2. Добавьте обязательные метаданные и канонический UUID версии 4.
+3. Добавьте нужные функции в списки `BIND_TO_*`.
+4. В Telegram откройте «Плагины → Загрузить плагин», прочитайте предупреждение и отправьте файл документом.
+5. После проверки управляйте расширением через «Мои плагины».
+
+Минимальный пример:
+
+```python
+NAME = "Hello Plugin"
+VERSION = "1.0.0"
+DESCRIPTION = "Отвечает на #hello"
+CREDITS = "Author"
+SETTINGS_PAGE = False
+UUID = "замените-на-канонический-uuid4"
+BIND_TO_DELETE = None
+
+
+def on_message(cardinal, event):
+    message = event.message
+    if str(message).strip() == "#hello":
+        cardinal.account.send_message(
+            message.chat_id,
+            "Привет!",
+            message.chat_name,
+        )
+
+
+BIND_TO_NEW_MESSAGE = [on_message]
+```
+
+Обязательные поля:
+
+| Поле | Тип | Назначение |
+|---|---|---|
+| `NAME` | `str` | название в «Моих плагинах» |
+| `VERSION` | `str` | версия расширения |
+| `DESCRIPTION` | `str` | краткое описание |
+| `CREDITS` | `str` | автор или источник |
+| `SETTINGS_PAGE` | `bool` | наличие собственной страницы настроек |
+| `UUID` | `str` | уникальный канонический UUID4 |
+| `BIND_TO_DELETE` | функция / `None` | очистка данных при удалении |
+
+Необъявленные списки хуков считаются пустыми.
+
+### Хуки
+
+- жизненный цикл: `BIND_TO_PRE_INIT`, `BIND_TO_POST_INIT`, `BIND_TO_PRE_START`,
+  `BIND_TO_POST_START`, `BIND_TO_PRE_STOP`, `BIND_TO_POST_STOP`;
+- сообщения: `BIND_TO_INIT_MESSAGE`, `BIND_TO_MESSAGES_LIST_CHANGED`,
+  `BIND_TO_LAST_CHAT_MESSAGE_CHANGED`, `BIND_TO_NEW_MESSAGE`;
+- заказы: `BIND_TO_INIT_ORDER`, `BIND_TO_NEW_ORDER`, `BIND_TO_ORDERS_LIST_CHANGED`,
+  `BIND_TO_ORDER_STATUS_CHANGED`;
+- операции: `BIND_TO_PRE_DELIVERY`, `BIND_TO_POST_DELIVERY`,
+  `BIND_TO_PRE_LOTS_RAISE`, `BIND_TO_POST_LOTS_RAISE`.
+
+Событийная функция получает `(cardinal, event)`. Обработчики жизненного цикла получают объект
+`cardinal`, а `BIND_TO_DELETE` — `(cardinal, callback)`. Доступны `cardinal.account`,
+`cardinal.runner`, `cardinal.telegram`, `cardinal.plugins` и `cardinal.MAIN_CFG`.
+
+### Telegram-совместимость
+
+Через `cardinal.telegram.bot` доступны `send_message`, `edit_message_text`,
+`edit_message_reply_markup`, `answer_callback_query`, `delete_message`, декораторы
+`message_handler` / `callback_query_handler` и методы `register_*_handler`. Поддерживаются
+фильтры `commands`, `content_types`, `func`, а также базовые `InlineKeyboardButton` и
+`InlineKeyboardMarkup` из `telebot.types`.
+
+Бот поддерживает однофайловый контракт, все 18 имён хуков Cardinal, импорты `cardinal`,
+`FunPayAPI` и базовые `telebot.types`. Плагины, которым нужны дополнительные сторонние
+Python-пакеты или нестандартные внутренние модули конкретной сборки Cardinal, потребуют добавить
+эти зависимости в образ хостинга.
 
 Исходники плагинов хранятся в PostgreSQL и восстанавливаются в `plugins_runtime/` при запуске.
-Плагины, которым нужны дополнительные сторонние Python-пакеты или нестандартные внутренние модули
-конкретной сборки Cardinal, потребуют добавить эти зависимости в образ хостинга.
+Выключенный плагин остаётся в базе, но его хуки и Telegram-обработчики не выполняются. При удалении
+исходник, настройки и обработчики удаляются.
 
 > Плагин выполняет произвольный Python-код с правами процесса бота. Он способен читать окружение,
 > обращаться к базе и управлять FunPay-аккаунтом. Устанавливайте только проверенные плагины.

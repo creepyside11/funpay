@@ -47,6 +47,67 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
 )
 
+AUTO_LOTS_PLUGIN_UUID = "77b095e0-13a1-4e12-9c52-3a7b83a89b11"
+ADVANCED_STATS_PLUGIN_UUID = "c55a4072-eab8-4d87-8f17-b111e4b8bb22"
+STATUS_PLUGIN_UUID = "b19339bb-8f13-49cb-a4c1-0d3a55e1cc33"
+
+
+@dataclass(frozen=True, slots=True)
+class ReadyPluginSpec:
+    uuid: str
+    filename: str
+    name: str
+    version: str
+    description: str
+    details: str
+
+
+READY_PLUGINS = (
+    ReadyPluginSpec(
+        AUTO_LOTS_PLUGIN_UUID,
+        "AutoLotsPlugin.py",
+        "AutoLotsPlugin",
+        "1.0.0",
+        "Массовое управление лотами",
+        "Показывает активные и выключенные лоты, массово активирует или "
+        "деактивирует обычные и валютные предложения. Обычные лоты можно массово удалить; "
+        "валютные предложения при удалении безопасно деактивируются.",
+    ),
+    ReadyPluginSpec(
+        ADVANCED_STATS_PLUGIN_UUID,
+        "AdvancedProfileStats.py",
+        "Advanced Profile Stats",
+        "1.0.0",
+        "Расширенная статистика профиля",
+        "Считает продажи, закрытые и возвращённые заказы, уникальных покупателей, "
+        "выручку и популярные лоты за выбранный период. Дополнительно показывает общий "
+        "баланс, доступную к выводу сумму и средства на удержании.",
+    ),
+    ReadyPluginSpec(
+        STATUS_PLUGIN_UUID,
+        "StatusPlugin.py",
+        "Status Plugin",
+        "1.0.0",
+        "Статус продавца в чатах FunPay",
+        "Позволяет задать собственный текст статуса. Покупатель отправляет в личном чате "
+        "FunPay команду #status и мгновенно получает настроенный ответ.",
+    ),
+)
+READY_PLUGIN_BY_UUID = {plugin.uuid: plugin for plugin in READY_PLUGINS}
+
+
+def ready_plugin_source(plugin: ReadyPluginSpec) -> str:
+    """Возвращает валидный однофайловый модуль формата FunPayCardinal."""
+    return (
+        f"NAME = {plugin.name!r}\n"
+        f"VERSION = {plugin.version!r}\n"
+        f"DESCRIPTION = {plugin.description!r}\n"
+        "CREDITS = 'FunPay aiogram bot'\n"
+        "SETTINGS_PAGE = True\n"
+        f"UUID = {plugin.uuid!r}\n"
+        "BIND_TO_DELETE = None\n"
+    )
+
 
 @dataclass(slots=True)
 class Config:
@@ -159,6 +220,17 @@ class Database:
                 enabled BOOLEAN NOT NULL DEFAULT TRUE,
                 uploaded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 PRIMARY KEY (telegram_id, uuid)
+            );
+
+            CREATE TABLE IF NOT EXISTS funpay_plugin_settings (
+                telegram_id BIGINT NOT NULL,
+                plugin_uuid TEXT NOT NULL,
+                setting_key TEXT NOT NULL,
+                setting_value TEXT NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (telegram_id, plugin_uuid, setting_key),
+                FOREIGN KEY (telegram_id, plugin_uuid)
+                    REFERENCES funpay_plugins(telegram_id, uuid) ON DELETE CASCADE
             );
             """
         )
@@ -356,6 +428,37 @@ class Database:
             uuid,
         )
 
+    async def get_plugin_setting(
+        self, telegram_id: int, uuid: str, key: str, default: str = ""
+    ) -> str:
+        row = await self.fetchrow(
+            """
+            SELECT setting_value FROM funpay_plugin_settings
+             WHERE telegram_id=$1 AND plugin_uuid=$2 AND setting_key=$3
+            """,
+            telegram_id,
+            uuid,
+            key,
+        )
+        return str(row["setting_value"]) if row else default
+
+    async def set_plugin_setting(
+        self, telegram_id: int, uuid: str, key: str, value: str
+    ) -> None:
+        await self.execute(
+            """
+            INSERT INTO funpay_plugin_settings
+                (telegram_id, plugin_uuid, setting_key, setting_value, updated_at)
+            VALUES ($1, $2, $3, $4, NOW())
+            ON CONFLICT (telegram_id, plugin_uuid, setting_key) DO UPDATE
+                SET setting_value=EXCLUDED.setting_value, updated_at=NOW()
+            """,
+            telegram_id,
+            uuid,
+            key,
+            value,
+        )
+
     async def active_users(self) -> list[asyncpg.Record]:
         return await self.fetch(
             """
@@ -548,6 +651,61 @@ def format_sales_stats(stats: SalesStats) -> str:
         f"Выручка по закрытым: <b>{revenue}</b>\n\n"
         f"🏆 <b>Популярные лоты</b>\n{top}{note}"
     )
+
+
+@dataclass
+class LotBulkResult:
+    common_total: int = 0
+    currency_total: int = 0
+    changed: int = 0
+    errors: list[str] = field(default_factory=list)
+
+
+def load_lot_inventory(account: Account) -> tuple[Any, list[Any], list[Any]]:
+    profile = account.get_user(account.id)
+    lots = profile.get_lots()
+    common = [
+        lot
+        for lot in lots
+        if lot.subcategory.type is types.SubCategoryTypes.COMMON
+    ]
+    currency = [
+        lot
+        for lot in lots
+        if lot.subcategory.type is types.SubCategoryTypes.CURRENCY
+    ]
+    return profile, common, currency
+
+
+def apply_bulk_lot_action(account: Account, action: str) -> LotBulkResult:
+    """Массово меняет обычные и валютные предложения одного аккаунта."""
+    if action not in {"activate", "deactivate", "delete"}:
+        raise ValueError("Неизвестное действие с лотами")
+    _, common, currency = load_lot_inventory(account)
+    result = LotBulkResult(len(common), len(currency))
+    for lot in common:
+        try:
+            if action == "delete":
+                account.delete_lot(int(lot.id))
+            else:
+                fields = account.get_lot_fields(int(lot.id))
+                fields.active = action == "activate"
+                account.save_lot(fields.renew_fields())
+            result.changed += 1
+        except Exception as exc:  # noqa: BLE001 - API операций с лотами выбрасывает разные исключения.
+            result.errors.append(f"{lot.id}: {clipped(exc, 120)}")
+
+    subcategories = {lot.subcategory.id: lot.subcategory for lot in currency}.values()
+    for subcategory in subcategories:
+        try:
+            fields = account.get_chip_fields(subcategory.id)
+            for offer in fields.chip_offers.values():
+                offer.active = action == "activate" if action != "delete" else False
+            account.save_chip(fields.renew_fields())
+            result.changed += len(fields.chip_offers)
+        except Exception as exc:  # noqa: BLE001 - API валютных лотов выбрасывает разные исключения.
+            result.errors.append(f"валюта {subcategory.id}: {clipped(exc, 120)}")
+    return result
 
 
 def order_status_label(status: types.OrderStatuses) -> str:
@@ -1028,6 +1186,27 @@ class RuntimeManager:
                         [InlineKeyboardButton(text="🌐 FunPay", url=f"https://funpay.com/chat/?node={chat_id}")],
                     ]),
                 )
+            if (
+                (message.text or "").strip().casefold() == "#status"
+                and self.plugins.is_enabled(runtime.telegram_id, STATUS_PLUGIN_UUID)
+            ):
+                status_text = await self.db.get_plugin_setting(
+                    runtime.telegram_id,
+                    STATUS_PLUGIN_UUID,
+                    "status_text",
+                    "🟢 Продавец на связи. Можете оформлять заказ.",
+                )
+                await asyncio.to_thread(
+                    runtime.account.send_message,
+                    message.chat_id,
+                    render_template(
+                        status_text,
+                        message=message,
+                        account=runtime.account,
+                    ),
+                    message.chat_name,
+                )
+                return
             hour = datetime.now().astimezone().hour
             if (
                 row["autoreply_enabled"]
@@ -1116,6 +1295,10 @@ class OrderState(StatesGroup):
 
 class PluginState(StatesGroup):
     file = State()
+
+
+class StatusPluginState(StatesGroup):
+    text = State()
 
 
 def keyboard(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
@@ -1699,19 +1882,18 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
             return
         plugin_runtime = manager.plugins.runtimes.get(user_id)
         plugins = list(plugin_runtime.plugins.values()) if plugin_runtime else []
+        ready_count = sum(plugin.uuid in READY_PLUGIN_BY_UUID for plugin in plugins)
         rows = [
-            [(f"{'✅' if plugin.enabled else '❌'} {clipped(plugin.name, 28)} v{clipped(plugin.version, 12)}", f"plugin_info:{plugin.uuid}")]
-            for plugin in plugins
-        ]
-        rows.extend([
+            [("🧰 Готовые плагины", "ready_plugins")],
+            [(f"🧩 Мои плагины ({len(plugins)})", "my_plugins")],
             [("➕ Загрузить плагин", "plugin_upload_warning")],
             [("📚 Документация", "plugin_docs")],
             [("⬅️ Меню", "menu")],
-        ])
+        ]
         await target.answer(
             "🧩 <b>Плагины FunPayCardinal</b>\n"
-            f"Установлено: <b>{len(plugins)}</b>\n\n"
-            "Поддерживаются одиночные .py-плагины с метаданными и списками хуков Cardinal.",
+            f"Установлено: <b>{len(plugins)}</b> · готовых: <b>{ready_count}</b>\n\n"
+            "Выберите готовое расширение или загрузите собственный однофайловый .py-плагин.",
             reply_markup=keyboard(rows),
         )
 
@@ -1720,32 +1902,221 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
         await callback.answer()
         await show_plugins(callback.message, callback.from_user.id)
 
+    async def show_my_plugins(target: Message, user_id: int) -> None:
+        if not await require_runtime(target, user_id):
+            return
+        plugin_runtime = manager.plugins.runtimes.get(user_id)
+        plugins = list(plugin_runtime.plugins.values()) if plugin_runtime else []
+        rows = [
+            [(
+                f"{'✅' if plugin.enabled else '❌'} {clipped(plugin.name, 27)} v{clipped(plugin.version, 10)}",
+                f"plugin_info:{plugin.uuid}",
+            )]
+            for plugin in plugins
+        ]
+        rows.append([("⬅️ Плагины", "plugins")])
+        text = (
+            "🧩 <b>Мои плагины</b>\n\n"
+            "Нажмите на плагин, чтобы открыть настройки, выключить или удалить его."
+            if plugins
+            else "🧩 <b>Мои плагины</b>\n\nПока ничего не установлено."
+        )
+        await target.answer(text, reply_markup=keyboard(rows))
+
+    @router.callback_query(F.data == "my_plugins")
+    async def my_plugins(callback: CallbackQuery) -> None:
+        await callback.answer()
+        await show_my_plugins(callback.message, callback.from_user.id)
+
+    async def show_ready_plugins(target: Message, user_id: int) -> None:
+        if not await require_runtime(target, user_id):
+            return
+        plugin_runtime = manager.plugins.runtimes.get(user_id)
+        installed = set(plugin_runtime.plugins) if plugin_runtime else set()
+        rows = [
+            [(
+                f"{'✅' if plugin.uuid in installed else '⬇️'} {plugin.name}",
+                f"ready_plugin:{plugin.uuid}",
+            )]
+            for plugin in READY_PLUGINS
+        ]
+        rows.append([("⬅️ Плагины", "plugins")])
+        await target.answer(
+            "🧰 <b>Готовые плагины</b>\n\n"
+            "Эти расширения встроены в проект, проверены загрузчиком и устанавливаются одной кнопкой. "
+            "✅ означает, что плагин уже находится в разделе «Мои плагины».",
+            reply_markup=keyboard(rows),
+        )
+
+    @router.callback_query(F.data == "ready_plugins")
+    async def ready_plugins(callback: CallbackQuery) -> None:
+        await callback.answer()
+        await show_ready_plugins(callback.message, callback.from_user.id)
+
+    @router.callback_query(F.data.startswith("ready_plugin:"))
+    async def ready_plugin_details(callback: CallbackQuery) -> None:
+        await callback.answer()
+        uuid = callback.data.split(":", 1)[1]
+        spec = READY_PLUGIN_BY_UUID.get(uuid)
+        if not spec:
+            await callback.message.answer("Готовый плагин не найден.")
+            return
+        installed = bool(
+            manager.plugins.runtimes.get(callback.from_user.id)
+            and uuid in manager.plugins.runtimes[callback.from_user.id].plugins
+        )
+        rows = []
+        if installed:
+            rows.append([("⚙️ Открыть", f"builtin_open:{uuid}")])
+            rows.append([("🧩 В моих плагинах", f"plugin_info:{uuid}")])
+        else:
+            rows.append([("⬇️ Установить", f"ready_install:{uuid}")])
+        rows.append([("⬅️ Готовые плагины", "ready_plugins")])
+        await callback.message.answer(
+            f"🧰 <b>{html.escape(spec.name)}</b> v{spec.version}\n"
+            f"<i>{html.escape(spec.description)}</i>\n\n"
+            f"{html.escape(spec.details)}\n\n"
+            f"Состояние: {'✅ установлен' if installed else 'не установлен'}",
+            reply_markup=keyboard(rows),
+        )
+
+    @router.callback_query(F.data.startswith("ready_install:"))
+    async def ready_plugin_install(callback: CallbackQuery) -> None:
+        uuid = callback.data.split(":", 1)[1]
+        spec = READY_PLUGIN_BY_UUID.get(uuid)
+        runtime = await require_runtime(callback.message, callback.from_user.id)
+        if not spec or not runtime:
+            await callback.answer("Плагин недоступен", show_alert=True)
+            return
+        if manager.plugins.runtimes.get(callback.from_user.id) and uuid in manager.plugins.runtimes[
+            callback.from_user.id
+        ].plugins:
+            await callback.answer("Плагин уже установлен", show_alert=True)
+            return
+        await callback.answer("Устанавливаю…")
+        try:
+            await manager.plugins.install(
+                callback.from_user.id,
+                spec.filename,
+                ready_plugin_source(spec),
+                runtime,
+            )
+        except Exception as exc:
+            logger.exception("Не удалось установить готовый плагин %s", uuid)
+            await callback.message.answer(
+                f"❌ Установка не выполнена: {html.escape(clipped(exc, 600))}"
+            )
+            return
+        await callback.message.answer(
+            f"✅ <b>{html.escape(spec.name)}</b> установлен.",
+            reply_markup=keyboard([
+                [("⚙️ Открыть", f"builtin_open:{uuid}")],
+                [("⬅️ Готовые плагины", "ready_plugins")],
+            ]),
+        )
+
     @router.callback_query(F.data == "plugin_docs")
     async def plugin_docs(callback: CallbackQuery) -> None:
         await callback.answer()
         await callback.message.answer(
-            "📚 <b>Формат плагинов FunPayCardinal</b>\n\n"
-            "Файл: одиночный UTF-8 <code>.py</code> до 512 КБ. Обязательные поля:\n"
-            "<code>NAME, VERSION, DESCRIPTION, CREDITS, SETTINGS_PAGE, UUID, BIND_TO_DELETE</code>.\n\n"
-            "Поддерживаемые хуки:\n"
-            "<code>BIND_TO_PRE_INIT, BIND_TO_POST_INIT, BIND_TO_PRE_START, BIND_TO_POST_START, "
-            "BIND_TO_PRE_STOP, BIND_TO_POST_STOP, BIND_TO_INIT_MESSAGE, "
-            "BIND_TO_MESSAGES_LIST_CHANGED, BIND_TO_LAST_CHAT_MESSAGE_CHANGED, "
-            "BIND_TO_NEW_MESSAGE, BIND_TO_INIT_ORDER, BIND_TO_NEW_ORDER, "
-            "BIND_TO_ORDERS_LIST_CHANGED, BIND_TO_ORDER_STATUS_CHANGED, "
-            "BIND_TO_PRE_DELIVERY, BIND_TO_POST_DELIVERY, BIND_TO_PRE_LOTS_RAISE, "
-            "BIND_TO_POST_LOTS_RAISE</code>.\n\n"
-            "Функции событий получают <code>(cardinal, event)</code>. Доступны импорты "
-            "<code>from cardinal import Cardinal, get_cardinal</code> и встроенный FunPayAPI.\n\n"
-            "⚠️ Плагин — произвольный Python-код и имеет доступ к аккаунту, окружению и процессу. "
-            "Устанавливайте только проверенные файлы.",
+            "📚 <b>Документация по плагинам</b>\n\n"
+            "Здесь описаны установка, полный контракт файла, события, Telegram-интерфейс и ограничения. "
+            "Начните с раздела «Быстрый старт», если создаёте первый плагин.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(
-                    text="🌐 Исходный FunPayCardinal",
-                    url="https://github.com/sidor0912/FunPayCardinal",
-                )],
+                [
+                    InlineKeyboardButton(text="🚀 Быстрый старт", callback_data="plugin_docs:start"),
+                    InlineKeyboardButton(text="🧱 Структура", callback_data="plugin_docs:structure"),
+                ],
+                [
+                    InlineKeyboardButton(text="⚡ Хуки", callback_data="plugin_docs:hooks"),
+                    InlineKeyboardButton(text="🤖 Telegram API", callback_data="plugin_docs:telegram"),
+                ],
+                [InlineKeyboardButton(text="🛡 Совместимость и безопасность", callback_data="plugin_docs:safety")],
+                [InlineKeyboardButton(text="🌐 Исходный FunPayCardinal", url="https://github.com/sidor0912/FunPayCardinal")],
                 [InlineKeyboardButton(text="⬅️ Плагины", callback_data="plugins")],
             ]),
+            disable_web_page_preview=True,
+        )
+
+    @router.callback_query(F.data.startswith("plugin_docs:"))
+    async def plugin_docs_page(callback: CallbackQuery) -> None:
+        await callback.answer()
+        page = callback.data.split(":", 1)[1]
+        code_example = html.escape(
+            """from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+NAME = "My Plugin"
+VERSION = "1.0.0"
+DESCRIPTION = "Описание"
+CREDITS = "Автор"
+SETTINGS_PAGE = False
+UUID = "создайте UUID версии 4"
+BIND_TO_DELETE = None
+
+def on_message(cardinal, event):
+    message = event.message
+    if str(message).strip() == "#hello":
+        cardinal.account.send_message(
+            message.chat_id, "Привет!", message.chat_name
+        )
+
+BIND_TO_NEW_MESSAGE = [on_message]
+"""
+        )
+        pages = {
+            "start": (
+                "🚀 <b>Быстрый старт</b>\n\n"
+                "1. Создайте один UTF-8 файл с расширением <code>.py</code>.\n"
+                "2. Добавьте обязательные метаданные и UUID4.\n"
+                "3. Создайте функции-обработчики и поместите их в нужные списки BIND_TO_*.\n"
+                "4. Откройте «Плагины → Загрузить плагин», подтвердите риск и отправьте файл документом.\n"
+                "5. После проверки плагин появится в «Мои плагины». Его можно выключить без удаления.\n\n"
+                "При перезапуске исходник восстанавливается из PostgreSQL автоматически. Максимальный размер — 512 КБ."
+            ),
+            "structure": (
+                "🧱 <b>Минимальная структура плагина</b>\n\n"
+                f"<pre>{code_example}</pre>\n"
+                "<b>Обязательные поля:</b> NAME, VERSION, DESCRIPTION и CREDITS — строки; "
+                "SETTINGS_PAGE — bool; UUID — канонический UUID4; BIND_TO_DELETE — функция или None. "
+                "Неиспользуемые BIND_TO_* можно не объявлять: загрузчик считает их пустыми списками."
+            ),
+            "hooks": (
+                "⚡ <b>Поддерживаемые хуки</b>\n\n"
+                "<b>Жизненный цикл:</b> PRE_INIT, POST_INIT, PRE_START, POST_START, PRE_STOP, POST_STOP.\n"
+                "<b>Сообщения:</b> INIT_MESSAGE, MESSAGES_LIST_CHANGED, LAST_CHAT_MESSAGE_CHANGED, NEW_MESSAGE.\n"
+                "<b>Заказы:</b> INIT_ORDER, NEW_ORDER, ORDERS_LIST_CHANGED, ORDER_STATUS_CHANGED.\n"
+                "<b>Операции:</b> PRE_DELIVERY, POST_DELIVERY, PRE_LOTS_RAISE, POST_LOTS_RAISE.\n\n"
+                "Перед каждым названием добавляется <code>BIND_TO_</code>. Событийный обработчик получает "
+                "<code>(cardinal, event)</code>; обработчики жизненного цикла — объект cardinal; обработчик удаления — "
+                "<code>(cardinal, callback)</code>. Ошибка одного обработчика записывается в лог и не останавливает остальные плагины."
+            ),
+            "telegram": (
+                "🤖 <b>Telegram API плагина</b>\n\n"
+                "Через <code>cardinal.telegram.bot</code> доступны: send_message, edit_message_text, "
+                "edit_message_reply_markup, answer_callback_query, delete_message, message_handler, "
+                "callback_query_handler и методы register_*_handler.\n\n"
+                "Поддержаны обычные фильтры <code>commands</code>, <code>content_types</code> и <code>func</code>, "
+                "а также InlineKeyboardButton/InlineKeyboardMarkup из <code>telebot.types</code>. "
+                "Telegram-обработчики автоматически перестают выполняться при выключении или удалении плагина.\n\n"
+                "FunPay доступен через <code>cardinal.account</code>, Runner — через <code>cardinal.runner</code>."
+            ),
+            "safety": (
+                "🛡 <b>Совместимость и безопасность</b>\n\n"
+                "Поддерживается однофайловый контракт и 18 имён хуков FunPayCardinal, импорты <code>cardinal</code>, "
+                "<code>FunPayAPI</code> и базовый слой <code>telebot.types</code>. Плагин, который импортирует дополнительные "
+                "пакеты или внутренние модули конкретной сборки Cardinal, потребует добавить их в Docker-образ.\n\n"
+                "⚠️ Python-плагин выполняется внутри процесса бота. Он может прочитать BOT_TOKEN, DATABASE_URL, "
+                "golden_key, обращаться к сети и управлять аккаунтом. Проверяйте исходный код, UUID и автора. "
+                "Выключение останавливает хуки, но для полного удаления недоверенного кода используйте кнопку «Удалить»."
+            ),
+        }
+        text = pages.get(page)
+        if not text:
+            await callback.message.answer("Раздел документации не найден.")
+            return
+        await callback.message.answer(
+            text,
+            reply_markup=keyboard([[("⬅️ Документация", "plugin_docs")]]),
             disable_web_page_preview=True,
         )
 
@@ -1825,6 +2196,14 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
             await callback.message.answer("Плагин не найден.")
             return
         hooks_count = sum(len(value) for value in plugin.hooks.values())
+        rows = []
+        if uuid in READY_PLUGIN_BY_UUID and plugin.enabled:
+            rows.append([("⚙️ Открыть", f"builtin_open:{uuid}")])
+        rows.extend([
+            [("Выключить" if plugin.enabled else "Включить", f"plugin_toggle:{uuid}")],
+            [("🗑 Удалить", f"plugin_delete_ask:{uuid}")],
+            [("⬅️ Мои плагины", "my_plugins")],
+        ])
         await callback.message.answer(
             f"🧩 <b>{html.escape(plugin.name)}</b> v{html.escape(plugin.version)}\n"
             f"{html.escape(plugin.description)}\n\n"
@@ -1833,11 +2212,7 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
             f"Хуков: <b>{hooks_count}</b>\n"
             f"Страница настроек Cardinal: {bool_icon(plugin.settings_page)}\n"
             f"Состояние: {bool_icon(plugin.enabled)}",
-            reply_markup=keyboard([
-                [("Выключить" if plugin.enabled else "Включить", f"plugin_toggle:{uuid}")],
-                [("🗑 Удалить", f"plugin_delete_ask:{uuid}")],
-                [("⬅️ Плагины", "plugins")],
-            ]),
+            reply_markup=keyboard(rows),
         )
 
     @router.callback_query(F.data.startswith("plugin_toggle:"))
@@ -1849,7 +2224,7 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
             await callback.answer("Плагин не найден", show_alert=True)
             return
         await callback.answer("Плагин включён" if enabled else "Плагин выключен")
-        await show_plugins(callback.message, callback.from_user.id)
+        await show_my_plugins(callback.message, callback.from_user.id)
 
     @router.callback_query(F.data.startswith("plugin_delete_ask:"))
     async def plugin_delete_ask(callback: CallbackQuery) -> None:
@@ -1876,7 +2251,234 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
             )
             return
         await callback.message.answer("✅ Плагин удалён.")
-        await show_plugins(callback.message, callback.from_user.id)
+        await show_my_plugins(callback.message, callback.from_user.id)
+
+    async def require_builtin_plugin(
+        target: Message, user_id: int, uuid: str
+    ) -> AccountRuntime | None:
+        runtime = await require_runtime(target, user_id)
+        if not runtime:
+            return None
+        if not manager.plugins.is_enabled(user_id, uuid):
+            await target.answer(
+                "Плагин не установлен или выключен.",
+                reply_markup=keyboard([[("🧰 Готовые плагины", "ready_plugins")]]),
+            )
+            return None
+        return runtime
+
+    async def show_auto_lots_plugin(target: Message, user_id: int) -> None:
+        runtime = await require_builtin_plugin(target, user_id, AUTO_LOTS_PLUGIN_UUID)
+        if not runtime:
+            return
+        try:
+            _, common, currency = await asyncio.to_thread(
+                load_lot_inventory, runtime.account
+            )
+        except Exception:
+            logger.exception("Не удалось получить лоты для AutoLotsPlugin")
+            await target.answer("❌ FunPay не отдал список лотов.")
+            return
+        all_lots = common + currency
+        active = sum(bool(lot.active) for lot in all_lots)
+        await target.answer(
+            "🗂 <b>AutoLotsPlugin</b>\n\n"
+            f"Всего предложений: <b>{len(all_lots)}</b>\n"
+            f"Активно: <b>{active}</b> · выключено: <b>{len(all_lots) - active}</b>\n"
+            f"Обычных лотов: <b>{len(common)}</b> · валютных: <b>{len(currency)}</b>\n\n"
+            "Активация и деактивация применяются к обоим типам. При массовом удалении "
+            "обычные лоты удаляются, а валютные предложения деактивируются, поскольку FunPay "
+            "хранит их группами.",
+            reply_markup=keyboard([
+                [("✅ Активировать все", "ready_lots:activate")],
+                [("⛔ Деактивировать все", "ready_lots:deactivate")],
+                [("🗑 Удалить все", "ready_lots:delete_ask")],
+                [("🔄 Обновить", f"builtin_open:{AUTO_LOTS_PLUGIN_UUID}")],
+                [("⬅️ Мои плагины", "my_plugins")],
+            ]),
+        )
+
+    async def show_status_plugin(target: Message, user_id: int) -> None:
+        if not await require_builtin_plugin(target, user_id, STATUS_PLUGIN_UUID):
+            return
+        status_text = await db.get_plugin_setting(
+            user_id,
+            STATUS_PLUGIN_UUID,
+            "status_text",
+            "🟢 Продавец на связи. Можете оформлять заказ.",
+        )
+        await target.answer(
+            "📡 <b>Status Plugin</b>\n\n"
+            "Покупатель должен отправить в личном чате FunPay команду <code>#status</code>. "
+            "Бот ответит следующим текстом:\n\n"
+            f"<blockquote>{html.escape(status_text)}</blockquote>\n"
+            "В тексте работают переменные автоответчика: $username, $chat_name, $account_name, $date и $time.",
+            reply_markup=keyboard([
+                [("✏️ Изменить статус", "ready_status:edit")],
+                [("⬅️ Мои плагины", "my_plugins")],
+            ]),
+        )
+
+    async def show_advanced_stats_plugin(target: Message, user_id: int) -> None:
+        if not await require_builtin_plugin(
+            target, user_id, ADVANCED_STATS_PLUGIN_UUID
+        ):
+            return
+        await target.answer(
+            "📈 <b>Advanced Profile Stats</b>\n\n"
+            "Выберите период. Плагин посчитает продажи и выручку, затем добавит актуальный "
+            "баланс, доступную к выводу сумму и средства на удержании.",
+            reply_markup=keyboard([
+                [("24 часа", "ready_stats:1"), ("7 дней", "ready_stats:7")],
+                [("30 дней", "ready_stats:30"), ("90 дней", "ready_stats:90")],
+                [("Год", "ready_stats:365"), ("Всё время", "ready_stats:all")],
+                [("⬅️ Мои плагины", "my_plugins")],
+            ]),
+        )
+
+    @router.callback_query(F.data.startswith("builtin_open:"))
+    async def builtin_plugin_open(callback: CallbackQuery) -> None:
+        await callback.answer()
+        uuid = callback.data.split(":", 1)[1]
+        if uuid == AUTO_LOTS_PLUGIN_UUID:
+            await show_auto_lots_plugin(callback.message, callback.from_user.id)
+        elif uuid == ADVANCED_STATS_PLUGIN_UUID:
+            await show_advanced_stats_plugin(callback.message, callback.from_user.id)
+        elif uuid == STATUS_PLUGIN_UUID:
+            await show_status_plugin(callback.message, callback.from_user.id)
+        else:
+            await callback.message.answer("Для этого плагина нет встроенной страницы настроек.")
+
+    @router.callback_query(F.data.startswith("ready_lots:"))
+    async def ready_lots_action(callback: CallbackQuery) -> None:
+        action = callback.data.split(":", 1)[1]
+        runtime = await require_builtin_plugin(
+            callback.message, callback.from_user.id, AUTO_LOTS_PLUGIN_UUID
+        )
+        if not runtime:
+            await callback.answer()
+            return
+        if action == "delete_ask":
+            await callback.answer()
+            await callback.message.answer(
+                "⚠️ <b>Удалить все обычные лоты?</b>\n\n"
+                "Операция необратима. Валютные предложения будут деактивированы. "
+                "Продолжить?",
+                reply_markup=keyboard([
+                    [("Да, удалить все", "ready_lots:delete")],
+                    [("Отмена", f"builtin_open:{AUTO_LOTS_PLUGIN_UUID}")],
+                ]),
+            )
+            return
+        if action not in {"activate", "deactivate", "delete"}:
+            await callback.answer("Неизвестное действие", show_alert=True)
+            return
+        await callback.answer("Выполняю…")
+        progress = await callback.message.answer(
+            "⏳ Обрабатываю лоты последовательно. Это может занять несколько минут."
+        )
+        try:
+            result = await asyncio.to_thread(
+                apply_bulk_lot_action, runtime.account, action
+            )
+        except Exception as exc:
+            logger.exception("Ошибка массового управления лотами")
+            await progress.edit_text(
+                f"❌ Операция не выполнена: {html.escape(clipped(exc, 600))}"
+            )
+            return
+        action_label = {
+            "activate": "активировано",
+            "deactivate": "деактивировано",
+            "delete": "удалено/деактивировано",
+        }[action]
+        errors = "\n".join(
+            f"• {html.escape(error)}" for error in result.errors[:10]
+        )
+        error_text = (
+            f"\n\nОшибок: <b>{len(result.errors)}</b>\n{errors}"
+            if result.errors
+            else ""
+        )
+        await progress.edit_text(
+            f"✅ Завершено: {action_label} <b>{result.changed}</b> предложений.\n"
+            f"Найдено обычных: {result.common_total}, валютных: {result.currency_total}"
+            f"{error_text}",
+            reply_markup=keyboard([
+                [("🔄 Обновить список", f"builtin_open:{AUTO_LOTS_PLUGIN_UUID}")]
+            ]),
+        )
+
+    @router.callback_query(F.data.startswith("ready_stats:"))
+    async def ready_stats_period(callback: CallbackQuery) -> None:
+        runtime = await require_builtin_plugin(
+            callback.message, callback.from_user.id, ADVANCED_STATS_PLUGIN_UUID
+        )
+        if not runtime:
+            await callback.answer()
+            return
+        raw_period = callback.data.split(":", 1)[1]
+        days = None if raw_period == "all" else int(raw_period)
+        await callback.answer("Собираю статистику…")
+        try:
+            stats = await asyncio.to_thread(load_sales_stats, runtime.account, days)
+        except Exception:
+            logger.exception("Advanced Profile Stats не получил продажи")
+            await callback.message.answer("❌ FunPay не отдал историю продаж.")
+            return
+        try:
+            balance = await asyncio.to_thread(load_detailed_balance, runtime.account)
+            balance_text = (
+                "\n\n💳 <b>Средства</b>\n"
+                f"Можно вывести: <b>{format_money(balance.available_rub)} ₽ · "
+                f"{format_money(balance.available_usd)} $ · {format_money(balance.available_eur)} €</b>\n"
+                f"На удержании: {format_money(balance.total_rub - balance.available_rub)} ₽ · "
+                f"{format_money(balance.total_usd - balance.available_usd)} $ · "
+                f"{format_money(balance.total_eur - balance.available_eur)} €\n"
+                f"Всего: {format_money(balance.total_rub)} ₽ · {format_money(balance.total_usd)} $ · "
+                f"{format_money(balance.total_eur)} €"
+            )
+        except Exception:
+            logger.exception("Advanced Profile Stats не получил баланс")
+            balance_text = "\n\n⚠️ Не удалось загрузить подробный баланс."
+        await callback.message.answer(
+            format_sales_stats(stats) + balance_text,
+            reply_markup=keyboard([
+                [("📅 Другой период", f"builtin_open:{ADVANCED_STATS_PLUGIN_UUID}")]
+            ]),
+        )
+
+    @router.callback_query(F.data == "ready_status:edit")
+    async def ready_status_edit(callback: CallbackQuery, state: FSMContext) -> None:
+        if not await require_builtin_plugin(
+            callback.message, callback.from_user.id, STATUS_PLUGIN_UUID
+        ):
+            await callback.answer()
+            return
+        await callback.answer()
+        await state.clear()
+        await state.set_state(StatusPluginState.text)
+        await callback.message.answer(
+            "Отправьте новый текст статуса: от 1 до 600 символов. "
+            "Разрешены переменные автоответчика. Для отмены: /cancel"
+        )
+
+    @router.message(StatusPluginState.text, F.text)
+    async def ready_status_save(message: Message, state: FSMContext) -> None:
+        if not manager.plugins.is_enabled(message.from_user.id, STATUS_PLUGIN_UUID):
+            await state.clear()
+            await message.answer("Status Plugin выключен или удалён.")
+            return
+        value = message.text.strip()
+        if not 1 <= len(value) <= 600:
+            await message.answer("Текст должен содержать от 1 до 600 символов.")
+            return
+        await db.set_plugin_setting(
+            message.from_user.id, STATUS_PLUGIN_UUID, "status_text", value
+        )
+        await state.clear()
+        await message.answer("✅ Статус сохранён.")
+        await show_status_plugin(message, message.from_user.id)
 
     async def show_chat_carousel(target: Message, user_id: int, index: int) -> None:
         runtime = await require_runtime(target, user_id)
