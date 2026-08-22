@@ -474,6 +474,26 @@ class Database:
                 PRIMARY KEY (telegram_id, deal_id)
             );
 
+            CREATE TABLE IF NOT EXISTS playerok_promotion_requests (
+                token TEXT PRIMARY KEY,
+                telegram_id BIGINT NOT NULL REFERENCES funpay_users(telegram_id) ON DELETE CASCADE,
+                account_id BIGINT NOT NULL REFERENCES marketplace_accounts(id) ON DELETE CASCADE,
+                item_id TEXT NOT NULL,
+                item_title TEXT NOT NULL,
+                priority_status_id TEXT NOT NULL,
+                priority_name TEXT NOT NULL,
+                expected_price INTEGER NOT NULL CHECK (expected_price > 0),
+                period_days INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending', 'processing', 'succeeded', 'failed')),
+                error_text TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+
+            CREATE INDEX IF NOT EXISTS playerok_promotion_requests_user_idx
+                ON playerok_promotion_requests (telegram_id, created_at DESC);
+
             CREATE TABLE IF NOT EXISTS playerok_plugins (
                 telegram_id BIGINT NOT NULL REFERENCES funpay_users(telegram_id) ON DELETE CASCADE,
                 uuid TEXT NOT NULL,
@@ -1835,6 +1855,84 @@ class Database:
             details,
         )
 
+    async def create_playerok_promotion_request(
+        self,
+        telegram_id: int,
+        account_id: int,
+        item_id: str,
+        item_title: str,
+        priority_status_id: str,
+        priority_name: str,
+        expected_price: int,
+        period_days: int,
+    ) -> asyncpg.Record:
+        token = os.urandom(8).hex()
+        row = await self.fetchrow(
+            """
+            INSERT INTO playerok_promotion_requests
+                (token, telegram_id, account_id, item_id, item_title,
+                 priority_status_id, priority_name, expected_price, period_days)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            RETURNING *
+            """,
+            token,
+            telegram_id,
+            account_id,
+            item_id,
+            clipped(item_title, 500),
+            priority_status_id,
+            clipped(priority_name, 200),
+            expected_price,
+            period_days,
+        )
+        if not row:
+            raise RuntimeError("Не удалось создать запрос продвижения")
+        return row
+
+    async def get_playerok_promotion_request(
+        self, telegram_id: int, token: str
+    ) -> asyncpg.Record | None:
+        return await self.fetchrow(
+            """
+            SELECT * FROM playerok_promotion_requests
+             WHERE telegram_id=$1 AND token=$2
+            """,
+            telegram_id,
+            token,
+        )
+
+    async def claim_playerok_promotion_request(
+        self, telegram_id: int, token: str
+    ) -> asyncpg.Record | None:
+        return await self.fetchrow(
+            """
+            UPDATE playerok_promotion_requests
+               SET status='processing', updated_at=NOW()
+             WHERE telegram_id=$1 AND token=$2 AND status='pending'
+               AND created_at > NOW() - INTERVAL '15 minutes'
+            RETURNING *
+            """,
+            telegram_id,
+            token,
+        )
+
+    async def finish_playerok_promotion_request(
+        self, telegram_id: int, token: str, status: str, error_text: str = ""
+    ) -> None:
+        if status not in {"succeeded", "failed"}:
+            raise ValueError("Неизвестный статус продвижения")
+        await self.execute(
+            """
+            UPDATE playerok_promotion_requests
+               SET status=$3, error_text=$4, updated_at=NOW()
+             WHERE telegram_id=$1 AND token=$2 AND status='processing'
+            """,
+            telegram_id,
+            token,
+            status,
+            clipped(error_text, 1000),
+        )
+
     async def restore_playerok_delivery_products(
         self, telegram_id: int, rule_id: int, products: list[str]
     ) -> None:
@@ -2127,6 +2225,27 @@ def render_playerok_template(
 
 def format_money(value: float) -> str:
     return f"{value:,.2f}".replace(",", " ").rstrip("0").rstrip(".")
+
+
+def playerok_paid_priorities(values: list[Any]) -> list[Any]:
+    """Оставляет платные тарифы Playerok и сортирует их по цене."""
+    result = []
+    for value in values:
+        try:
+            price = int(getattr(value, "price", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if price > 0 and getattr(value, "id", None):
+            result.append(value)
+    return sorted(result, key=lambda item: int(item.price))
+
+
+def playerok_priority_label(value: Any) -> str:
+    name = str(getattr(value, "name", None) or "Продвижение")
+    period = int(getattr(value, "period", 0) or 0)
+    price = int(getattr(value, "price", 0) or 0)
+    duration = f" · {period} дн." if period else ""
+    return f"{name}{duration} · {format_money(price)} ₽"
 
 
 def within_work_hours(start: int, end: int, hour: int) -> bool:
@@ -5363,6 +5482,7 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
             "Автовыставление каждые 5 минут публикует до 24 черновиков с бесплатным приоритетом. "
             "Создавать универсальные объявления автоматически нельзя: обязательные поля различаются по категориям.",
             reply_markup=keyboard([
+                [("🚀 Платное продвижение", "po_promotion")],
                 [(f"{bool_icon(row['playerok_auto_publish_enabled'])} Автовыставление", "po_auto_publish_toggle")],
                 [("📤 Выставить черновики сейчас", "po_publish_drafts")],
                 [("🔄 Обновить", "po_items"), ("⬅️ Меню", "menu")],
@@ -5373,6 +5493,278 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
     async def playerok_items(callback: CallbackQuery) -> None:
         await callback.answer("Загружаю…")
         await show_playerok_items(callback.message, callback.from_user.id)
+
+    async def load_playerok_promotion_data(
+        runtime: PlayerokRuntime, item_id: str
+    ) -> tuple[Any, list[Any]]:
+        if PlayerokItemStatuses is None:
+            raise RuntimeError("PlayerokAPI не загрузил статусы объявлений")
+        page = await asyncio.to_thread(
+            runtime.account.get_my_items,
+            statuses=[PlayerokItemStatuses.APPROVED],
+            count=24,
+        )
+        item = next(
+            (
+                candidate
+                for candidate in list(getattr(page, "items", []) or [])
+                if str(candidate.id) == item_id
+            ),
+            None,
+        )
+        if not item:
+            raise RuntimeError(
+                "активное объявление не найдено на первой странице"
+            )
+        priorities = await asyncio.to_thread(
+            runtime.account.get_item_priority_statuses,
+            str(item.id),
+            int(item.price),
+        )
+        return item, playerok_paid_priorities(list(priorities or []))
+
+    async def show_playerok_promotion(target: Message, user_id: int) -> None:
+        runtime = await require_playerok_runtime(target, user_id)
+        if not runtime or PlayerokItemStatuses is None:
+            return
+        try:
+            page = await asyncio.to_thread(
+                runtime.account.get_my_items,
+                statuses=[PlayerokItemStatuses.APPROVED],
+                count=24,
+            )
+        except Exception as exc:
+            logger.exception("Playerok: не загружены объявления для продвижения")
+            await target.answer(
+                f"❌ Продвижение недоступно: {html.escape(clipped(exc, 500))}"
+            )
+            return
+        items = list(getattr(page, "items", []) or [])
+        rows = [
+            [(
+                f"📢 {clipped(item.name, 31)} · {format_money(item.price)} ₽",
+                f"po_promo_item:{item.id}",
+            )]
+            for item in items
+        ]
+        rows.append([(
+            "⬅️ Объявления",
+            "po_items",
+        )])
+        await target.answer(
+            "🚀 <b>Платное продвижение Playerok</b>\n\n"
+            "Выберите активное объявление. Деньги не спишутся до отдельного подтверждения.\n\n"
+            f"Найдено: <b>{len(items)}</b> из <b>{getattr(page, 'total_count', len(items))}</b>.",
+            reply_markup=keyboard(rows),
+        )
+
+    @router.callback_query(F.data == "po_promotion")
+    async def playerok_promotion(callback: CallbackQuery) -> None:
+        await callback.answer("Загружаю…")
+        await show_playerok_promotion(callback.message, callback.from_user.id)
+
+    @router.callback_query(F.data.startswith("po_promo_item:"))
+    async def playerok_promotion_item(callback: CallbackQuery) -> None:
+        item_id = callback.data.split(":", 1)[1]
+        runtime = await require_playerok_runtime(
+            callback.message, callback.from_user.id
+        )
+        if not runtime:
+            return
+        await callback.answer("Загружаю тарифы…")
+        try:
+            item, priorities = await load_playerok_promotion_data(runtime, item_id)
+        except Exception as exc:
+            logger.exception("Playerok: не загружены тарифы продвижения")
+            await callback.message.answer(
+                f"❌ Не удалось загрузить тарифы: {html.escape(clipped(exc, 500))}"
+            )
+            return
+        if not priorities:
+            await callback.message.answer(
+                "Для этого объявления Playerok не вернул платных тарифов.",
+                reply_markup=keyboard([[("⬅️ К объявлениям", "po_promotion")]]),
+            )
+            return
+        rows = [
+            [(
+                f"💳 {clipped(playerok_priority_label(priority), 52)}",
+                f"po_promo_ask:{item.id}:{index}",
+            )]
+            for index, priority in enumerate(priorities)
+        ]
+        rows.append([(
+            "⬅️ Другое объявление",
+            "po_promotion",
+        )])
+        current_priority = getattr(
+            getattr(item, "priority", None), "name", "DEFAULT"
+        )
+        await callback.message.answer(
+            f"📢 <b>{html.escape(clipped(item.name, 900))}</b>\n"
+            f"Цена товара: <b>{format_money(item.price)} ₽</b>\n"
+            f"Текущий приоритет: <code>{html.escape(str(current_priority))}</code>\n\n"
+            "Выберите тариф:",
+            reply_markup=keyboard(rows),
+        )
+
+    @router.callback_query(F.data.startswith("po_promo_ask:"))
+    async def playerok_promotion_ask(callback: CallbackQuery) -> None:
+        try:
+            _, item_id, raw_index = callback.data.split(":", 2)
+            index = int(raw_index)
+        except (TypeError, ValueError):
+            await callback.answer("Некорректный тариф", show_alert=True)
+            return
+        runtime = await require_playerok_runtime(
+            callback.message, callback.from_user.id
+        )
+        if not runtime:
+            return
+        await callback.answer("Проверяю…")
+        try:
+            item, priorities = await load_playerok_promotion_data(runtime, item_id)
+            priority = priorities[index]
+            account = await asyncio.to_thread(runtime.account.get)
+            balance = account.profile.balance
+            available_value = getattr(balance, "available", None)
+            if available_value is None:
+                available_value = getattr(balance, "value", 0)
+            available = float(available_value or 0)
+        except Exception as exc:
+            logger.exception("Playerok: не подготовлено подтверждение продвижения")
+            await callback.message.answer(
+                f"❌ Не удалось проверить тариф: {html.escape(clipped(exc, 500))}"
+            )
+            return
+        price = int(priority.price)
+        if available < price:
+            await callback.message.answer(
+                "❌ <b>Недостаточно средств</b>\n\n"
+                f"Тариф: <b>{html.escape(playerok_priority_label(priority))}</b>\n"
+                f"Доступно: <b>{format_money(available)} ₽</b>",
+                reply_markup=keyboard([[("⬅️ К тарифам", f"po_promo_item:{item_id}")]]),
+            )
+            return
+        request = await db.create_playerok_promotion_request(
+            callback.from_user.id,
+            runtime.account_key,
+            str(item.id),
+            str(item.name),
+            str(priority.id),
+            str(priority.name),
+            price,
+            int(getattr(priority, "period", 0) or 0),
+        )
+        await callback.message.answer(
+            "⚠️ <b>Подтвердите платное продвижение</b>\n\n"
+            f"Аккаунт: <b>{html.escape(runtime.account_label)}</b>\n"
+            f"Объявление: <b>{html.escape(clipped(item.name, 700))}</b>\n"
+            f"Тариф: <b>{html.escape(playerok_priority_label(priority))}</b>\n"
+            f"Баланс: <b>{format_money(available)} ₽</b>\n\n"
+            f"После нажатия Playerok спишет <b>{format_money(price)} ₽</b> с баланса. "
+            "Подтверждение действует 15 минут.",
+            reply_markup=keyboard([
+                [("💳 Оплатить и продвинуть", f"po_promo_do:{request['token']}")],
+                [("❌ Отмена", f"po_promo_item:{item_id}")],
+            ]),
+        )
+
+    @router.callback_query(F.data.startswith("po_promo_do:"))
+    async def playerok_promotion_do(callback: CallbackQuery) -> None:
+        token = callback.data.split(":", 1)[1]
+        request = await db.get_playerok_promotion_request(
+            callback.from_user.id, token
+        )
+        if not request:
+            await callback.answer("Запрос не найден", show_alert=True)
+            return
+        runtime = await require_playerok_runtime(
+            callback.message, callback.from_user.id
+        )
+        if not runtime:
+            return
+        if runtime.account_key != int(request["account_id"]):
+            await callback.answer("Выберан другой аккаунт", show_alert=True)
+            await callback.message.answer(
+                "Переключитесь на аккаунт, для которого создано подтверждение.",
+                reply_markup=keyboard([[(
+                    "🔄 Переключить аккаунт",
+                    f"account_select:playerok:{request['account_id']}",
+                )]]),
+            )
+            return
+        claimed = await db.claim_playerok_promotion_request(
+            callback.from_user.id, token
+        )
+        if not claimed:
+            await callback.answer(
+                "Уже обработано или истекло",
+                show_alert=True,
+            )
+            return
+        await callback.answer("Оплачиваю…")
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except TelegramBadRequest:
+            pass
+        try:
+            item, priorities = await load_playerok_promotion_data(
+                runtime, str(claimed["item_id"])
+            )
+            priority = next(
+                (
+                    candidate
+                    for candidate in priorities
+                    if str(candidate.id) == str(claimed["priority_status_id"])
+                ),
+                None,
+            )
+            if not priority:
+                raise RuntimeError("тариф больше недоступен")
+            if int(priority.price) != int(claimed["expected_price"]):
+                raise RuntimeError(
+                    "стоимость тарифа изменилась; создайте новое подтверждение"
+                )
+            account = await asyncio.to_thread(runtime.account.get)
+            balance = account.profile.balance
+            available_value = getattr(balance, "available", None)
+            if available_value is None:
+                available_value = getattr(balance, "value", 0)
+            available = float(available_value or 0)
+            if available < int(claimed["expected_price"]):
+                raise RuntimeError("на балансе больше недостаточно средств")
+            result = await asyncio.to_thread(
+                runtime.account.increase_item_priority_status,
+                str(item.id),
+                str(priority.id),
+            )
+        except Exception as exc:
+            logger.exception("Playerok: платное продвижение не выполнено")
+            await db.finish_playerok_promotion_request(
+                callback.from_user.id, token, "failed", str(exc)
+            )
+            await callback.message.answer(
+                "❌ <b>Продвижение не выполнено</b>\n\n"
+                f"<code>{html.escape(clipped(exc, 700))}</code>",
+                reply_markup=keyboard([[("🔄 Выбрать тариф заново", f"po_promo_item:{claimed['item_id']}")]]),
+            )
+            return
+        await db.finish_playerok_promotion_request(
+            callback.from_user.id, token, "succeeded"
+        )
+        expiration = getattr(result, "status_expiration_date", None)
+        await callback.message.answer(
+            "✅ <b>Объявление продвинуто</b>\n\n"
+            f"📢 {html.escape(clipped(claimed['item_title'], 800))}\n"
+            f"🚀 Тариф: <b>{html.escape(claimed['priority_name'])}</b>\n"
+            f"💳 Списано: <b>{format_money(claimed['expected_price'])} ₽</b>"
+            + (f"\n📅 До: <code>{html.escape(str(expiration))}</code>" if expiration else ""),
+            reply_markup=keyboard([
+                [("🚀 Продвинуть другое", "po_promotion")],
+                [("⬅️ Объявления", "po_items")],
+            ]),
+        )
 
     @router.callback_query(F.data == "po_auto_publish_toggle")
     async def playerok_auto_publish_toggle(callback: CallbackQuery) -> None:

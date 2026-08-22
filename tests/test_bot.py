@@ -628,6 +628,18 @@ def test_playerok_draft_publication_uses_free_priority(monkeypatch):
     assert published == [("item-1", "free")]
 
 
+def test_playerok_paid_priorities_exclude_free_and_sort_by_price():
+    free = SimpleNamespace(id="free", name="Базовый", price=0, period=0)
+    week = SimpleNamespace(id="week", name="Premium", price=350, period=7)
+    day = SimpleNamespace(id="day", name="Boost", price=100, period=1)
+    invalid = SimpleNamespace(id=None, name="Broken", price=50, period=1)
+
+    result = bot_module.playerok_paid_priorities([free, week, invalid, day])
+
+    assert [item.id for item in result] == ["day", "week"]
+    assert bot_module.playerok_priority_label(day) == "Boost · 1 дн. · 100 ₽"
+
+
 def test_conversation_actions_do_not_force_main_menu():
     callbacks = {
         button.callback_data
