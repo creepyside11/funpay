@@ -39,6 +39,15 @@ from cryptography.fernet import Fernet, InvalidToken
 
 from FunPayAPI import Account, Runner, events, types
 from FunPayAPI import exceptions as fp_exceptions
+from playerok_plugin_system import (
+    PLAYEROK_READY_PLUGIN_BY_UUID,
+    PLAYEROK_READY_PLUGINS,
+    PlayerokPluginData,
+    PlayerokPluginManager,
+    PlayerokPluginValidationError,
+    playerok_ready_plugin_source,
+    playerok_setting_label,
+)
 from plugin_system import PluginData, PluginManager, PluginValidationError
 
 try:
@@ -63,6 +72,9 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
 )
 PLUGIN_DOCUMENTATION_PATH = Path(__file__).with_name("PLUGIN_DEVELOPMENT.md")
+PLAYEROK_PLUGIN_DOCUMENTATION_PATH = Path(__file__).with_name(
+    "PLAYEROK_PLUGIN_DEVELOPMENT.md"
+)
 
 AUTO_LOTS_PLUGIN_UUID = "77b095e0-13a1-4e12-9c52-3a7b83a89b11"
 ADVANCED_STATS_PLUGIN_UUID = "c55a4072-eab8-4d87-8f17-b111e4b8bb22"
@@ -438,9 +450,57 @@ class Database:
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 PRIMARY KEY (telegram_id, deal_id)
             );
+
+            CREATE TABLE IF NOT EXISTS playerok_plugins (
+                telegram_id BIGINT NOT NULL REFERENCES funpay_users(telegram_id) ON DELETE CASCADE,
+                uuid TEXT NOT NULL,
+                filename TEXT NOT NULL,
+                name TEXT NOT NULL,
+                version TEXT NOT NULL,
+                description TEXT NOT NULL,
+                credits TEXT NOT NULL,
+                settings_page BOOLEAN NOT NULL DEFAULT FALSE,
+                source TEXT NOT NULL,
+                enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                uploaded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (telegram_id, uuid)
+            );
+
+            CREATE TABLE IF NOT EXISTS playerok_plugin_settings (
+                telegram_id BIGINT NOT NULL,
+                plugin_uuid TEXT NOT NULL,
+                setting_key TEXT NOT NULL,
+                setting_value TEXT NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (telegram_id, plugin_uuid, setting_key),
+                FOREIGN KEY (telegram_id, plugin_uuid)
+                    REFERENCES playerok_plugins(telegram_id, uuid) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS playerok_plugin_catalog (
+                uuid TEXT PRIMARY KEY,
+                owner_telegram_id BIGINT REFERENCES funpay_users(telegram_id) ON DELETE CASCADE,
+                publisher_name TEXT NOT NULL,
+                filename TEXT NOT NULL,
+                name TEXT NOT NULL,
+                version TEXT NOT NULL,
+                short_description TEXT NOT NULL,
+                description TEXT NOT NULL,
+                credits TEXT NOT NULL,
+                source TEXT NOT NULL,
+                is_official BOOLEAN NOT NULL DEFAULT FALSE,
+                install_count BIGINT NOT NULL DEFAULT 0,
+                published_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+
+            CREATE INDEX IF NOT EXISTS playerok_plugin_catalog_order_idx
+                ON playerok_plugin_catalog
+                (is_official DESC, install_count DESC, updated_at DESC);
             """
         )
         await self.seed_official_plugins()
+        await self.seed_official_playerok_plugins()
 
     async def close(self) -> None:
         if self.pool:
@@ -852,6 +912,201 @@ class Database:
         await self.execute(
             """
             INSERT INTO funpay_plugin_settings
+                (telegram_id, plugin_uuid, setting_key, setting_value, updated_at)
+            VALUES ($1, $2, $3, $4, NOW())
+            ON CONFLICT (telegram_id, plugin_uuid, setting_key) DO UPDATE
+                SET setting_value=EXCLUDED.setting_value, updated_at=NOW()
+            """,
+            telegram_id,
+            uuid,
+            key,
+            value,
+        )
+
+    async def seed_official_playerok_plugins(self) -> None:
+        for plugin in PLAYEROK_READY_PLUGINS:
+            await self.execute(
+                """
+                INSERT INTO playerok_plugin_catalog
+                    (uuid, owner_telegram_id, publisher_name, filename, name, version,
+                     short_description, description, credits, source, is_official)
+                VALUES ($1, NULL, 'Команда проекта', $2, $3, $4, $5, $6,
+                        'FunPay aiogram bot', $7, TRUE)
+                ON CONFLICT (uuid) DO UPDATE
+                    SET publisher_name=EXCLUDED.publisher_name,
+                        filename=EXCLUDED.filename, name=EXCLUDED.name,
+                        version=EXCLUDED.version,
+                        short_description=EXCLUDED.short_description,
+                        description=EXCLUDED.description, credits=EXCLUDED.credits,
+                        source=EXCLUDED.source, is_official=TRUE, updated_at=NOW()
+                  WHERE playerok_plugin_catalog.is_official=TRUE
+                """,
+                plugin.uuid,
+                plugin.filename,
+                plugin.name,
+                plugin.version,
+                plugin.description,
+                plugin.details,
+                playerok_ready_plugin_source(plugin),
+            )
+
+    async def list_playerok_plugins(self, telegram_id: int) -> list[asyncpg.Record]:
+        return await self.fetch(
+            "SELECT * FROM playerok_plugins WHERE telegram_id=$1 ORDER BY uploaded_at, name",
+            telegram_id,
+        )
+
+    async def get_playerok_plugin(
+        self, telegram_id: int, uuid: str
+    ) -> asyncpg.Record | None:
+        return await self.fetchrow(
+            "SELECT * FROM playerok_plugins WHERE telegram_id=$1 AND uuid=$2",
+            telegram_id,
+            uuid,
+        )
+
+    async def list_playerok_catalog_plugins(
+        self, limit: int, offset: int
+    ) -> tuple[list[asyncpg.Record], int]:
+        rows = await self.fetch(
+            """
+            SELECT * FROM playerok_plugin_catalog
+             ORDER BY is_official DESC, install_count DESC, updated_at DESC, name
+             LIMIT $1 OFFSET $2
+            """,
+            limit,
+            offset,
+        )
+        count_row = await self.fetchrow(
+            "SELECT COUNT(*) AS count FROM playerok_plugin_catalog"
+        )
+        return rows, int(count_row["count"]) if count_row else 0
+
+    async def get_playerok_catalog_plugin(self, uuid: str) -> asyncpg.Record | None:
+        return await self.fetchrow(
+            "SELECT * FROM playerok_plugin_catalog WHERE uuid=$1", uuid
+        )
+
+    async def publish_playerok_catalog_plugin(
+        self,
+        telegram_id: int,
+        uuid: str,
+        publisher_name: str,
+        description: str,
+    ) -> bool:
+        row = await self.fetchrow(
+            """
+            INSERT INTO playerok_plugin_catalog
+                (uuid, owner_telegram_id, publisher_name, filename, name, version,
+                 short_description, description, credits, source, is_official,
+                 published_at, updated_at)
+            SELECT uuid, telegram_id, $3, filename, name, version, description, $4,
+                   credits, source, FALSE, NOW(), NOW()
+              FROM playerok_plugins
+             WHERE telegram_id=$1 AND uuid=$2
+            ON CONFLICT (uuid) DO UPDATE
+                SET publisher_name=EXCLUDED.publisher_name,
+                    filename=EXCLUDED.filename, name=EXCLUDED.name,
+                    version=EXCLUDED.version,
+                    short_description=EXCLUDED.short_description,
+                    description=EXCLUDED.description, credits=EXCLUDED.credits,
+                    source=EXCLUDED.source, updated_at=NOW()
+              WHERE playerok_plugin_catalog.owner_telegram_id=$1
+                AND playerok_plugin_catalog.is_official=FALSE
+            RETURNING uuid
+            """,
+            telegram_id,
+            uuid,
+            publisher_name,
+            description,
+        )
+        return row is not None
+
+    async def unpublish_playerok_catalog_plugin(
+        self, telegram_id: int, uuid: str
+    ) -> bool:
+        result = await self.execute(
+            """
+            DELETE FROM playerok_plugin_catalog
+             WHERE uuid=$1 AND owner_telegram_id=$2 AND is_official=FALSE
+            """,
+            uuid,
+            telegram_id,
+        )
+        return result.endswith(" 1")
+
+    async def increment_playerok_catalog_install(self, uuid: str) -> None:
+        await self.execute(
+            """
+            UPDATE playerok_plugin_catalog
+               SET install_count=install_count+1
+             WHERE uuid=$1
+            """,
+            uuid,
+        )
+
+    async def upsert_playerok_plugin(
+        self, telegram_id: int, plugin: PlayerokPluginData, source: str
+    ) -> None:
+        await self.execute(
+            """
+            INSERT INTO playerok_plugins
+                (telegram_id, uuid, filename, name, version, description, credits,
+                 settings_page, source, enabled, uploaded_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, TRUE, NOW())
+            ON CONFLICT (telegram_id, uuid) DO UPDATE
+                SET filename=EXCLUDED.filename, name=EXCLUDED.name,
+                    version=EXCLUDED.version, description=EXCLUDED.description,
+                    credits=EXCLUDED.credits, settings_page=EXCLUDED.settings_page,
+                    source=EXCLUDED.source, enabled=TRUE, uploaded_at=NOW()
+            """,
+            telegram_id,
+            plugin.uuid,
+            plugin.filename,
+            plugin.name,
+            plugin.version,
+            plugin.description,
+            plugin.credits,
+            plugin.settings_page,
+            source,
+        )
+
+    async def set_playerok_plugin_enabled(
+        self, telegram_id: int, uuid: str, enabled: bool
+    ) -> None:
+        await self.execute(
+            "UPDATE playerok_plugins SET enabled=$3 WHERE telegram_id=$1 AND uuid=$2",
+            telegram_id,
+            uuid,
+            enabled,
+        )
+
+    async def delete_playerok_plugin(self, telegram_id: int, uuid: str) -> None:
+        await self.execute(
+            "DELETE FROM playerok_plugins WHERE telegram_id=$1 AND uuid=$2",
+            telegram_id,
+            uuid,
+        )
+
+    async def list_playerok_plugin_settings(
+        self, telegram_id: int, uuid: str
+    ) -> dict[str, str]:
+        rows = await self.fetch(
+            """
+            SELECT setting_key, setting_value FROM playerok_plugin_settings
+             WHERE telegram_id=$1 AND plugin_uuid=$2
+            """,
+            telegram_id,
+            uuid,
+        )
+        return {str(row["setting_key"]): str(row["setting_value"]) for row in rows}
+
+    async def set_playerok_plugin_setting(
+        self, telegram_id: int, uuid: str, key: str, value: str
+    ) -> None:
+        await self.execute(
+            """
+            INSERT INTO playerok_plugin_settings
                 (telegram_id, plugin_uuid, setting_key, setting_value, updated_at)
             VALUES ($1, $2, $3, $4, NOW())
             ON CONFLICT (telegram_id, plugin_uuid, setting_key) DO UPDATE
@@ -1864,6 +2119,7 @@ class RuntimeManager:
         self.playerok_runtimes: dict[int, PlayerokRuntime] = {}
         self.loop: asyncio.AbstractEventLoop | None = None
         self.plugins = PluginManager(db, bot)
+        self.playerok_plugins = PlayerokPluginManager(db, bot)
 
     async def start_saved(self) -> None:
         self.loop = asyncio.get_running_loop()
@@ -1917,6 +2173,7 @@ class RuntimeManager:
             await asyncio.wait_for(asyncio.to_thread(account.get), timeout=50)
         runtime = PlayerokRuntime(telegram_id=telegram_id, account=account)
         self.playerok_runtimes[telegram_id] = runtime
+        await self.playerok_plugins.load_runtime(telegram_id, runtime)
         runtime.task = asyncio.create_task(self._playerok_poll_loop(runtime))
         logger.info("Playerok runtime запущен: telegram=%s playerok=%s", telegram_id, account.id)
         return runtime
@@ -2143,6 +2400,9 @@ class RuntimeManager:
             message = getattr(chat, "last_message", None)
             if message and runtime.message_ids.get(str(chat.id)) != str(message.id):
                 await self._process_playerok_message(runtime, row, chat, message)
+                await self.playerok_plugins.dispatch(
+                    runtime.telegram_id, "BIND_TO_NEW_MESSAGE", chat, message
+                )
 
         if row["playerok_notify_messages"]:
             for chat in chats:
@@ -2165,6 +2425,13 @@ class RuntimeManager:
         for deal in deals:
             if runtime.deal_statuses.get(str(deal.id)) is None:
                 await self._process_playerok_delivery(runtime, row, deal)
+            if runtime.deal_statuses.get(str(deal.id)) != deal_statuses[str(deal.id)]:
+                await self.playerok_plugins.dispatch(
+                    runtime.telegram_id,
+                    "BIND_TO_DEAL_CHANGED",
+                    deal,
+                    runtime.deal_statuses.get(str(deal.id)),
+                )
 
         if row["playerok_notify_deals"]:
             for deal in deals:
@@ -2207,6 +2474,12 @@ class RuntimeManager:
                     reply_markup=keyboard([[("📦 Сделка", f"po_deal:{getattr(deal, 'id', '')}")]]) if deal else None,
                 )
 
+        for review in reviews:
+            if str(review.id) not in runtime.review_ids:
+                await self.playerok_plugins.dispatch(
+                    runtime.telegram_id, "BIND_TO_NEW_REVIEW", review
+                )
+
         runtime.message_ids = message_ids
         runtime.deal_statuses = deal_statuses
         runtime.review_ids = review_ids
@@ -2219,6 +2492,9 @@ class RuntimeManager:
                     return
                 snapshot = await self._playerok_snapshot(runtime)
                 await self._handle_playerok_snapshot(runtime, row, snapshot)
+                await self.playerok_plugins.dispatch(
+                    runtime.telegram_id, "BIND_TO_TICK"
+                )
                 now = asyncio.get_running_loop().time()
                 if row["playerok_auto_publish_enabled"] and now >= runtime.next_auto_publish_at:
                     published, total, errors = await self.publish_playerok_drafts(runtime.telegram_id)
@@ -2416,6 +2692,7 @@ class RuntimeManager:
         runtime = self.playerok_runtimes.pop(telegram_id, None)
         if not runtime:
             return
+        await self.playerok_plugins.stop_runtime(telegram_id)
         runtime.stop_event.set()
         if runtime.task:
             runtime.task.cancel()
@@ -2920,6 +3197,15 @@ class PlayerokItemCreateState(StatesGroup):
     field_value = State()
 
 
+class PlayerokPluginState(StatesGroup):
+    file = State()
+    setting_value = State()
+
+
+class PlayerokCatalogPublishState(StatesGroup):
+    description = State()
+
+
 class AutoReplyState(StatesGroup):
     text = State()
     cooldown = State()
@@ -2997,7 +3283,7 @@ def main_keyboard(marketplace: str = "funpay") -> InlineKeyboardMarkup:
             [("💬 Чаты", "po_chats"), ("📦 Сделки", "po_deals")],
             [("📢 Объявления", "po_items"), ("➕ Создать", "po_item_create")],
             [("🤖 Автоответчик", "po_autoreply"), ("📤 Автовыдача", "po_delivery")],
-            [("🔔 Уведомления", "po_notifications")],
+            [("🧩 Плагины", "po_plugins"), ("🔔 Уведомления", "po_notifications")],
             [("⚙️ Аккаунт Playerok", "po_account")],
         ])
     return keyboard([
@@ -5418,6 +5704,591 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
             await callback.message.answer(f"❌ Не удалось поднять лоты: {html.escape(clipped(exc, 500))}")
             return
         await callback.message.answer(result, reply_markup=keyboard([[("⬅️ Автоподнятие", "auto_raise")]]))
+
+    async def show_playerok_plugins(target: Message, user_id: int) -> None:
+        plugin_runtime = manager.playerok_plugins.runtimes.get(user_id)
+        plugins = list(plugin_runtime.plugins.values()) if plugin_runtime else []
+        await target.answer(
+            "🧩 <b>Плагины Playerok</b>\n"
+            f"Установлено: <b>{len(plugins)}</b>\n\n"
+            "Каталог содержит официальные расширения и публикации пользователей. "
+            "Настройки каждого установленного плагина доступны постоянно в его карточке.",
+            reply_markup=keyboard([
+                [("🧭 Каталог плагинов", "po_plugin_catalog:0")],
+                [(f"🧩 Мои плагины ({len(plugins)})", "po_my_plugins")],
+                [("➕ Загрузить плагин", "po_plugin_upload_warning")],
+                [("📚 Документация", "po_plugin_docs")],
+                [("⬅️ Меню", "menu")],
+            ]),
+        )
+
+    @router.callback_query(F.data == "po_plugins")
+    async def playerok_plugins(callback: CallbackQuery) -> None:
+        await callback.answer()
+        await show_playerok_plugins(callback.message, callback.from_user.id)
+
+    async def show_playerok_my_plugins(target: Message, user_id: int) -> None:
+        plugin_runtime = manager.playerok_plugins.runtimes.get(user_id)
+        plugins = list(plugin_runtime.plugins.values()) if plugin_runtime else []
+        rows = [
+            [(
+                f"{'✅' if plugin.enabled else '❌'} {clipped(plugin.name, 27)} v{clipped(plugin.version, 9)}",
+                f"po_pi:{plugin.uuid}",
+            )]
+            for plugin in plugins
+        ]
+        rows.append([("⬅️ Плагины", "po_plugins")])
+        await target.answer(
+            "🧩 <b>Мои плагины Playerok</b>\n\n"
+            + ("Выберите плагин." if plugins else "Пока ничего не установлено."),
+            reply_markup=keyboard(rows),
+        )
+
+    @router.callback_query(F.data == "po_my_plugins")
+    async def playerok_my_plugins(callback: CallbackQuery) -> None:
+        await callback.answer()
+        await show_playerok_my_plugins(callback.message, callback.from_user.id)
+
+    async def show_playerok_plugin_catalog(
+        target: Message, user_id: int, page: int = 0
+    ) -> None:
+        page = max(0, page)
+        offset = page * PLUGIN_CATALOG_PAGE_SIZE
+        catalog, total = await db.list_playerok_catalog_plugins(
+            PLUGIN_CATALOG_PAGE_SIZE, offset
+        )
+        if not catalog and page:
+            page = max(0, (total - 1) // PLUGIN_CATALOG_PAGE_SIZE)
+            offset = page * PLUGIN_CATALOG_PAGE_SIZE
+            catalog, total = await db.list_playerok_catalog_plugins(
+                PLUGIN_CATALOG_PAGE_SIZE, offset
+            )
+        plugin_runtime = manager.playerok_plugins.runtimes.get(user_id)
+        installed = set(plugin_runtime.plugins) if plugin_runtime else set()
+        rows = [
+            [(
+                (
+                    f"{'✅' if item['uuid'] in installed else ('🛡' if item['is_official'] else '🧩')} "
+                    f"{clipped(item['name'], 27)} v{clipped(item['version'], 8)}"
+                ),
+                f"po_pc_view:{item['uuid']}:{page}",
+            )]
+            for item in catalog
+        ]
+        navigation = []
+        if page:
+            navigation.append(("◀️", f"po_plugin_catalog:{page - 1}"))
+        if offset + len(catalog) < total:
+            navigation.append(("▶️", f"po_plugin_catalog:{page + 1}"))
+        if navigation:
+            rows.append(navigation)
+        rows.append([("⬅️ Плагины", "po_plugins")])
+        await target.answer(
+            "🧭 <b>Каталог плагинов Playerok</b>\n\n"
+            f"Публикаций: <b>{total}</b> · страница <b>{page + 1}</b>.\n"
+            "🛡 — официальный · 🧩 — сообщество · ✅ — установлен.\n\n"
+            "⚠️ Публикации сообщества не модерируются: перед установкой скачайте и проверьте исходник.",
+            reply_markup=keyboard(rows),
+        )
+
+    @router.callback_query(F.data.startswith("po_plugin_catalog:"))
+    async def playerok_plugin_catalog(callback: CallbackQuery) -> None:
+        await callback.answer()
+        try:
+            page = int(callback.data.rsplit(":", 1)[1])
+        except ValueError:
+            page = 0
+        await show_playerok_plugin_catalog(callback.message, callback.from_user.id, page)
+
+    @router.callback_query(F.data.startswith("po_pc_view:"))
+    async def playerok_catalog_details(callback: CallbackQuery) -> None:
+        _, uuid, raw_page = callback.data.split(":", 2)
+        item = await db.get_playerok_catalog_plugin(uuid)
+        if not item:
+            await callback.answer("Публикация не найдена", show_alert=True)
+            return
+        await callback.answer()
+        plugin_runtime = manager.playerok_plugins.runtimes.get(callback.from_user.id)
+        installed = bool(plugin_runtime and uuid in plugin_runtime.plugins)
+        rows = [[(
+            "🧩 Открыть установленный" if installed else "⬇️ Установить",
+            f"po_pi:{uuid}" if installed else f"po_pc_ask:{uuid}",
+        )]]
+        rows.append([("📥 Скачать исходник", f"po_pc_source:{uuid}")])
+        rows.append([("⬅️ Каталог", f"po_plugin_catalog:{raw_page}")])
+        badge = "🛡 <b>Официальный плагин</b>" if item["is_official"] else "🧩 Плагин сообщества"
+        await callback.message.answer(
+            f"{badge}\n\n"
+            f"<b>{html.escape(item['name'])}</b> v{html.escape(item['version'])}\n"
+            f"<i>{html.escape(item['short_description'])}</i>\n\n"
+            f"{html.escape(item['description'])}\n\n"
+            f"Автор: <b>{html.escape(item['publisher_name'])}</b>\n"
+            f"Установок: <b>{item['install_count']}</b>\n"
+            f"UUID: <code>{uuid}</code>",
+            reply_markup=keyboard(rows),
+        )
+
+    @router.callback_query(F.data.startswith("po_pc_source:"))
+    async def playerok_catalog_source(callback: CallbackQuery) -> None:
+        uuid = callback.data.split(":", 1)[1]
+        item = await db.get_playerok_catalog_plugin(uuid)
+        if not item:
+            await callback.answer("Исходник недоступен", show_alert=True)
+            return
+        await callback.answer("Отправляю файл…")
+        await callback.message.answer_document(
+            BufferedInputFile(item["source"].encode("utf-8"), filename=item["filename"]),
+            caption=f"Исходник Playerok-плагина <b>{html.escape(item['name'])}</b>. Проверьте его перед установкой.",
+        )
+
+    @router.callback_query(F.data.startswith("po_pc_ask:"))
+    async def playerok_catalog_install_ask(callback: CallbackQuery) -> None:
+        uuid = callback.data.split(":", 1)[1]
+        item = await db.get_playerok_catalog_plugin(uuid)
+        if not item:
+            await callback.answer("Плагин недоступен", show_alert=True)
+            return
+        await callback.answer()
+        await callback.message.answer(
+            f"Установить <b>{html.escape(item['name'])}</b>?\n\n"
+            "Плагин выполняется внутри процесса бота и получит доступ к Playerok-аккаунту, "
+            "сети и возможностям Python-процесса. Каталог не гарантирует безопасность кода.",
+            reply_markup=keyboard([
+                [("📥 Скачать и проверить", f"po_pc_source:{uuid}")],
+                [("Я доверяю — установить", f"po_pc_install:{uuid}")],
+                [("Отмена", f"po_pc_view:{uuid}:0")],
+            ]),
+        )
+
+    @router.callback_query(F.data.startswith("po_pc_install:"))
+    async def playerok_catalog_install(callback: CallbackQuery) -> None:
+        uuid = callback.data.split(":", 1)[1]
+        item = await db.get_playerok_catalog_plugin(uuid)
+        runtime = await require_playerok_runtime(callback.message, callback.from_user.id)
+        if not item or not runtime:
+            return
+        if manager.playerok_plugins.is_enabled(callback.from_user.id, uuid) or (
+            manager.playerok_plugins.runtimes.get(callback.from_user.id)
+            and uuid in manager.playerok_plugins.runtimes[callback.from_user.id].plugins
+        ):
+            await callback.answer("Плагин уже установлен", show_alert=True)
+            return
+        await callback.answer("Устанавливаю…")
+        try:
+            plugin = await manager.playerok_plugins.install(
+                callback.from_user.id, item["filename"], item["source"], runtime
+            )
+        except Exception as exc:
+            logger.exception("Не установлен Playerok-плагин из каталога")
+            await callback.message.answer(f"❌ Установка не выполнена: {html.escape(clipped(exc, 600))}")
+            return
+        await db.increment_playerok_catalog_install(uuid)
+        await callback.message.answer(
+            f"✅ Playerok-плагин <b>{html.escape(plugin.name)}</b> установлен.",
+            reply_markup=keyboard([[('⚙️ Открыть плагин', f"po_pi:{uuid}")]]),
+        )
+
+    @router.callback_query(F.data == "po_plugin_docs")
+    async def playerok_plugin_docs(callback: CallbackQuery) -> None:
+        await callback.answer()
+        await callback.message.answer(
+            "📚 <b>Playerok Plugin SDK</b>\n\n"
+            "Плагины — одиночные UTF-8 файлы Python до 512 КБ. Они получают события сообщений, "
+            "сделок, отзывов и периодический тик, а настройки строятся автоматически из SETTINGS.",
+            reply_markup=keyboard([
+                [("🚀 Быстрый старт", "po_docs:start"), ("🧱 Структура", "po_docs:structure")],
+                [("⚡ Хуки", "po_docs:hooks"), ("⚙️ Настройки", "po_docs:settings")],
+                [("🧭 Каталог", "po_docs:catalog")],
+                [("📥 Скачать полную документацию", "po_docs_download")],
+                [("🛡 Безопасность", "po_docs:safety")],
+                [("⬅️ Плагины", "po_plugins")],
+            ]),
+        )
+
+    @router.callback_query(F.data == "po_docs_download")
+    async def playerok_plugin_docs_download(callback: CallbackQuery) -> None:
+        if not PLAYEROK_PLUGIN_DOCUMENTATION_PATH.is_file():
+            await callback.answer("Файл документации отсутствует", show_alert=True)
+            return
+        await callback.answer("Отправляю документацию…")
+        await callback.message.answer_document(
+            FSInputFile(PLAYEROK_PLUGIN_DOCUMENTATION_PATH),
+            caption="Полная документация Playerok Plugin SDK. Её можно передать нейросети вместе с заданием на плагин.",
+        )
+
+    @router.callback_query(F.data.startswith("po_docs:"))
+    async def playerok_plugin_docs_page(callback: CallbackQuery) -> None:
+        await callback.answer()
+        page = callback.data.split(":", 1)[1]
+        pages = {
+            "start": (
+                "🚀 <b>Быстрый старт</b>\n\n"
+                "1. Возьмите шаблон из скачиваемой документации.\n"
+                "2. Создайте новый UUID4 и заполните метаданные.\n"
+                "3. Объявите SETTINGS, ACTIONS и все списки BIND_TO_*.\n"
+                "4. Загрузите .py через «Плагины → Загрузить плагин».\n"
+                "5. Проверьте настройки и события на тестовом аккаунте."
+            ),
+            "structure": (
+                "🧱 <b>Структура</b>\n\n"
+                "Обязательны NAME, VERSION, DESCRIPTION, CREDITS, UUID, SETTINGS_PAGE, SETTINGS, "
+                "ACTIONS, BIND_TO_DELETE и все списки хуков. Обработчик получает ctx; "
+                "аккаунт доступен как <code>ctx.account</code>, настройки — <code>ctx.get_setting()</code>."
+            ),
+            "hooks": (
+                "⚡ <b>Хуки</b>\n\n"
+                "<code>BIND_TO_START</code>, <code>BIND_TO_STOP</code>, <code>BIND_TO_TICK</code>, "
+                "<code>BIND_TO_NEW_MESSAGE</code>, <code>BIND_TO_DEAL_CHANGED</code>, "
+                "<code>BIND_TO_NEW_REVIEW</code>, <code>BIND_TO_SETTING_CHANGED</code>.\n\n"
+                "Допускаются def и async def. Синхронные функции выполняются вне event loop."
+            ),
+            "settings": (
+                "⚙️ <b>Настройки</b>\n\n"
+                "SETTINGS поддерживает типы bool, int, str и choice. Бот автоматически создаёт "
+                "постоянную кнопку «Настройки», проверяет значения и сохраняет их в PostgreSQL. "
+                "ACTIONS добавляет кнопки ручных действий на ту же страницу."
+            ),
+            "catalog": (
+                "🧭 <b>Публикация</b>\n\n"
+                "Установите и проверьте свой плагин, откройте его карточку, нажмите «Опубликовать» "
+                "и добавьте описание назначения, настройки, зависимостей и ограничений. "
+                "Чужой или официальный UUID перезаписать нельзя."
+            ),
+            "safety": (
+                "🛡 <b>Безопасность</b>\n\n"
+                "Плагин — исполняемый Python-код с доступом к Playerok-сессии и окружению процесса. "
+                "Проверяйте исходник, не сохраняйте cookie и прокси в коде или логах. "
+                "Официального стабильного Playerok API нет, поэтому обрабатывайте ошибки сети и изменения схемы."
+            ),
+        }
+        text = pages.get(page)
+        if not text:
+            await callback.message.answer("Раздел документации не найден.")
+            return
+        await callback.message.answer(text, reply_markup=keyboard([[('⬅️ Документация', 'po_plugin_docs')]]))
+
+    @router.callback_query(F.data == "po_plugin_upload_warning")
+    async def playerok_plugin_upload_warning(callback: CallbackQuery) -> None:
+        await callback.answer()
+        await callback.message.answer(
+            "⚠️ <b>Внимание</b>\n"
+            "Playerok-плагин выполняется с правами процесса бота и получает доступ к аккаунту. "
+            "Продолжайте только если доверяете автору и проверили исходный код.",
+            reply_markup=keyboard([
+                [("Я понимаю риск", "po_plugin_upload_confirm")],
+                [("Отмена", "po_plugins")],
+            ]),
+        )
+
+    @router.callback_query(F.data == "po_plugin_upload_confirm")
+    async def playerok_plugin_upload_confirm(callback: CallbackQuery, state: FSMContext) -> None:
+        await callback.answer()
+        if not await require_playerok_runtime(callback.message, callback.from_user.id):
+            return
+        await state.clear()
+        await state.set_state(PlayerokPluginState.file)
+        await callback.message.answer("Отправьте одиночный UTF-8 файл Playerok-плагина .py до 512 КБ. Для отмены: /cancel")
+
+    @router.message(PlayerokPluginState.file)
+    async def playerok_plugin_upload_file(message: Message, state: FSMContext) -> None:
+        document = message.document
+        if not document or not (document.file_name or "").lower().endswith(".py"):
+            await message.answer("❌ Отправьте документ с расширением .py.")
+            return
+        if document.file_size and document.file_size > 512 * 1024:
+            await message.answer("❌ Размер плагина не должен превышать 512 КБ.")
+            return
+        runtime = await require_playerok_runtime(message, message.from_user.id)
+        if not runtime:
+            await state.clear()
+            return
+        buffer = BytesIO()
+        await message.bot.download(document, destination=buffer)
+        try:
+            source = buffer.getvalue().decode("utf-8-sig")
+            plugin = await manager.playerok_plugins.install(
+                message.from_user.id, document.file_name, source, runtime
+            )
+        except UnicodeDecodeError:
+            await message.answer("❌ Файл должен быть текстовым UTF-8 Python-модулем.")
+            return
+        except PlayerokPluginValidationError as exc:
+            await message.answer(f"❌ Плагин отклонён: {html.escape(str(exc))}")
+            return
+        except Exception as exc:
+            logger.exception("Не удалось установить Playerok-плагин")
+            await message.answer(f"❌ Ошибка установки: {html.escape(clipped(exc, 600))}")
+            return
+        await state.clear()
+        await message.answer(f"✅ Playerok-плагин <b>{html.escape(plugin.name)}</b> установлен.")
+        await show_playerok_my_plugins(message, message.from_user.id)
+
+    async def show_playerok_plugin_info(target: Message, user_id: int, uuid: str) -> None:
+        runtime = manager.playerok_plugins.runtimes.get(user_id)
+        plugin = runtime.plugins.get(uuid) if runtime else None
+        if not plugin:
+            await target.answer("Плагин не найден.")
+            return
+        publication = await db.get_playerok_catalog_plugin(uuid)
+        rows = []
+        if plugin.settings_page:
+            rows.append([("⚙️ Настройки", f"po_ps:{uuid}")])
+        publication_status = "Не опубликован"
+        if publication:
+            if publication["is_official"]:
+                publication_status = "🛡 официальная публикация"
+                rows.append([("🧭 Открыть в каталоге", f"po_pc_view:{uuid}:0")])
+            elif publication["owner_telegram_id"] == user_id:
+                publication_status = "✅ опубликован вами"
+                rows.append([("📝 Обновить публикацию", f"po_pub_start:{uuid}")])
+                rows.append([("Убрать из каталога", f"po_unpub_ask:{uuid}")])
+            else:
+                publication_status = "Опубликован другим пользователем"
+                rows.append([("🧭 Открыть в каталоге", f"po_pc_view:{uuid}:0")])
+        elif uuid not in PLAYEROK_READY_PLUGIN_BY_UUID:
+            rows.append([("🌐 Опубликовать в каталоге", f"po_pub_start:{uuid}")])
+        rows.extend([
+            [("Выключить" if plugin.enabled else "Включить", f"po_pt:{uuid}")],
+            [("🗑 Удалить", f"po_pd_ask:{uuid}")],
+            [("⬅️ Мои плагины", "po_my_plugins")],
+        ])
+        hooks_count = sum(len(value) for value in plugin.hooks.values())
+        await target.answer(
+            f"🧩 <b>{html.escape(plugin.name)}</b> v{html.escape(plugin.version)}\n"
+            f"{html.escape(plugin.description)}\n\n"
+            f"Автор: {html.escape(plugin.credits)}\n"
+            f"UUID: <code>{plugin.uuid}</code>\n"
+            f"Хуков: <b>{hooks_count}</b> · действий: <b>{len(plugin.actions)}</b>\n"
+            f"Настройки: {bool_icon(plugin.settings_page)}\n"
+            f"Каталог: {html.escape(publication_status)}\n"
+            f"Состояние: {bool_icon(plugin.enabled)}",
+            reply_markup=keyboard(rows),
+        )
+
+    @router.callback_query(F.data.startswith("po_pi:"))
+    async def playerok_plugin_info(callback: CallbackQuery, state: FSMContext) -> None:
+        await callback.answer()
+        await state.clear()
+        await show_playerok_plugin_info(callback.message, callback.from_user.id, callback.data.split(":", 1)[1])
+
+    async def show_playerok_plugin_settings(target: Message, user_id: int, uuid: str) -> None:
+        runtime = manager.playerok_plugins.runtimes.get(user_id)
+        plugin = runtime.plugins.get(uuid) if runtime else None
+        if not plugin or not plugin.settings_page:
+            await target.answer("Страница настроек не найдена.")
+            return
+        values = runtime.settings.get(uuid, {})
+        rows = []
+        for index, (key, spec) in enumerate(plugin.settings_schema.items()):
+            value = values.get(key, spec["default"])
+            rows.append([(
+                f"{spec['label']}: {clipped(playerok_setting_label(spec, value), 22)}",
+                f"po_pset:{uuid}:{index}",
+            )])
+        for index, action in enumerate(plugin.actions.values()):
+            rows.append([(action["label"], f"po_pact:{uuid}:{index}")])
+        rows.append([("⬅️ К плагину", f"po_pi:{uuid}")])
+        await target.answer(
+            f"⚙️ <b>Настройки: {html.escape(plugin.name)}</b>\n\n"
+            "Нажмите настройку для изменения. Значения сохраняются в PostgreSQL и восстанавливаются после перезапуска.",
+            reply_markup=keyboard(rows),
+        )
+
+    @router.callback_query(F.data.startswith("po_ps:"))
+    async def playerok_plugin_settings(callback: CallbackQuery) -> None:
+        await callback.answer()
+        await show_playerok_plugin_settings(callback.message, callback.from_user.id, callback.data.split(":", 1)[1])
+
+    @router.callback_query(F.data.startswith("po_pset:"))
+    async def playerok_plugin_setting_change(callback: CallbackQuery, state: FSMContext) -> None:
+        _, uuid, raw_index = callback.data.split(":", 2)
+        runtime = manager.playerok_plugins.runtimes.get(callback.from_user.id)
+        plugin = runtime.plugins.get(uuid) if runtime else None
+        if not plugin or not plugin.enabled:
+            await callback.answer("Сначала включите плагин", show_alert=True)
+            return
+        items = list(plugin.settings_schema.items())
+        try:
+            key, spec = items[int(raw_index)]
+        except (ValueError, IndexError):
+            await callback.answer("Настройка не найдена", show_alert=True)
+            return
+        current = runtime.settings.get(uuid, {}).get(key, spec["default"])
+        if spec["type"] == "bool":
+            await manager.playerok_plugins.set_setting(callback.from_user.id, uuid, key, not bool(current))
+            await callback.answer("Сохранено")
+            await show_playerok_plugin_settings(callback.message, callback.from_user.id, uuid)
+            return
+        if spec["type"] == "choice":
+            choices = list(spec["choices"])
+            index = choices.index(str(current)) if str(current) in choices else -1
+            await manager.playerok_plugins.set_setting(callback.from_user.id, uuid, key, choices[(index + 1) % len(choices)])
+            await callback.answer("Выбран следующий вариант")
+            await show_playerok_plugin_settings(callback.message, callback.from_user.id, uuid)
+            return
+        await callback.answer()
+        await state.clear()
+        await state.set_state(PlayerokPluginState.setting_value)
+        await state.update_data(po_plugin_uuid=uuid, po_plugin_setting=key)
+        constraints = (
+            f"от {spec.get('min', '−∞')} до {spec.get('max', '+∞')}"
+            if spec["type"] == "int"
+            else f"от {spec.get('min_length', 0)} до {spec.get('max_length', 2000)} символов"
+        )
+        await callback.message.answer(
+            f"Введите новое значение «<b>{html.escape(spec['label'])}</b>» ({constraints}). Для отмены: /cancel"
+        )
+
+    @router.message(PlayerokPluginState.setting_value, F.text)
+    async def playerok_plugin_setting_save(message: Message, state: FSMContext) -> None:
+        data = await state.get_data()
+        uuid = data.get("po_plugin_uuid")
+        key = data.get("po_plugin_setting")
+        if not uuid or not key:
+            await state.clear()
+            return
+        try:
+            await manager.playerok_plugins.set_setting(message.from_user.id, uuid, key, message.text)
+        except (KeyError, ValueError) as exc:
+            await message.answer(f"❌ Значение не сохранено: {html.escape(str(exc))}")
+            return
+        await state.clear()
+        await message.answer("✅ Настройка сохранена.")
+        await show_playerok_plugin_settings(message, message.from_user.id, uuid)
+
+    @router.callback_query(F.data.startswith("po_pact:"))
+    async def playerok_plugin_action(callback: CallbackQuery) -> None:
+        _, uuid, raw_index = callback.data.split(":", 2)
+        runtime = manager.playerok_plugins.runtimes.get(callback.from_user.id)
+        plugin = runtime.plugins.get(uuid) if runtime else None
+        if not plugin or not plugin.enabled:
+            await callback.answer("Сначала включите плагин", show_alert=True)
+            return
+        actions = list(plugin.actions)
+        try:
+            action_id = actions[int(raw_index)]
+        except (ValueError, IndexError):
+            await callback.answer("Действие не найдено", show_alert=True)
+            return
+        await callback.answer("Выполняю…")
+        try:
+            result = await manager.playerok_plugins.run_action(callback.from_user.id, uuid, action_id)
+        except Exception as exc:
+            logger.exception("Ошибка действия Playerok-плагина %s", uuid)
+            await callback.message.answer(f"❌ Действие завершилось ошибкой: <code>{html.escape(clipped(exc, 700))}</code>")
+            return
+        if result is not None:
+            await callback.message.answer(clipped(str(result), 3900))
+        await show_playerok_plugin_settings(callback.message, callback.from_user.id, uuid)
+
+    @router.callback_query(F.data.startswith("po_pt:"))
+    async def playerok_plugin_toggle(callback: CallbackQuery) -> None:
+        uuid = callback.data.split(":", 1)[1]
+        try:
+            enabled = await manager.playerok_plugins.toggle(callback.from_user.id, uuid)
+        except KeyError:
+            await callback.answer("Плагин не найден", show_alert=True)
+            return
+        await callback.answer("Плагин включён" if enabled else "Плагин выключен")
+        await show_playerok_plugin_info(callback.message, callback.from_user.id, uuid)
+
+    @router.callback_query(F.data.startswith("po_pd_ask:"))
+    async def playerok_plugin_delete_ask(callback: CallbackQuery) -> None:
+        uuid = callback.data.split(":", 1)[1]
+        await callback.answer()
+        await callback.message.answer(
+            "Удалить Playerok-плагин, его исходник и настройки?",
+            reply_markup=keyboard([[("Да, удалить", f"po_pd_do:{uuid}"), ("Отмена", f"po_pi:{uuid}")]]),
+        )
+
+    @router.callback_query(F.data.startswith("po_pd_do:"))
+    async def playerok_plugin_delete(callback: CallbackQuery) -> None:
+        uuid = callback.data.split(":", 1)[1]
+        await callback.answer("Удаляю…")
+        await manager.playerok_plugins.delete(callback.from_user.id, uuid)
+        await callback.message.answer("✅ Playerok-плагин удалён.")
+        await show_playerok_my_plugins(callback.message, callback.from_user.id)
+
+    @router.callback_query(F.data.startswith("po_pub_start:"))
+    async def playerok_catalog_publish_start(callback: CallbackQuery, state: FSMContext) -> None:
+        uuid = callback.data.split(":", 1)[1]
+        plugin = await db.get_playerok_plugin(callback.from_user.id, uuid)
+        publication = await db.get_playerok_catalog_plugin(uuid)
+        if not plugin:
+            await callback.answer("Установленный плагин не найден", show_alert=True)
+            return
+        if publication and (publication["is_official"] or publication["owner_telegram_id"] != callback.from_user.id):
+            await callback.answer("Этот UUID уже опубликован другим автором", show_alert=True)
+            return
+        await callback.answer()
+        await state.clear()
+        await state.set_state(PlayerokCatalogPublishState.description)
+        await state.update_data(po_catalog_uuid=uuid)
+        await callback.message.answer(
+            f"Отправьте описание Playerok-плагина: назначение, настройка, команды/действия, "
+            f"зависимости и ограничения. От {PLUGIN_CATALOG_DESCRIPTION_MIN} до {PLUGIN_CATALOG_DESCRIPTION_MAX} символов.\n\nДля отмены: /cancel"
+        )
+
+    @router.message(PlayerokCatalogPublishState.description, F.text)
+    async def playerok_catalog_publish_description(message: Message, state: FSMContext) -> None:
+        try:
+            description = validate_catalog_description(message.text or "")
+        except ValueError as exc:
+            await message.answer(f"❌ {html.escape(str(exc))}")
+            return
+        uuid = (await state.get_data()).get("po_catalog_uuid")
+        plugin = await db.get_playerok_plugin(message.from_user.id, uuid) if uuid else None
+        if not plugin:
+            await state.clear()
+            await message.answer("❌ Плагин больше не установлен.")
+            return
+        await state.update_data(po_catalog_description=description)
+        await message.answer(
+            "🔎 <b>Предпросмотр публикации Playerok</b>\n\n"
+            f"<b>{html.escape(plugin['name'])}</b> v{html.escape(plugin['version'])}\n"
+            f"<i>{html.escape(plugin['description'])}</i>\n\n"
+            f"{html.escape(description)}\n\n"
+            f"Публичный автор: <b>{html.escape(telegram_publisher_name(message.from_user))}</b>",
+            reply_markup=keyboard([[("✅ Опубликовать", f"po_pub_do:{uuid}"), ("Отмена", f"po_pi:{uuid}")]]),
+        )
+
+    @router.callback_query(F.data.startswith("po_pub_do:"))
+    async def playerok_catalog_publish_do(callback: CallbackQuery, state: FSMContext) -> None:
+        uuid = callback.data.split(":", 1)[1]
+        data = await state.get_data()
+        if data.get("po_catalog_uuid") != uuid or not data.get("po_catalog_description"):
+            await callback.answer("Сессия публикации истекла", show_alert=True)
+            return
+        published = await db.publish_playerok_catalog_plugin(
+            callback.from_user.id,
+            uuid,
+            telegram_publisher_name(callback.from_user),
+            data["po_catalog_description"],
+        )
+        await state.clear()
+        await callback.answer("Опубликовано" if published else "Публикация не выполнена", show_alert=not published)
+        if published:
+            await callback.message.answer("✅ Playerok-плагин опубликован в общем каталоге.", reply_markup=keyboard([[('🧭 Открыть', f"po_pc_view:{uuid}:0")]]))
+
+    @router.callback_query(F.data.startswith("po_unpub_ask:"))
+    async def playerok_catalog_unpublish_ask(callback: CallbackQuery) -> None:
+        uuid = callback.data.split(":", 1)[1]
+        item = await db.get_playerok_catalog_plugin(uuid)
+        if not item or item["owner_telegram_id"] != callback.from_user.id or item["is_official"]:
+            await callback.answer("Удалить эту публикацию нельзя", show_alert=True)
+            return
+        await callback.answer()
+        await callback.message.answer(
+            f"Убрать <b>{html.escape(item['name'])}</b> из каталога Playerok? Установленные копии останутся.",
+            reply_markup=keyboard([[("Да, убрать", f"po_unpub_do:{uuid}"), ("Отмена", f"po_pi:{uuid}")]]),
+        )
+
+    @router.callback_query(F.data.startswith("po_unpub_do:"))
+    async def playerok_catalog_unpublish_do(callback: CallbackQuery) -> None:
+        uuid = callback.data.split(":", 1)[1]
+        removed = await db.unpublish_playerok_catalog_plugin(callback.from_user.id, uuid)
+        await callback.answer("Публикация удалена" if removed else "Публикация не найдена")
+        await show_playerok_plugin_info(callback.message, callback.from_user.id, uuid)
 
     async def show_plugins(target: Message, user_id: int) -> None:
         runtime = await require_runtime(target, user_id)

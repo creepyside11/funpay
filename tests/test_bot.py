@@ -7,6 +7,7 @@ import pytest
 
 import bot as bot_module
 from bot import (
+    PLAYEROK_PLUGIN_DOCUMENTATION_PATH,
     PLUGIN_CATALOG_DESCRIPTION_MAX,
     PLUGIN_CATALOG_DESCRIPTION_MIN,
     PLUGIN_DOCUMENTATION_PATH,
@@ -36,6 +37,13 @@ from bot import (
     within_work_hours,
 )
 from FunPayAPI import Runner, types
+from playerok_plugin_system import (
+    PLAYEROK_READY_PLUGINS,
+    PlayerokPluginManager,
+    PlayerokPluginValidationError,
+    playerok_ready_plugin_source,
+    playerok_setting_label,
+)
 from plugin_system import CardinalBotFacade, PluginManager, PluginValidationError
 from tg_bot import CBT
 
@@ -397,6 +405,7 @@ def test_playerok_menu_and_independent_account_adapter(monkeypatch):
         "po_item_create",
         "po_autoreply",
         "po_delivery",
+        "po_plugins",
     } <= callbacks
     assert playerok_proxy_value("http://user:pass@127.0.0.1:8080") == (
         "user:pass@127.0.0.1:8080"
@@ -550,6 +559,57 @@ def test_downloadable_plugin_documentation_is_ai_readable():
     assert "BIND_TO_NEW_MESSAGE" in text
     assert "автоответ на отзыв" in text.casefold()
     assert "Финальный чек-лист" in text
+
+
+def test_downloadable_playerok_plugin_documentation_is_ai_readable():
+    text = PLAYEROK_PLUGIN_DOCUMENTATION_PATH.read_text(encoding="utf-8")
+    assert "Инструкция для нейросети" in text
+    assert "BIND_TO_DEAL_CHANGED" in text
+    assert "ctx.get_setting" in text
+    assert "Финальный чек-лист" in text
+
+
+def test_playerok_plugin_contract_and_ready_plugins(tmp_path):
+    source = '''
+NAME = "Test Playerok Plugin"
+VERSION = "1.0.0"
+DESCRIPTION = "Plugin"
+CREDITS = "Tester"
+UUID = "12345678-1234-4234-9234-123456789abc"
+SETTINGS_PAGE = True
+SETTINGS = {
+    "enabled": {"label": "Включено", "type": "bool", "default": False},
+    "period": {"label": "Период", "type": "choice", "default": "7", "choices": {"7": "7 дней", "30": "30 дней"}},
+}
+def run(ctx):
+    return "ok"
+ACTIONS = {"run": {"label": "Запустить", "handler": run}}
+BIND_TO_START = []
+BIND_TO_STOP = []
+BIND_TO_TICK = []
+BIND_TO_NEW_MESSAGE = []
+BIND_TO_DEAL_CHANGED = []
+BIND_TO_NEW_REVIEW = []
+BIND_TO_SETTING_CHANGED = []
+BIND_TO_DELETE = None
+'''
+    manager = PlayerokPluginManager(SimpleNamespace(), SimpleNamespace())
+    manager.root = tmp_path
+    plugin = manager._load_module(1, "test.py", source, True)
+    assert plugin.settings_schema["enabled"]["default"] is False
+    assert plugin.actions["run"]["label"] == "Запустить"
+    assert playerok_setting_label(plugin.settings_schema["period"], "30") == "30 дней"
+    with pytest.raises(PlayerokPluginValidationError):
+        manager._load_module(1, "bad.txt", source, True)
+
+    ready = [
+        manager._load_module(
+            2, spec.filename, playerok_ready_plugin_source(spec), True
+        )
+        for spec in PLAYEROK_READY_PLUGINS
+    ]
+    assert [item.uuid for item in ready] == [spec.uuid for spec in PLAYEROK_READY_PLUGINS]
+    assert all(item.settings_page and item.actions for item in ready)
 
 
 def test_plugin_settings_button_uses_cardinal_callback_contract():

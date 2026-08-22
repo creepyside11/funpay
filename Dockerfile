@@ -9,7 +9,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY bot.py plugin_system.py cardinal.py PLUGIN_DEVELOPMENT.md ./
+COPY bot.py plugin_system.py playerok_plugin_system.py cardinal.py \
+    PLUGIN_DEVELOPMENT.md PLAYEROK_PLUGIN_DEVELOPMENT.md ./
 COPY FunPayAPI ./FunPayAPI
 COPY telebot ./telebot
 COPY tg_bot ./tg_bot
