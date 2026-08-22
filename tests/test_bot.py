@@ -5,6 +5,8 @@ from types import SimpleNamespace
 import pytest
 
 from bot import (
+    PLUGIN_CATALOG_DESCRIPTION_MAX,
+    PLUGIN_CATALOG_DESCRIPTION_MIN,
     PLUGIN_DOCUMENTATION_PATH,
     READY_PLUGINS,
     SecretBox,
@@ -25,6 +27,8 @@ from bot import (
     proxy_label,
     ready_plugin_source,
     render_template,
+    telegram_publisher_name,
+    validate_catalog_description,
     within_work_hours,
 )
 from FunPayAPI import Runner, types
@@ -311,6 +315,17 @@ def test_ready_plugins_have_valid_cardinal_sources(tmp_path):
     ]
     assert [plugin.uuid for plugin in loaded] == [spec.uuid for spec in READY_PLUGINS]
     assert all(plugin.settings_page for plugin in loaded)
+
+
+def test_catalog_description_validation_and_publisher_name():
+    valid = "Плагин добавляет команду, настройки и безопасный сценарий работы."
+    assert validate_catalog_description(f"  {valid}  ") == valid
+    with pytest.raises(ValueError):
+        validate_catalog_description("x" * (PLUGIN_CATALOG_DESCRIPTION_MIN - 1))
+    with pytest.raises(ValueError):
+        validate_catalog_description("x" * (PLUGIN_CATALOG_DESCRIPTION_MAX + 1))
+    assert telegram_publisher_name(SimpleNamespace(username="author", full_name="Author")) == "@author"
+    assert telegram_publisher_name(SimpleNamespace(username=None, full_name="Иван")) == "Иван"
 
 
 def test_bulk_lot_action_updates_common_and_currency_lots():

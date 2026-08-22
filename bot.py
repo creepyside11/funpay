@@ -26,6 +26,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     BotCommand,
+    BufferedInputFile,
     CallbackQuery,
     FSInputFile,
     InlineKeyboardButton,
@@ -54,6 +55,9 @@ AUTO_LOTS_PLUGIN_UUID = "77b095e0-13a1-4e12-9c52-3a7b83a89b11"
 ADVANCED_STATS_PLUGIN_UUID = "c55a4072-eab8-4d87-8f17-b111e4b8bb22"
 STATUS_PLUGIN_UUID = "b19339bb-8f13-49cb-a4c1-0d3a55e1cc33"
 PLUGIN_SETTINGS_CALLBACK_PREFIX = "47"
+PLUGIN_CATALOG_PAGE_SIZE = 6
+PLUGIN_CATALOG_DESCRIPTION_MIN = 40
+PLUGIN_CATALOG_DESCRIPTION_MAX = 2000
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,6 +124,22 @@ def plugin_settings_callback_data(plugin: PluginData) -> str | None:
     if plugin.uuid in READY_PLUGIN_BY_UUID:
         return f"builtin_open:{plugin.uuid}"
     return f"{PLUGIN_SETTINGS_CALLBACK_PREFIX}:{plugin.uuid}:0"
+
+
+def validate_catalog_description(value: str) -> str:
+    description = value.strip()
+    if not PLUGIN_CATALOG_DESCRIPTION_MIN <= len(description) <= PLUGIN_CATALOG_DESCRIPTION_MAX:
+        raise ValueError(
+            f"Описание должно содержать от {PLUGIN_CATALOG_DESCRIPTION_MIN} "
+            f"до {PLUGIN_CATALOG_DESCRIPTION_MAX} символов."
+        )
+    return description
+
+
+def telegram_publisher_name(user: Any) -> str:
+    if getattr(user, "username", None):
+        return f"@{user.username}"
+    return clipped(getattr(user, "full_name", "Пользователь Telegram"), 100)
 
 
 @dataclass(slots=True)
@@ -245,8 +265,29 @@ class Database:
                 FOREIGN KEY (telegram_id, plugin_uuid)
                     REFERENCES funpay_plugins(telegram_id, uuid) ON DELETE CASCADE
             );
+
+            CREATE TABLE IF NOT EXISTS funpay_plugin_catalog (
+                uuid TEXT PRIMARY KEY,
+                owner_telegram_id BIGINT REFERENCES funpay_users(telegram_id) ON DELETE CASCADE,
+                publisher_name TEXT NOT NULL,
+                filename TEXT NOT NULL,
+                name TEXT NOT NULL,
+                version TEXT NOT NULL,
+                short_description TEXT NOT NULL,
+                description TEXT NOT NULL,
+                credits TEXT NOT NULL,
+                source TEXT NOT NULL,
+                is_official BOOLEAN NOT NULL DEFAULT FALSE,
+                install_count BIGINT NOT NULL DEFAULT 0,
+                published_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+
+            CREATE INDEX IF NOT EXISTS funpay_plugin_catalog_order_idx
+                ON funpay_plugin_catalog (is_official DESC, install_count DESC, updated_at DESC);
             """
         )
+        await self.seed_official_plugins()
 
     async def close(self) -> None:
         if self.pool:
@@ -400,6 +441,113 @@ class Database:
         return await self.fetch(
             "SELECT * FROM funpay_plugins WHERE telegram_id=$1 ORDER BY uploaded_at, name",
             telegram_id,
+        )
+
+    async def get_plugin(self, telegram_id: int, uuid: str) -> asyncpg.Record | None:
+        return await self.fetchrow(
+            "SELECT * FROM funpay_plugins WHERE telegram_id=$1 AND uuid=$2",
+            telegram_id,
+            uuid,
+        )
+
+    async def seed_official_plugins(self) -> None:
+        for plugin in READY_PLUGINS:
+            await self.execute(
+                """
+                INSERT INTO funpay_plugin_catalog
+                    (uuid, owner_telegram_id, publisher_name, filename, name, version,
+                     short_description, description, credits, source, is_official)
+                VALUES ($1, NULL, 'Команда проекта', $2, $3, $4, $5, $6,
+                        'FunPay aiogram bot', $7, TRUE)
+                ON CONFLICT (uuid) DO UPDATE
+                    SET publisher_name=EXCLUDED.publisher_name,
+                        filename=EXCLUDED.filename, name=EXCLUDED.name,
+                        version=EXCLUDED.version,
+                        short_description=EXCLUDED.short_description,
+                        description=EXCLUDED.description, credits=EXCLUDED.credits,
+                        source=EXCLUDED.source, is_official=TRUE, updated_at=NOW()
+                  WHERE funpay_plugin_catalog.is_official=TRUE
+                """,
+                plugin.uuid,
+                plugin.filename,
+                plugin.name,
+                plugin.version,
+                plugin.description,
+                plugin.details,
+                ready_plugin_source(plugin),
+            )
+
+    async def list_catalog_plugins(
+        self, limit: int, offset: int
+    ) -> tuple[list[asyncpg.Record], int]:
+        rows = await self.fetch(
+            """
+            SELECT * FROM funpay_plugin_catalog
+             ORDER BY is_official DESC, install_count DESC, updated_at DESC, name
+             LIMIT $1 OFFSET $2
+            """,
+            limit,
+            offset,
+        )
+        count_row = await self.fetchrow("SELECT COUNT(*) AS count FROM funpay_plugin_catalog")
+        return rows, int(count_row["count"]) if count_row else 0
+
+    async def get_catalog_plugin(self, uuid: str) -> asyncpg.Record | None:
+        return await self.fetchrow(
+            "SELECT * FROM funpay_plugin_catalog WHERE uuid=$1",
+            uuid,
+        )
+
+    async def publish_catalog_plugin(
+        self,
+        telegram_id: int,
+        uuid: str,
+        publisher_name: str,
+        description: str,
+    ) -> bool:
+        row = await self.fetchrow(
+            """
+            INSERT INTO funpay_plugin_catalog
+                (uuid, owner_telegram_id, publisher_name, filename, name, version,
+                 short_description, description, credits, source, is_official,
+                 published_at, updated_at)
+            SELECT uuid, telegram_id, $3, filename, name, version, description, $4,
+                   credits, source, FALSE, NOW(), NOW()
+              FROM funpay_plugins
+             WHERE telegram_id=$1 AND uuid=$2
+            ON CONFLICT (uuid) DO UPDATE
+                SET publisher_name=EXCLUDED.publisher_name,
+                    filename=EXCLUDED.filename, name=EXCLUDED.name,
+                    version=EXCLUDED.version,
+                    short_description=EXCLUDED.short_description,
+                    description=EXCLUDED.description, credits=EXCLUDED.credits,
+                    source=EXCLUDED.source, updated_at=NOW()
+              WHERE funpay_plugin_catalog.owner_telegram_id=$1
+                AND funpay_plugin_catalog.is_official=FALSE
+            RETURNING uuid
+            """,
+            telegram_id,
+            uuid,
+            publisher_name,
+            description,
+        )
+        return row is not None
+
+    async def unpublish_catalog_plugin(self, telegram_id: int, uuid: str) -> bool:
+        result = await self.execute(
+            """
+            DELETE FROM funpay_plugin_catalog
+             WHERE uuid=$1 AND owner_telegram_id=$2 AND is_official=FALSE
+            """,
+            uuid,
+            telegram_id,
+        )
+        return result.endswith(" 1")
+
+    async def increment_catalog_install(self, uuid: str) -> None:
+        await self.execute(
+            "UPDATE funpay_plugin_catalog SET install_count=install_count+1 WHERE uuid=$1",
+            uuid,
         )
 
     async def upsert_plugin(self, telegram_id: int, plugin: PluginData, source: str) -> None:
@@ -1333,6 +1481,10 @@ class PluginState(StatesGroup):
     file = State()
 
 
+class CatalogPublishState(StatesGroup):
+    description = State()
+
+
 class StatusPluginState(StatesGroup):
     text = State()
 
@@ -1988,9 +2140,8 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
             return
         plugin_runtime = manager.plugins.runtimes.get(user_id)
         plugins = list(plugin_runtime.plugins.values()) if plugin_runtime else []
-        ready_count = sum(plugin.uuid in READY_PLUGIN_BY_UUID for plugin in plugins)
         rows = [
-            [("🧰 Готовые плагины", "ready_plugins")],
+            [("🧭 Каталог плагинов", "plugin_catalog:0")],
             [(f"🧩 Мои плагины ({len(plugins)})", "my_plugins")],
             [("➕ Загрузить плагин", "plugin_upload_warning")],
             [("📚 Документация", "plugin_docs")],
@@ -1998,8 +2149,9 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
         ]
         await target.answer(
             "🧩 <b>Плагины FunPayCardinal</b>\n"
-            f"Установлено: <b>{len(plugins)}</b> · готовых: <b>{ready_count}</b>\n\n"
-            "Выберите готовое расширение или загрузите собственный однофайловый .py-плагин.",
+            f"Установлено: <b>{len(plugins)}</b>\n\n"
+            "Откройте общий каталог, установите опубликованное расширение или загрузите "
+            "собственный однофайловый .py-плагин.",
             reply_markup=keyboard(rows),
         )
 
@@ -2034,64 +2186,143 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
         await callback.answer()
         await show_my_plugins(callback.message, callback.from_user.id)
 
-    async def show_ready_plugins(target: Message, user_id: int) -> None:
+    async def show_plugin_catalog(target: Message, user_id: int, page: int = 0) -> None:
         if not await require_runtime(target, user_id):
             return
+        page = max(0, page)
+        catalog, total = await db.list_catalog_plugins(
+            PLUGIN_CATALOG_PAGE_SIZE,
+            page * PLUGIN_CATALOG_PAGE_SIZE,
+        )
+        total_pages = max(1, (total + PLUGIN_CATALOG_PAGE_SIZE - 1) // PLUGIN_CATALOG_PAGE_SIZE)
+        if page >= total_pages:
+            page = total_pages - 1
+            catalog, total = await db.list_catalog_plugins(
+                PLUGIN_CATALOG_PAGE_SIZE,
+                page * PLUGIN_CATALOG_PAGE_SIZE,
+            )
         plugin_runtime = manager.plugins.runtimes.get(user_id)
         installed = set(plugin_runtime.plugins) if plugin_runtime else set()
         rows = [
             [(
-                f"{'✅' if plugin.uuid in installed else '⬇️'} {plugin.name}",
-                f"ready_plugin:{plugin.uuid}",
+                (
+                    f"{'✅' if plugin['uuid'] in installed else ('🛡' if plugin['is_official'] else '🧩')} "
+                    f"{clipped(plugin['name'], 27)} v{clipped(plugin['version'], 8)}"
+                ),
+                f"catalog_view:{plugin['uuid']}:{page}",
             )]
-            for plugin in READY_PLUGINS
+            for plugin in catalog
         ]
+        navigation = []
+        if page > 0:
+            navigation.append(("◀️", f"plugin_catalog:{page - 1}"))
+        if page + 1 < total_pages:
+            navigation.append(("▶️", f"plugin_catalog:{page + 1}"))
+        if navigation:
+            rows.append(navigation)
         rows.append([("⬅️ Плагины", "plugins")])
         await target.answer(
-            "🧰 <b>Готовые плагины</b>\n\n"
-            "Эти расширения встроены в проект, проверены загрузчиком и устанавливаются одной кнопкой. "
-            "✅ означает, что плагин уже находится в разделе «Мои плагины».",
+            "🧭 <b>Каталог плагинов</b>\n\n"
+            f"Опубликовано: <b>{total}</b> · страница <b>{page + 1}/{total_pages}</b>\n"
+            "🛡 — официальный · 🧩 — от сообщества · ✅ — уже установлен.\n\n"
+            "Чтобы опубликовать свой плагин, откройте его в разделе «Мои плагины». "
+            "⚠️ Каталог не модерируется: изучайте описание и скачивайте исходник перед установкой.",
             reply_markup=keyboard(rows),
         )
 
-    @router.callback_query(F.data == "ready_plugins")
-    async def ready_plugins(callback: CallbackQuery) -> None:
+    @router.callback_query(F.data.startswith("plugin_catalog:"))
+    async def plugin_catalog(callback: CallbackQuery) -> None:
         await callback.answer()
-        await show_ready_plugins(callback.message, callback.from_user.id)
+        try:
+            page = int(callback.data.rsplit(":", 1)[1])
+        except ValueError:
+            page = 0
+        await show_plugin_catalog(callback.message, callback.from_user.id, page)
 
-    @router.callback_query(F.data.startswith("ready_plugin:"))
-    async def ready_plugin_details(callback: CallbackQuery) -> None:
+    @router.callback_query(F.data == "ready_plugins")
+    async def legacy_ready_plugins(callback: CallbackQuery) -> None:
         await callback.answer()
-        uuid = callback.data.split(":", 1)[1]
-        spec = READY_PLUGIN_BY_UUID.get(uuid)
-        if not spec:
-            await callback.message.answer("Готовый плагин не найден.")
+        await show_plugin_catalog(callback.message, callback.from_user.id)
+
+    @router.callback_query(F.data.startswith("catalog_view:"))
+    async def catalog_plugin_details(callback: CallbackQuery) -> None:
+        await callback.answer()
+        _, uuid, raw_page = callback.data.split(":", 2)
+        item = await db.get_catalog_plugin(uuid)
+        if not item:
+            await callback.message.answer("Публикация удалена из каталога.")
             return
+        try:
+            page = max(0, int(raw_page))
+        except ValueError:
+            page = 0
         installed = bool(
             manager.plugins.runtimes.get(callback.from_user.id)
             and uuid in manager.plugins.runtimes[callback.from_user.id].plugins
         )
         rows = []
         if installed:
-            rows.append([("⚙️ Открыть", f"builtin_open:{uuid}")])
-            rows.append([("🧩 В моих плагинах", f"plugin_info:{uuid}")])
+            rows.append([("🧩 Открыть установленный", f"plugin_info:{uuid}")])
         else:
-            rows.append([("⬇️ Установить", f"ready_install:{uuid}")])
-        rows.append([("⬅️ Готовые плагины", "ready_plugins")])
+            rows.append([("⬇️ Установить", f"catalog_install_ask:{uuid}")])
+        rows.append([("📥 Скачать исходник", f"catalog_source:{uuid}")])
+        rows.append([("⬅️ Каталог", f"plugin_catalog:{page}")])
+        badge = "🛡 <b>Официальный плагин</b>" if item["is_official"] else "🧩 Плагин сообщества"
         await callback.message.answer(
-            f"🧰 <b>{html.escape(spec.name)}</b> v{spec.version}\n"
-            f"<i>{html.escape(spec.description)}</i>\n\n"
-            f"{html.escape(spec.details)}\n\n"
+            f"{badge}\n"
+            f"<b>{html.escape(clipped(item['name'], 100))}</b> "
+            f"v{html.escape(clipped(item['version'], 30))}\n"
+            f"<i>{html.escape(clipped(item['short_description'], 500))}</i>\n\n"
+            f"{html.escape(item['description'])}\n\n"
+            f"Опубликовал: <b>{html.escape(clipped(item['publisher_name'], 100))}</b>\n"
+            f"Автор в файле: {html.escape(clipped(item['credits'], 200))}\n"
+            f"Установок из каталога: <b>{item['install_count']}</b>\n"
+            f"UUID: <code>{item['uuid']}</code>\n"
             f"Состояние: {'✅ установлен' if installed else 'не установлен'}",
             reply_markup=keyboard(rows),
         )
 
-    @router.callback_query(F.data.startswith("ready_install:"))
-    async def ready_plugin_install(callback: CallbackQuery) -> None:
+    @router.callback_query(F.data.startswith("catalog_source:"))
+    async def catalog_plugin_source(callback: CallbackQuery) -> None:
         uuid = callback.data.split(":", 1)[1]
-        spec = READY_PLUGIN_BY_UUID.get(uuid)
+        item = await db.get_catalog_plugin(uuid)
+        if not item:
+            await callback.answer("Публикация удалена", show_alert=True)
+            return
+        await callback.answer("Готовлю исходник…")
+        await callback.message.answer_document(
+            BufferedInputFile(item["source"].encode("utf-8"), filename=item["filename"]),
+            caption=(
+                f"📄 Исходник <b>{html.escape(item['name'])}</b> v{html.escape(item['version'])}.\n"
+                "Проверьте код перед установкой: плагины выполняются с правами процесса бота."
+            ),
+        )
+
+    @router.callback_query(F.data.startswith("catalog_install_ask:"))
+    async def catalog_plugin_install_ask(callback: CallbackQuery) -> None:
+        uuid = callback.data.split(":", 1)[1]
+        item = await db.get_catalog_plugin(uuid)
+        if not item:
+            await callback.answer("Публикация удалена", show_alert=True)
+            return
+        await callback.answer()
+        await callback.message.answer(
+            f"⚠️ <b>Установить {html.escape(item['name'])}?</b>\n\n"
+            "Плагин получит доступ к FunPay-аккаунту, golden_key, сети, переменным окружения "
+            "и возможностям процесса бота. Каталог не гарантирует безопасность кода.",
+            reply_markup=keyboard([
+                [("📥 Скачать и проверить", f"catalog_source:{uuid}")],
+                [("Я доверяю — установить", f"catalog_install_do:{uuid}")],
+                [("Отмена", f"catalog_view:{uuid}:0")],
+            ]),
+        )
+
+    @router.callback_query(F.data.startswith("catalog_install_do:"))
+    async def catalog_plugin_install(callback: CallbackQuery) -> None:
+        uuid = callback.data.split(":", 1)[1]
+        item = await db.get_catalog_plugin(uuid)
         runtime = await require_runtime(callback.message, callback.from_user.id)
-        if not spec or not runtime:
+        if not item or not runtime:
             await callback.answer("Плагин недоступен", show_alert=True)
             return
         if manager.plugins.runtimes.get(callback.from_user.id) and uuid in manager.plugins.runtimes[
@@ -2103,21 +2334,22 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
         try:
             await manager.plugins.install(
                 callback.from_user.id,
-                spec.filename,
-                ready_plugin_source(spec),
+                item["filename"],
+                item["source"],
                 runtime,
             )
         except Exception as exc:
-            logger.exception("Не удалось установить готовый плагин %s", uuid)
+            logger.exception("Не удалось установить плагин из каталога %s", uuid)
             await callback.message.answer(
                 f"❌ Установка не выполнена: {html.escape(clipped(exc, 600))}"
             )
             return
+        await db.increment_catalog_install(uuid)
         await callback.message.answer(
-            f"✅ <b>{html.escape(spec.name)}</b> установлен.",
+            f"✅ <b>{html.escape(item['name'])}</b> установлен из каталога.",
             reply_markup=keyboard([
-                [("⚙️ Открыть", f"builtin_open:{uuid}")],
-                [("⬅️ Готовые плагины", "ready_plugins")],
+                [("🧩 Открыть плагин", f"plugin_info:{uuid}")],
+                [("⬅️ Каталог", "plugin_catalog:0")],
             ]),
         )
 
@@ -2137,6 +2369,7 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
                     InlineKeyboardButton(text="⚡ Хуки", callback_data="plugin_docs:hooks"),
                     InlineKeyboardButton(text="🤖 Telegram API", callback_data="plugin_docs:telegram"),
                 ],
+                [InlineKeyboardButton(text="🧭 Публикация в каталоге", callback_data="plugin_docs:catalog")],
                 [InlineKeyboardButton(text="📥 Скачать полную документацию", callback_data="plugin_docs_download")],
                 [InlineKeyboardButton(text="🛡 Совместимость и безопасность", callback_data="plugin_docs:safety")],
                 [InlineKeyboardButton(text="🌐 Исходный FunPayCardinal", url="https://github.com/sidor0912/FunPayCardinal")],
@@ -2240,6 +2473,18 @@ BIND_TO_NEW_MESSAGE = [on_message]
                 "golden_key, обращаться к сети и управлять аккаунтом. Проверяйте исходный код, UUID и автора. "
                 "Выключение останавливает хуки, но для полного удаления недоверенного кода используйте кнопку «Удалить»."
             ),
+            "catalog": (
+                "🧭 <b>Публикация в каталоге</b>\n\n"
+                "1. Сначала установите и проверьте собственный .py-плагин.\n"
+                "2. Откройте «Мои плагины → плагин → Опубликовать в каталоге».\n"
+                "3. Напишите подробное описание длиной 40–2000 символов: назначение, команды, "
+                "настройка, зависимости, разрешения и ограничения.\n"
+                "4. Проверьте карточку и подтвердите публикацию.\n\n"
+                "При обновлении бот заново копирует метаданные и исходник текущей установленной версии. "
+                "Чужой или официальный UUID перезаписать нельзя. Публикацию можно убрать; уже установленные "
+                "копии у других пользователей сохранятся. Каталог сообщества не модерируется, поэтому "
+                "перед установкой скачивайте и проверяйте исходный файл."
+            ),
         }
         text = pages.get(page)
         if not text:
@@ -2318,8 +2563,9 @@ BIND_TO_NEW_MESSAGE = [on_message]
         await show_plugins(message, message.from_user.id)
 
     @router.callback_query(F.data.startswith("plugin_info:"))
-    async def plugin_info(callback: CallbackQuery) -> None:
+    async def plugin_info(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer()
+        await state.clear()
         uuid = callback.data.split(":", 1)[1]
         plugin_runtime = manager.plugins.runtimes.get(callback.from_user.id)
         plugin = plugin_runtime.plugins.get(uuid) if plugin_runtime else None
@@ -2327,10 +2573,25 @@ BIND_TO_NEW_MESSAGE = [on_message]
             await callback.message.answer("Плагин не найден.")
             return
         hooks_count = sum(len(value) for value in plugin.hooks.values())
+        publication = await db.get_catalog_plugin(uuid)
         rows = []
         settings_callback = plugin_settings_callback_data(plugin)
         if settings_callback:
             rows.append([("⚙️ Настройки", settings_callback)])
+        publication_status = "Не опубликован"
+        if publication:
+            if publication["is_official"]:
+                publication_status = "🛡 официальная публикация"
+                rows.append([("🧭 Открыть в каталоге", f"catalog_view:{uuid}:0")])
+            elif publication["owner_telegram_id"] == callback.from_user.id:
+                publication_status = "✅ опубликован вами"
+                rows.append([("📝 Обновить публикацию", f"catalog_publish_start:{uuid}")])
+                rows.append([("Убрать из каталога", f"catalog_unpublish_ask:{uuid}")])
+            else:
+                publication_status = "Опубликован другим пользователем"
+                rows.append([("🧭 Открыть в каталоге", f"catalog_view:{uuid}:0")])
+        elif uuid not in READY_PLUGIN_BY_UUID:
+            rows.append([("🌐 Опубликовать в каталоге", f"catalog_publish_start:{uuid}")])
         rows.extend([
             [("Выключить" if plugin.enabled else "Включить", f"plugin_toggle:{uuid}")],
             [("🗑 Удалить", f"plugin_delete_ask:{uuid}")],
@@ -2343,8 +2604,126 @@ BIND_TO_NEW_MESSAGE = [on_message]
             f"UUID: <code>{plugin.uuid}</code>\n"
             f"Хуков: <b>{hooks_count}</b>\n"
             f"Страница настроек Cardinal: {bool_icon(plugin.settings_page)}\n"
+            f"Каталог: {html.escape(publication_status)}\n"
             f"Состояние: {bool_icon(plugin.enabled)}",
             reply_markup=keyboard(rows),
+        )
+
+    @router.callback_query(F.data.startswith("catalog_publish_start:"))
+    async def catalog_publish_start(callback: CallbackQuery, state: FSMContext) -> None:
+        uuid = callback.data.split(":", 1)[1]
+        plugin = await db.get_plugin(callback.from_user.id, uuid)
+        publication = await db.get_catalog_plugin(uuid)
+        if not plugin:
+            await callback.answer("Установленный плагин не найден", show_alert=True)
+            return
+        if publication and (
+            publication["is_official"]
+            or publication["owner_telegram_id"] != callback.from_user.id
+        ):
+            await callback.answer("Этот UUID уже опубликован другим автором", show_alert=True)
+            return
+        await callback.answer()
+        await state.clear()
+        await state.set_state(CatalogPublishState.description)
+        await state.update_data(catalog_uuid=uuid)
+        current = (
+            f"\n\nТекущее описание:\n<i>{html.escape(publication['description'])}</i>"
+            if publication
+            else ""
+        )
+        await callback.message.answer(
+            "🌐 <b>Публикация плагина</b>\n\n"
+            "Отправьте подробное описание: что делает плагин, как его настроить, какие команды "
+            "он добавляет и какие разрешения или зависимости ему нужны. "
+            f"От {PLUGIN_CATALOG_DESCRIPTION_MIN} до {PLUGIN_CATALOG_DESCRIPTION_MAX} символов."
+            f"{current}\n\nДля отмены: /cancel"
+        )
+
+    @router.message(CatalogPublishState.description)
+    async def catalog_publish_description(message: Message, state: FSMContext) -> None:
+        try:
+            description = validate_catalog_description(message.text or "")
+        except ValueError as exc:
+            await message.answer(f"❌ {html.escape(str(exc))}")
+            return
+        data = await state.get_data()
+        uuid = data.get("catalog_uuid")
+        plugin = await db.get_plugin(message.from_user.id, uuid) if uuid else None
+        if not plugin:
+            await state.clear()
+            await message.answer("❌ Плагин больше не установлен.")
+            return
+        await state.update_data(catalog_description=description)
+        await message.answer(
+            "🔎 <b>Предпросмотр публикации</b>\n\n"
+            f"<b>{html.escape(clipped(plugin['name'], 100))}</b> "
+            f"v{html.escape(clipped(plugin['version'], 30))}\n"
+            f"<i>{html.escape(clipped(plugin['description'], 500))}</i>\n\n"
+            f"{html.escape(description)}\n\n"
+            f"Публичный автор: <b>{html.escape(telegram_publisher_name(message.from_user))}</b>\n"
+            "После публикации любой пользователь бота сможет посмотреть и скачать исходник.",
+            reply_markup=keyboard([
+                [("✅ Опубликовать", f"catalog_publish_do:{uuid}")],
+                [("Отмена", f"plugin_info:{uuid}")],
+            ]),
+        )
+
+    @router.callback_query(F.data.startswith("catalog_publish_do:"))
+    async def catalog_publish_do(callback: CallbackQuery, state: FSMContext) -> None:
+        uuid = callback.data.split(":", 1)[1]
+        data = await state.get_data()
+        if data.get("catalog_uuid") != uuid or not data.get("catalog_description"):
+            await callback.answer("Сессия публикации истекла", show_alert=True)
+            return
+        published = await db.publish_catalog_plugin(
+            callback.from_user.id,
+            uuid,
+            telegram_publisher_name(callback.from_user),
+            data["catalog_description"],
+        )
+        await state.clear()
+        if not published:
+            await callback.answer("Публикация не выполнена", show_alert=True)
+            await callback.message.answer(
+                "UUID уже занят либо установленный плагин был удалён."
+            )
+            return
+        await callback.answer("Опубликовано")
+        await callback.message.answer(
+            "✅ Плагин опубликован в общем каталоге. Описание и исходник теперь видны другим пользователям.",
+            reply_markup=keyboard([[('🧭 Открыть публикацию', f"catalog_view:{uuid}:0")]]),
+        )
+
+    @router.callback_query(F.data.startswith("catalog_unpublish_ask:"))
+    async def catalog_unpublish_ask(callback: CallbackQuery) -> None:
+        uuid = callback.data.split(":", 1)[1]
+        item = await db.get_catalog_plugin(uuid)
+        if not item or item["owner_telegram_id"] != callback.from_user.id or item["is_official"]:
+            await callback.answer("Вы не можете удалить эту публикацию", show_alert=True)
+            return
+        await callback.answer()
+        await callback.message.answer(
+            f"Убрать <b>{html.escape(item['name'])}</b> из общего каталога? "
+            "Уже установленные копии у других пользователей останутся.",
+            reply_markup=keyboard([
+                [("Да, убрать", f"catalog_unpublish_do:{uuid}")],
+                [("Отмена", f"plugin_info:{uuid}")],
+            ]),
+        )
+
+    @router.callback_query(F.data.startswith("catalog_unpublish_do:"))
+    async def catalog_unpublish_do(callback: CallbackQuery) -> None:
+        uuid = callback.data.split(":", 1)[1]
+        removed = await db.unpublish_catalog_plugin(callback.from_user.id, uuid)
+        await callback.answer("Публикация удалена" if removed else "Публикация не найдена")
+        await callback.message.answer(
+            (
+                "✅ Плагин убран из каталога. Ваша установленная копия не изменена."
+                if removed
+                else "Публикация уже отсутствует или принадлежит другому пользователю."
+            ),
+            reply_markup=keyboard([[('⬅️ К плагину', f"plugin_info:{uuid}")]]),
         )
 
     @router.callback_query(F.data.startswith("plugin_toggle:"))
@@ -2428,7 +2807,7 @@ BIND_TO_NEW_MESSAGE = [on_message]
         if not manager.plugins.is_enabled(user_id, uuid):
             await target.answer(
                 "Плагин не установлен или выключен.",
-                reply_markup=keyboard([[("🧰 Готовые плагины", "ready_plugins")]]),
+                reply_markup=keyboard([[("🧭 Каталог плагинов", "plugin_catalog:0")]]),
             )
             return None
         return runtime
