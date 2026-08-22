@@ -53,6 +53,7 @@ PLUGIN_DOCUMENTATION_PATH = Path(__file__).with_name("PLUGIN_DEVELOPMENT.md")
 AUTO_LOTS_PLUGIN_UUID = "77b095e0-13a1-4e12-9c52-3a7b83a89b11"
 ADVANCED_STATS_PLUGIN_UUID = "c55a4072-eab8-4d87-8f17-b111e4b8bb22"
 STATUS_PLUGIN_UUID = "b19339bb-8f13-49cb-a4c1-0d3a55e1cc33"
+PLUGIN_SETTINGS_CALLBACK_PREFIX = "47"
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,6 +111,15 @@ def ready_plugin_source(plugin: ReadyPluginSpec) -> str:
         f"UUID = {plugin.uuid!r}\n"
         "BIND_TO_DELETE = None\n"
     )
+
+
+def plugin_settings_callback_data(plugin: PluginData) -> str | None:
+    """Возвращает постоянный callback страницы настроек установленного плагина."""
+    if not plugin.settings_page:
+        return None
+    if plugin.uuid in READY_PLUGIN_BY_UUID:
+        return f"builtin_open:{plugin.uuid}"
+    return f"{PLUGIN_SETTINGS_CALLBACK_PREFIX}:{plugin.uuid}:0"
 
 
 @dataclass(slots=True)
@@ -2193,7 +2203,8 @@ BIND_TO_NEW_MESSAGE = [on_message]
                 "🧱 <b>Минимальная структура плагина</b>\n\n"
                 f"<pre>{code_example}</pre>\n"
                 "<b>Обязательные поля:</b> NAME, VERSION, DESCRIPTION и CREDITS — строки; "
-                "SETTINGS_PAGE — bool; UUID — канонический UUID4; BIND_TO_DELETE — функция или None. "
+                "SETTINGS_PAGE — bool, создающий постоянную кнопку настроек; UUID — канонический UUID4; "
+                "BIND_TO_DELETE — функция или None. "
                 "Неиспользуемые BIND_TO_* можно не объявлять: загрузчик считает их пустыми списками."
             ),
             "hooks": (
@@ -2214,12 +2225,16 @@ BIND_TO_NEW_MESSAGE = [on_message]
                 "Поддержаны обычные фильтры <code>commands</code>, <code>content_types</code> и <code>func</code>, "
                 "а также InlineKeyboardButton/InlineKeyboardMarkup из <code>telebot.types</code>. "
                 "Telegram-обработчики автоматически перестают выполняться при выключении или удалении плагина.\n\n"
+                "При SETTINGS_PAGE=True карточка плагина показывает кнопку «Настройки» с callback "
+                "<code>47:UUID:0</code>. Зарегистрируйте для неё callback-handler; префикс также доступен "
+                "как <code>CBT.PLUGIN_SETTINGS</code> через <code>from tg_bot import CBT</code>.\n\n"
                 "FunPay доступен через <code>cardinal.account</code>, Runner — через <code>cardinal.runner</code>."
             ),
             "safety": (
                 "🛡 <b>Совместимость и безопасность</b>\n\n"
                 "Поддерживается однофайловый контракт и 18 имён хуков FunPayCardinal, импорты <code>cardinal</code>, "
-                "<code>FunPayAPI</code> и базовый слой <code>telebot.types</code>. Плагин, который импортирует дополнительные "
+                "<code>FunPayAPI</code>, <code>tg_bot.CBT</code> и базовый слой <code>telebot.types</code>. "
+                "Плагин, который импортирует дополнительные "
                 "пакеты или внутренние модули конкретной сборки Cardinal, потребует добавить их в Docker-образ.\n\n"
                 "⚠️ Python-плагин выполняется внутри процесса бота. Он может прочитать BOT_TOKEN, DATABASE_URL, "
                 "golden_key, обращаться к сети и управлять аккаунтом. Проверяйте исходный код, UUID и автора. "
@@ -2313,8 +2328,9 @@ BIND_TO_NEW_MESSAGE = [on_message]
             return
         hooks_count = sum(len(value) for value in plugin.hooks.values())
         rows = []
-        if uuid in READY_PLUGIN_BY_UUID and plugin.enabled:
-            rows.append([("⚙️ Открыть", f"builtin_open:{uuid}")])
+        settings_callback = plugin_settings_callback_data(plugin)
+        if settings_callback:
+            rows.append([("⚙️ Настройки", settings_callback)])
         rows.extend([
             [("Выключить" if plugin.enabled else "Включить", f"plugin_toggle:{uuid}")],
             [("🗑 Удалить", f"plugin_delete_ask:{uuid}")],
@@ -2341,6 +2357,40 @@ BIND_TO_NEW_MESSAGE = [on_message]
             return
         await callback.answer("Плагин включён" if enabled else "Плагин выключен")
         await show_my_plugins(callback.message, callback.from_user.id)
+
+    @router.callback_query(
+        F.data.startswith(f"{PLUGIN_SETTINGS_CALLBACK_PREFIX}:")
+    )
+    async def external_plugin_settings(callback: CallbackQuery) -> None:
+        parts = callback.data.split(":", 2)
+        uuid = parts[1] if len(parts) == 3 else ""
+        plugin_runtime = manager.plugins.runtimes.get(callback.from_user.id)
+        plugin = plugin_runtime.plugins.get(uuid) if plugin_runtime else None
+        if not plugin or not plugin.settings_page:
+            await callback.answer("Страница настроек не найдена", show_alert=True)
+            return
+        if not plugin.enabled:
+            await callback.answer(
+                "Сначала включите плагин, затем откройте настройки.",
+                show_alert=True,
+            )
+            return
+        try:
+            handled = await manager.plugins.dispatch_telegram_callback(
+                callback.from_user.id, callback
+            )
+        except Exception:
+            logger.exception("Ошибка страницы настроек плагина %s", uuid)
+            await callback.answer(
+                "Плагин завершил страницу настроек с ошибкой. Проверьте журнал.",
+                show_alert=True,
+            )
+            return
+        if not handled:
+            await callback.answer(
+                "Автор указал SETTINGS_PAGE=True, но не зарегистрировал обработчик настроек.",
+                show_alert=True,
+            )
 
     @router.callback_query(F.data.startswith("plugin_delete_ask:"))
     async def plugin_delete_ask(callback: CallbackQuery) -> None:

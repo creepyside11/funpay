@@ -20,6 +20,7 @@ from bot import (
     main_keyboard,
     normalize_proxy,
     normalize_review_reply,
+    plugin_settings_callback_data,
     proxy_dict,
     proxy_label,
     ready_plugin_source,
@@ -28,6 +29,7 @@ from bot import (
 )
 from FunPayAPI import Runner, types
 from plugin_system import CardinalBotFacade, PluginManager, PluginValidationError
+from tg_bot import CBT
 
 
 @pytest.mark.parametrize(
@@ -247,10 +249,39 @@ def test_downloadable_plugin_documentation_is_ai_readable():
     assert "Финальный чек-лист" in text
 
 
+def test_plugin_settings_button_uses_cardinal_callback_contract():
+    external = SimpleNamespace(
+        uuid="12345678-1234-4234-9234-123456789abc",
+        enabled=True,
+        settings_page=True,
+    )
+    assert CBT.PLUGIN_SETTINGS == "47"
+    assert plugin_settings_callback_data(external) == (
+        "47:12345678-1234-4234-9234-123456789abc:0"
+    )
+    external.enabled = False
+    assert plugin_settings_callback_data(external) == (
+        "47:12345678-1234-4234-9234-123456789abc:0"
+    )
+    external.enabled = True
+    external.settings_page = False
+    assert plugin_settings_callback_data(external) is None
+
+    builtin = SimpleNamespace(
+        uuid=READY_PLUGINS[0].uuid,
+        enabled=True,
+        settings_page=True,
+    )
+    assert plugin_settings_callback_data(builtin) == (
+        f"builtin_open:{READY_PLUGINS[0].uuid}"
+    )
+
+
 def test_cardinal_plugin_contract_is_loaded(tmp_path):
     source = '''
 from cardinal import get_cardinal
 from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
+from tg_bot import CBT
 NAME = "Test"
 VERSION = "1.0"
 DESCRIPTION = "Plugin"

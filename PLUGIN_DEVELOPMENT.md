@@ -30,8 +30,8 @@
 12. Не храните токены, golden_key, прокси и пароли в исходнике или логах.
 13. `BIND_TO_PRE_DELIVERY` и `BIND_TO_POST_DELIVERY` валидируются загрузчиком, но текущий бот не
     содержит отдельного конвейера автовыдачи и поэтому эти два хука не вызываются.
-14. `SETTINGS_PAGE=True` не создаёт страницу автоматически. Плагин должен сам зарегистрировать
-    Telegram callback/message handlers либо использовать встроенную страницу, добавленную в `bot.py`.
+14. `SETTINGS_PAGE=True` создаёт постоянную кнопку «⚙️ Настройки» рядом с выключением и удалением
+    плагина. Плагин обязан зарегистрировать обработчик callback `47:<UUID>:<offset>`.
 15. После генерации проверьте раздел «Финальный чек-лист».
 
 ## 2. Установка и жизненный цикл
@@ -63,7 +63,7 @@
 | `VERSION` | строка | Версия, рекомендуется SemVer: `1.0.0`. |
 | `DESCRIPTION` | строка | Краткое назначение. |
 | `CREDITS` | строка | Автор или источник. |
-| `SETTINGS_PAGE` | bool | Информационный флаг наличия настроек. |
+| `SETTINGS_PAGE` | bool | Добавлять ли постоянную кнопку «⚙️ Настройки» в карточку плагина. |
 | `UUID` | строка | Канонический UUID4 в нижнем регистре. |
 | `BIND_TO_DELETE` | callable или `None` | Обработчик удаления `(cardinal, callback)`. |
 
@@ -411,12 +411,23 @@ BIND_TO_NEW_MESSAGE = [on_message]
 Не используйте `time.sleep()` в обработчике: он задержит обработку событий этого плагина. Для
 долгих операций лучше сделать собственный управляемый worker с остановкой в `BIND_TO_PRE_STOP`.
 
-## 10. Рецепт: кнопка в Telegram
+## 10. Рецепт: постоянная страница настроек
 
-Регистрируйте обработчики один раз из `BIND_TO_PRE_INIT`:
+Если `SETTINGS_PAGE=True`, карточка установленного плагина в «Моих плагинах» всегда содержит
+кнопку «⚙️ Настройки». Бот отправляет стандартный callback:
+
+```text
+47:<UUID>:<offset>
+```
+
+При первом открытии `offset` равен `0`. Значение `47` доступно как `CBT.PLUGIN_SETTINGS`.
+Регистрируйте обработчик один раз из `BIND_TO_PRE_INIT`:
 
 ```python
 from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
+from tg_bot import CBT
+
+SETTINGS_PAGE = True
 
 
 def register_telegram(cardinal):
@@ -424,30 +435,35 @@ def register_telegram(cardinal):
 
     def show(call):
         bot.answer_callback_query(call.id)
-        bot.send_message(call.message.chat.id, "Настройки плагина")
+        offset = int(call.data.rsplit(":", 1)[1])
+        markup = InlineKeyboardMarkup(row_width=1)
+        markup.add(
+            InlineKeyboardButton(
+                "Обновить",
+                callback_data=f"{CBT.PLUGIN_SETTINGS}:{UUID}:{offset}",
+            )
+        )
+        bot.send_message(
+            call.message.chat.id,
+            "⚙️ Настройки плагина",
+            reply_markup=markup,
+        )
 
     bot.register_callback_query_handler(
         show,
-        func=lambda call: call.data == "example_plugin:settings",
-    )
-
-    markup = InlineKeyboardMarkup(row_width=1)
-    markup.add(
-        InlineKeyboardButton(
-            "Открыть настройки",
-            callback_data="example_plugin:settings",
-        )
-    )
-    cardinal.telegram.send_notification(
-        "Плагин запущен.",
-        reply_markup=markup,
+        func=lambda call: call.data.startswith(
+            f"{CBT.PLUGIN_SETTINGS}:{UUID}:"
+        ),
     )
 
 
 BIND_TO_PRE_INIT = [register_telegram]
 ```
 
-Используйте уникальный префикс callback_data, чтобы не пересекаться с ботом и другими плагинами.
+Можно использовать собственные callback_data для кнопок внутри страницы, но первая кнопка входа
+всегда имеет формат Cardinal `47:<UUID>:0`. При `SETTINGS_PAGE=False` кнопка не показывается.
+У выключенного плагина кнопка остаётся в карточке, но бот попросит сначала включить плагин, потому
+что обработчики выключенного модуля не выполняются.
 
 ## 11. Полный безопасный каркас
 
@@ -534,7 +550,7 @@ BIND_TO_DELETE = on_delete
 - Повторная регистрация Telegram handlers на каждом `NEW_MESSAGE`.
 - Блокирующий бесконечный цикл в PRE_START.
 - Импорт `telebot.TeleBot`: локальный shim предоставляет только `telebot.types`.
-- Ожидание, что `SETTINGS_PAGE=True` автоматически создаст кнопку.
+- `SETTINGS_PAGE=True` без обработчика `47:<UUID>:<offset>`: кнопка появится, но открыть страницу не сможет.
 - Использование delivery hooks как единственного механизма выдачи: сейчас они не генерируются.
 - Хранение состояния только в глобальной переменной без учёта перезапуска процесса.
 - Вставка пользовательского текста в Telegram HTML без `html.escape`.
@@ -555,6 +571,7 @@ BIND_TO_DELETE = on_delete
 - [ ] входящие сообщения отделены от собственных и системных;
 - [ ] пользовательские данные экранируются для Telegram HTML;
 - [ ] callback_data уникальны и короче 64 байт;
+- [ ] при `SETTINGS_PAGE=True` зарегистрирован обработчик `47:<UUID>:<offset>`;
 - [ ] автоответ на отзыв не дублирует уже существующий `review.reply`;
 - [ ] исключения внешнего API обрабатываются там, где возможна безопасная деградация;
 - [ ] внешние зависимости перечислены отдельно и добавлены в Docker-образ;

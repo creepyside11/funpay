@@ -97,11 +97,18 @@ BIND_TO_NEW_MESSAGE = [on_message]
 | `VERSION` | `str` | версия расширения |
 | `DESCRIPTION` | `str` | краткое описание |
 | `CREDITS` | `str` | автор или источник |
-| `SETTINGS_PAGE` | `bool` | наличие собственной страницы настроек |
+| `SETTINGS_PAGE` | `bool` | показывать постоянную кнопку собственной страницы настроек |
 | `UUID` | `str` | уникальный канонический UUID4 |
 | `BIND_TO_DELETE` | функция / `None` | очистка данных при удалении |
 
 Необъявленные списки хуков считаются пустыми.
+
+Если указано `SETTINGS_PAGE = True`, в карточке плагина внутри «Моих плагинов» постоянно
+показывается кнопка «⚙️ Настройки» рядом с выключением и удалением. Плагин должен зарегистрировать
+Telegram callback-handler для стандартного Cardinal callback `47:<UUID>:<offset>`; при первом
+открытии `offset` равен `0`. Для совместимого импорта доступно `from tg_bot import CBT`, где
+`CBT.PLUGIN_SETTINGS == "47"`. У выключенного плагина кнопка остаётся видимой, но при нажатии бот
+предложит сначала включить модуль.
 
 ### Хуки
 
@@ -188,7 +195,7 @@ python bot.py
 
 - `bot.py` — aiogram, PostgreSQL, интерфейс, настройки и менеджер фоновых аккаунтов;
 - `PLUGIN_DEVELOPMENT.md` — скачиваемый точный контракт и руководство для создания плагинов человеком или нейросетью;
-- `plugin_system.py`, `cardinal.py`, `telebot/` — совместимый загрузчик и адаптеры плагинов Cardinal;
+- `plugin_system.py`, `cardinal.py`, `telebot/`, `tg_bot/` — совместимый загрузчик и адаптеры плагинов Cardinal;
 - `FunPayAPI/` — API и Runner, взятые из FunPayCardinal и адаптированные для управляемой остановки на хостинге;
 - `Dockerfile` / `Procfile` — запуск на контейнерных и worker-хостингах.
 
@@ -196,7 +203,7 @@ python bot.py
 
 ```bash
 pip install -r requirements-dev.txt
-python -m compileall bot.py plugin_system.py cardinal.py telebot FunPayAPI
+python -m compileall bot.py plugin_system.py cardinal.py telebot tg_bot FunPayAPI
 pytest -q
 ```
 
