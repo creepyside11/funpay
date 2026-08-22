@@ -395,6 +395,7 @@ def test_auto_delivery_issues_stock_and_disables_empty_lot():
 
 
 def test_playerok_menu_and_independent_account_adapter(monkeypatch):
+    assert bot_module.PlayerokAccount is not None
     callbacks = {
         button.callback_data
         for row in main_keyboard("playerok").inline_keyboard

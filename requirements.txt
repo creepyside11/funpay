@@ -7,4 +7,5 @@ lxml>=5.3,<7
 PySocks>=1.7,<2
 requests>=2.32,<3
 requests-toolbelt>=1.0,<2
-playerokapi @ https://github.com/alleexxeeyy/PlayerokAPI/archive/1df7e806abd8319b3106a0bf8daeae079ef0a8c9.zip
+curl-cffi==0.13.0
+websocket-client==1.8.0

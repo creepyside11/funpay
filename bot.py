@@ -51,12 +51,14 @@ from playerok_plugin_system import (
 )
 from plugin_system import PluginData, PluginManager, PluginValidationError
 
+PLAYEROK_IMPORT_ERROR: ImportError | None = None
 try:
     from playerokapi.account import Account as PlayerokAccount
     from playerokapi.enums import ItemDealDirections as PlayerokItemDealDirections
     from playerokapi.enums import ItemDealStatuses as PlayerokItemDealStatuses
     from playerokapi.enums import ItemStatuses as PlayerokItemStatuses
-except ImportError:  # Playerok — опциональная интеграция для локальных тестов без зависимости.
+except ImportError as exc:  # Оставляем FunPay доступным при неполной локальной сборке.
+    PLAYEROK_IMPORT_ERROR = exc
     PlayerokAccount = None
     PlayerokItemDealDirections = None
     PlayerokItemDealStatuses = None
@@ -1991,7 +1993,8 @@ def playerok_proxy_value(proxy: str) -> str:
 def create_playerok_account(cookie: str, proxy: str) -> Any:
     """Создаёт независимый аккаунт, обходя singleton в PlayerokAPI."""
     if PlayerokAccount is None:
-        raise RuntimeError("PlayerokAPI не установлен в текущей сборке")
+        details = f": {PLAYEROK_IMPORT_ERROR}" if PLAYEROK_IMPORT_ERROR else ""
+        raise RuntimeError(f"PlayerokAPI не загрузился в текущей сборке{details}")
     account = object.__new__(PlayerokAccount)
     kwargs: dict[str, Any] = {
         "user_agent": USER_AGENT,
