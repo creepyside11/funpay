@@ -391,6 +391,13 @@ def test_playerok_menu_and_independent_account_adapter(monkeypatch):
         for button in row
     }
     assert {"marketplace_switch", "po_profile", "po_balance", "po_items"} <= callbacks
+    assert {
+        "po_chats",
+        "po_deals",
+        "po_item_create",
+        "po_autoreply",
+        "po_delivery",
+    } <= callbacks
     assert playerok_proxy_value("http://user:pass@127.0.0.1:8080") == (
         "user:pass@127.0.0.1:8080"
     )
@@ -420,6 +427,83 @@ def test_playerok_menu_and_independent_account_adapter(monkeypatch):
     recovered = create_playerok_account("token-three-123", "http://127.0.0.1:8080")
     assert recovered.refreshed is True
     assert recovered._tmp_cert_path == bot_module.certifi.where()
+
+
+def test_playerok_template_uses_chat_deal_and_message_variables():
+    account = SimpleNamespace(id="seller-id", username="Seller")
+    chat = SimpleNamespace(id="chat-1")
+    message = SimpleNamespace(text="Здравствуйте", user=SimpleNamespace(username="Buyer"))
+    deal = SimpleNamespace(
+        id="deal-1",
+        user=SimpleNamespace(username="Buyer"),
+        item=SimpleNamespace(name="Item"),
+        chat=chat,
+    )
+    rendered = bot_module.render_playerok_template(
+        "$username · $chat_id · $message_text · $order_id · $order_title",
+        account,
+        chat=chat,
+        message=message,
+        deal=deal,
+    )
+    assert rendered == "Buyer · chat-1 · Здравствуйте · deal-1 · Item"
+
+
+def test_playerok_auto_delivery_can_confirm_after_success(monkeypatch):
+    sent = []
+    updated = []
+    rule = {
+        "id": 7,
+        "item_title": "Item",
+        "response": "Ключ: $product",
+    }
+
+    class FakeDatabase:
+        async def claim_playerok_delivery(self, telegram_id, deal_id, item_id):
+            assert (telegram_id, deal_id, item_id) == (10, "deal-1", "item-1")
+            return rule, ["KEY-1"], 0, None
+
+        async def restore_playerok_delivery_products(self, *_args):
+            raise AssertionError("Товар не должен возвращаться после успешной выдачи")
+
+        async def finish_playerok_delivery(self, *args):
+            sent.append(("log", args))
+
+    class FakeAccount:
+        id = "seller"
+        username = "Seller"
+
+        def send_message(self, chat_id, text):
+            sent.append((chat_id, text))
+
+        def update_deal(self, deal_id, status):
+            updated.append((deal_id, status))
+
+    manager = bot_module.RuntimeManager(SimpleNamespace(), FakeDatabase(), SimpleNamespace())
+    monkeypatch.setattr(bot_module, "PlayerokItemDealStatuses", SimpleNamespace(SENT="SENT"))
+
+    async def record_notification(*_args, **_kwargs):
+        return None
+
+    manager.safe_notify = record_notification
+    runtime = bot_module.PlayerokRuntime(10, FakeAccount())
+    deal = SimpleNamespace(
+        id="deal-1",
+        status=SimpleNamespace(name="PAID"),
+        item=SimpleNamespace(id="item-1", name="Item"),
+        chat=SimpleNamespace(id="chat-1"),
+        user=SimpleNamespace(username="Buyer"),
+    )
+    row = {
+        "playerok_auto_delivery_enabled": True,
+        "playerok_auto_confirm_enabled": True,
+        "playerok_notify_delivery": True,
+    }
+
+    asyncio.run(manager._process_playerok_delivery(runtime, row, deal))
+
+    assert sent[0] == ("chat-1", "Ключ: KEY-1")
+    assert updated == [("deal-1", "SENT")]
 
 
 def test_playerok_draft_publication_uses_free_priority(monkeypatch):

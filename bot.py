@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -43,10 +44,12 @@ from plugin_system import PluginData, PluginManager, PluginValidationError
 try:
     from playerokapi.account import Account as PlayerokAccount
     from playerokapi.enums import ItemDealDirections as PlayerokItemDealDirections
+    from playerokapi.enums import ItemDealStatuses as PlayerokItemDealStatuses
     from playerokapi.enums import ItemStatuses as PlayerokItemStatuses
 except ImportError:  # Playerok — опциональная интеграция для локальных тестов без зависимости.
     PlayerokAccount = None
     PlayerokItemDealDirections = None
+    PlayerokItemDealStatuses = None
     PlayerokItemStatuses = None
 
 logging.basicConfig(
@@ -214,6 +217,15 @@ class Database:
                 playerok_notify_reviews BOOLEAN NOT NULL DEFAULT TRUE,
                 playerok_notify_system BOOLEAN NOT NULL DEFAULT TRUE,
                 playerok_auto_publish_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+                playerok_autoreply_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+                playerok_autoreply_text TEXT NOT NULL DEFAULT 'Здравствуйте! Спасибо за сообщение. Скоро отвечу.',
+                playerok_autoreply_cooldown_minutes INTEGER NOT NULL DEFAULT 30,
+                playerok_autoreply_delay_seconds INTEGER NOT NULL DEFAULT 0,
+                playerok_autoreply_work_start SMALLINT NOT NULL DEFAULT 0,
+                playerok_autoreply_work_end SMALLINT NOT NULL DEFAULT 24,
+                playerok_auto_delivery_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+                playerok_auto_confirm_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+                playerok_notify_delivery BOOLEAN NOT NULL DEFAULT TRUE,
                 notify_messages BOOLEAN NOT NULL DEFAULT TRUE,
                 notify_new_orders BOOLEAN NOT NULL DEFAULT TRUE,
                 notify_order_status BOOLEAN NOT NULL DEFAULT TRUE,
@@ -256,6 +268,15 @@ class Database:
             ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS playerok_notify_reviews BOOLEAN NOT NULL DEFAULT TRUE;
             ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS playerok_notify_system BOOLEAN NOT NULL DEFAULT TRUE;
             ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS playerok_auto_publish_enabled BOOLEAN NOT NULL DEFAULT FALSE;
+            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS playerok_autoreply_enabled BOOLEAN NOT NULL DEFAULT FALSE;
+            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS playerok_autoreply_text TEXT NOT NULL DEFAULT 'Здравствуйте! Спасибо за сообщение. Скоро отвечу.';
+            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS playerok_autoreply_cooldown_minutes INTEGER NOT NULL DEFAULT 30;
+            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS playerok_autoreply_delay_seconds INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS playerok_autoreply_work_start SMALLINT NOT NULL DEFAULT 0;
+            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS playerok_autoreply_work_end SMALLINT NOT NULL DEFAULT 24;
+            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS playerok_auto_delivery_enabled BOOLEAN NOT NULL DEFAULT FALSE;
+            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS playerok_auto_confirm_enabled BOOLEAN NOT NULL DEFAULT FALSE;
+            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS playerok_notify_delivery BOOLEAN NOT NULL DEFAULT TRUE;
             ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS auto_delivery_enabled BOOLEAN NOT NULL DEFAULT FALSE;
             ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS multi_delivery_enabled BOOLEAN NOT NULL DEFAULT TRUE;
             ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS delivery_auto_restore BOOLEAN NOT NULL DEFAULT TRUE;
@@ -374,6 +395,48 @@ class Database:
                 enabled BOOLEAN NOT NULL DEFAULT TRUE,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 PRIMARY KEY (telegram_id, chat_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS playerok_autoreply_log (
+                telegram_id BIGINT NOT NULL REFERENCES funpay_users(telegram_id) ON DELETE CASCADE,
+                chat_id TEXT NOT NULL,
+                last_sent TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (telegram_id, chat_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS playerok_command_replies (
+                id BIGSERIAL PRIMARY KEY,
+                telegram_id BIGINT NOT NULL REFERENCES funpay_users(telegram_id) ON DELETE CASCADE,
+                trigger TEXT NOT NULL,
+                response TEXT NOT NULL,
+                enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                notify BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE (telegram_id, trigger)
+            );
+
+            CREATE TABLE IF NOT EXISTS playerok_delivery_rules (
+                id BIGSERIAL PRIMARY KEY,
+                telegram_id BIGINT NOT NULL REFERENCES funpay_users(telegram_id) ON DELETE CASCADE,
+                item_id TEXT NOT NULL,
+                item_title TEXT NOT NULL,
+                response TEXT NOT NULL,
+                products TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+                enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE (telegram_id, item_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS playerok_delivery_log (
+                telegram_id BIGINT NOT NULL REFERENCES funpay_users(telegram_id) ON DELETE CASCADE,
+                deal_id TEXT NOT NULL,
+                rule_id BIGINT REFERENCES playerok_delivery_rules(id) ON DELETE SET NULL,
+                status TEXT NOT NULL,
+                details TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (telegram_id, deal_id)
             );
             """
         )
@@ -505,6 +568,10 @@ class Database:
             "playerok_notify_reviews",
             "playerok_notify_system",
             "playerok_auto_publish_enabled",
+            "playerok_autoreply_enabled",
+            "playerok_auto_delivery_enabled",
+            "playerok_auto_confirm_enabled",
+            "playerok_notify_delivery",
             "auto_delivery_enabled",
             "multi_delivery_enabled",
             "delivery_auto_restore",
@@ -526,12 +593,23 @@ class Database:
             text,
         )
 
+    async def set_playerok_autoreply_text(self, telegram_id: int, text: str) -> None:
+        await self.execute(
+            "UPDATE funpay_users SET playerok_autoreply_text=$2, updated_at=NOW() WHERE telegram_id=$1",
+            telegram_id,
+            text,
+        )
+
     async def set_integer_setting(self, telegram_id: int, column: str, value: int) -> None:
         allowed = {
             "autoreply_cooldown_minutes": (0, 1440),
             "autoreply_delay_seconds": (0, 300),
             "autoreply_work_start": (0, 23),
             "autoreply_work_end": (1, 24),
+            "playerok_autoreply_cooldown_minutes": (0, 1440),
+            "playerok_autoreply_delay_seconds": (0, 300),
+            "playerok_autoreply_work_start": (0, 23),
+            "playerok_autoreply_work_end": (1, 24),
         }
         if column not in allowed or not allowed[column][0] <= value <= allowed[column][1]:
             raise ValueError("Недопустимое значение настройки")
@@ -576,6 +654,24 @@ class Database:
             ON CONFLICT (telegram_id, chat_id) DO UPDATE
                SET last_sent=NOW()
              WHERE funpay_autoreply_log.last_sent < NOW() - make_interval(mins => $3)
+            RETURNING telegram_id
+            """,
+            telegram_id,
+            chat_id,
+            cooldown_minutes,
+        )
+        return row is not None
+
+    async def claim_playerok_autoreply(
+        self, telegram_id: int, chat_id: str, cooldown_minutes: int = 30
+    ) -> bool:
+        row = await self.fetchrow(
+            """
+            INSERT INTO playerok_autoreply_log (telegram_id, chat_id, last_sent)
+            VALUES ($1, $2, NOW())
+            ON CONFLICT (telegram_id, chat_id) DO UPDATE
+               SET last_sent=NOW()
+             WHERE playerok_autoreply_log.last_sent < NOW() - make_interval(mins => $3)
             RETURNING telegram_id
             """,
             telegram_id,
@@ -1072,6 +1168,229 @@ class Database:
             chat_id,
         )
 
+    async def list_playerok_command_replies(self, telegram_id: int) -> list[asyncpg.Record]:
+        return await self.fetch(
+            "SELECT * FROM playerok_command_replies WHERE telegram_id=$1 ORDER BY trigger",
+            telegram_id,
+        )
+
+    async def get_playerok_command_reply(
+        self, telegram_id: int, reply_id: int
+    ) -> asyncpg.Record | None:
+        return await self.fetchrow(
+            "SELECT * FROM playerok_command_replies WHERE telegram_id=$1 AND id=$2",
+            telegram_id,
+            reply_id,
+        )
+
+    async def find_playerok_command_reply(
+        self, telegram_id: int, trigger: str
+    ) -> asyncpg.Record | None:
+        return await self.fetchrow(
+            """
+            SELECT * FROM playerok_command_replies
+             WHERE telegram_id=$1 AND trigger=$2 AND enabled=TRUE
+            """,
+            telegram_id,
+            trigger.casefold().strip(),
+        )
+
+    async def save_playerok_command_reply(
+        self, telegram_id: int, trigger: str, response: str
+    ) -> asyncpg.Record:
+        return await self.fetchrow(
+            """
+            INSERT INTO playerok_command_replies (telegram_id, trigger, response)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (telegram_id, trigger) DO UPDATE
+                SET response=EXCLUDED.response, enabled=TRUE, updated_at=NOW()
+            RETURNING *
+            """,
+            telegram_id,
+            trigger.casefold().strip(),
+            response,
+        )
+
+    async def toggle_playerok_command_reply(self, telegram_id: int, reply_id: int) -> None:
+        await self.execute(
+            """
+            UPDATE playerok_command_replies SET enabled=NOT enabled, updated_at=NOW()
+             WHERE telegram_id=$1 AND id=$2
+            """,
+            telegram_id,
+            reply_id,
+        )
+
+    async def delete_playerok_command_reply(self, telegram_id: int, reply_id: int) -> None:
+        await self.execute(
+            "DELETE FROM playerok_command_replies WHERE telegram_id=$1 AND id=$2",
+            telegram_id,
+            reply_id,
+        )
+
+    async def list_playerok_delivery_rules(self, telegram_id: int) -> list[asyncpg.Record]:
+        return await self.fetch(
+            "SELECT * FROM playerok_delivery_rules WHERE telegram_id=$1 ORDER BY item_title",
+            telegram_id,
+        )
+
+    async def get_playerok_delivery_rule(
+        self, telegram_id: int, rule_id: int
+    ) -> asyncpg.Record | None:
+        return await self.fetchrow(
+            "SELECT * FROM playerok_delivery_rules WHERE telegram_id=$1 AND id=$2",
+            telegram_id,
+            rule_id,
+        )
+
+    async def save_playerok_delivery_rule(
+        self, telegram_id: int, item_id: str, item_title: str, response: str
+    ) -> asyncpg.Record:
+        return await self.fetchrow(
+            """
+            INSERT INTO playerok_delivery_rules (telegram_id, item_id, item_title, response)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (telegram_id, item_id) DO UPDATE
+                SET item_title=EXCLUDED.item_title, response=EXCLUDED.response,
+                    enabled=TRUE, updated_at=NOW()
+            RETURNING *
+            """,
+            telegram_id,
+            item_id,
+            item_title,
+            response,
+        )
+
+    async def add_playerok_delivery_products(
+        self, telegram_id: int, rule_id: int, products: list[str]
+    ) -> None:
+        await self.execute(
+            """
+            UPDATE playerok_delivery_rules
+               SET products=products || $3::TEXT[], updated_at=NOW()
+             WHERE telegram_id=$1 AND id=$2
+            """,
+            telegram_id,
+            rule_id,
+            products,
+        )
+
+    async def clear_playerok_delivery_products(self, telegram_id: int, rule_id: int) -> None:
+        await self.execute(
+            """
+            UPDATE playerok_delivery_rules
+               SET products=ARRAY[]::TEXT[], updated_at=NOW()
+             WHERE telegram_id=$1 AND id=$2
+            """,
+            telegram_id,
+            rule_id,
+        )
+
+    async def toggle_playerok_delivery_rule(self, telegram_id: int, rule_id: int) -> None:
+        await self.execute(
+            """
+            UPDATE playerok_delivery_rules SET enabled=NOT enabled, updated_at=NOW()
+             WHERE telegram_id=$1 AND id=$2
+            """,
+            telegram_id,
+            rule_id,
+        )
+
+    async def delete_playerok_delivery_rule(self, telegram_id: int, rule_id: int) -> None:
+        await self.execute(
+            "DELETE FROM playerok_delivery_rules WHERE telegram_id=$1 AND id=$2",
+            telegram_id,
+            rule_id,
+        )
+
+    async def claim_playerok_delivery(
+        self, telegram_id: int, deal_id: str, item_id: str
+    ) -> tuple[asyncpg.Record, list[str], int, str | None] | None:
+        if not self.pool:
+            raise RuntimeError("База данных не подключена")
+        async with self.pool.acquire() as connection:  # noqa: SIM117 - transaction needs connection.
+            async with connection.transaction():
+                if await connection.fetchval(
+                    "SELECT 1 FROM playerok_delivery_log WHERE telegram_id=$1 AND deal_id=$2",
+                    telegram_id,
+                    deal_id,
+                ):
+                    return None
+                rule = await connection.fetchrow(
+                    """
+                    SELECT * FROM playerok_delivery_rules
+                     WHERE telegram_id=$1 AND item_id=$2 AND enabled=TRUE
+                     LIMIT 1 FOR UPDATE
+                    """,
+                    telegram_id,
+                    item_id,
+                )
+                if not rule:
+                    return None
+                stock = list(rule["products"] or [])
+                needs_product = "$product" in rule["response"]
+                if needs_product and not stock:
+                    error = "Закончились товары для автовыдачи"
+                    await connection.execute(
+                        """
+                        INSERT INTO playerok_delivery_log
+                            (telegram_id, deal_id, rule_id, status, details)
+                        VALUES ($1, $2, $3, 'failed', $4)
+                        """,
+                        telegram_id,
+                        deal_id,
+                        rule["id"],
+                        error,
+                    )
+                    return rule, [], 0, error
+                products = stock[:1] if needs_product else []
+                remaining = stock[1:] if needs_product else stock
+                await connection.execute(
+                    "UPDATE playerok_delivery_rules SET products=$3, updated_at=NOW() WHERE telegram_id=$1 AND id=$2",
+                    telegram_id,
+                    rule["id"],
+                    remaining,
+                )
+                await connection.execute(
+                    """
+                    INSERT INTO playerok_delivery_log (telegram_id, deal_id, rule_id, status)
+                    VALUES ($1, $2, $3, 'processing')
+                    """,
+                    telegram_id,
+                    deal_id,
+                    rule["id"],
+                )
+                return rule, products, len(remaining), None
+
+    async def finish_playerok_delivery(
+        self, telegram_id: int, deal_id: str, status: str, details: str = ""
+    ) -> None:
+        await self.execute(
+            """
+            UPDATE playerok_delivery_log SET status=$3, details=$4
+             WHERE telegram_id=$1 AND deal_id=$2
+            """,
+            telegram_id,
+            deal_id,
+            status,
+            details,
+        )
+
+    async def restore_playerok_delivery_products(
+        self, telegram_id: int, rule_id: int, products: list[str]
+    ) -> None:
+        if products:
+            await self.execute(
+                """
+                UPDATE playerok_delivery_rules
+                   SET products=$3::TEXT[] || products, updated_at=NOW()
+                 WHERE telegram_id=$1 AND id=$2
+                """,
+                telegram_id,
+                rule_id,
+                products,
+            )
+
 
 def normalize_proxy(raw: str) -> str:
     value = raw.strip()
@@ -1193,6 +1512,29 @@ def render_template(
     for variable in sorted(variables, key=len, reverse=True):
         text = text.replace(variable, variables[variable])
     return text
+
+
+def render_playerok_template(
+    text: str, account: Any, *, chat: Any | None = None, message: Any | None = None,
+    deal: Any | None = None,
+) -> str:
+    """Подставляет общие переменные без привязки к объектам FunPay."""
+    buyer = getattr(message, "user", None) or getattr(deal, "user", None)
+    item = getattr(deal, "item", None)
+    text = text.replace("$message_text", str(getattr(message, "text", "") or ""))
+    text = text.replace("$order_link", "")
+    return render_template(
+        text,
+        account=account,
+        chat_id=getattr(chat, "id", None),
+        chat_name=getattr(buyer, "username", None) or getattr(chat, "id", None),
+        order=SimpleNamespace(
+            id=str(getattr(deal, "id", "")),
+            buyer_username=getattr(buyer, "username", None),
+            chat_id=getattr(chat, "id", None),
+            title=getattr(item, "name", None),
+        ) if deal else None,
+    )
 
 
 def format_money(value: float) -> str:
@@ -1618,6 +1960,150 @@ class RuntimeManager:
                     errors.append(f"{clipped(getattr(item, 'name', item.id), 80)}: {clipped(exc, 120)}")
             return published, len(drafts), errors
 
+    async def _process_playerok_message(
+        self, runtime: PlayerokRuntime, row: asyncpg.Record, chat: Any, message: Any
+    ) -> None:
+        sender = getattr(message, "user", None)
+        if str(getattr(sender, "id", "")) == str(runtime.account.id):
+            return
+        text = (getattr(message, "text", "") or "").strip()
+        if not text:
+            return
+        command = text.casefold()
+        command_rule = await self.db.find_playerok_command_reply(
+            runtime.telegram_id, command
+        )
+        if command_rule:
+            response = render_playerok_template(
+                command_rule["response"], runtime.account, chat=chat, message=message
+            )
+            try:
+                await asyncio.to_thread(runtime.account.send_message, str(chat.id), response)
+            except Exception:
+                logger.exception("Playerok: не отправлен ответ на команду %s", command)
+            else:
+                if command_rule["notify"]:
+                    await self.safe_notify(
+                        runtime.telegram_id,
+                        "⌨️ <b>Сработала команда</b>\n\n"
+                        f"Команда: <code>{html.escape(command)}</code>\n"
+                        f"Покупатель: <b>{html.escape(clipped(getattr(sender, 'username', '—'), 120))}</b>\n"
+                        f"Чат: <code>{html.escape(str(chat.id))}</code>",
+                        marketplace="playerok",
+                    )
+            return
+        hour = datetime.now().astimezone().hour
+        if not (
+            row["playerok_autoreply_enabled"]
+            and within_work_hours(
+                row["playerok_autoreply_work_start"],
+                row["playerok_autoreply_work_end"],
+                hour,
+            )
+            and await self.db.claim_playerok_autoreply(
+                runtime.telegram_id,
+                str(chat.id),
+                row["playerok_autoreply_cooldown_minutes"],
+            )
+        ):
+            return
+        delay = int(row["playerok_autoreply_delay_seconds"])
+        if delay:
+            await asyncio.sleep(delay)
+        if self.get_playerok(runtime.telegram_id) is not runtime or runtime.stop_event.is_set():
+            return
+        response = render_playerok_template(
+            row["playerok_autoreply_text"], runtime.account, chat=chat, message=message
+        )
+        try:
+            await asyncio.to_thread(runtime.account.send_message, str(chat.id), response)
+        except Exception:
+            logger.exception("Playerok: автоответ не отправлен в чат %s", chat.id)
+
+    async def _process_playerok_delivery(
+        self, runtime: PlayerokRuntime, row: asyncpg.Record, deal: Any
+    ) -> None:
+        if not row["playerok_auto_delivery_enabled"]:
+            return
+        status = getattr(getattr(deal, "status", None), "name", "")
+        if status not in {"PENDING", "PAID"}:
+            return
+        item = getattr(deal, "item", None)
+        chat = getattr(deal, "chat", None)
+        item_id = str(getattr(item, "id", "") or "")
+        chat_id = str(getattr(chat, "id", chat) or "")
+        if not item_id or not chat_id:
+            logger.warning("Playerok: у сделки %s нет товара или чата", getattr(deal, "id", "—"))
+            return
+        claim = await self.db.claim_playerok_delivery(
+            runtime.telegram_id, str(deal.id), item_id
+        )
+        if not claim:
+            return
+        rule, products, remaining, error = claim
+        if error:
+            if row["playerok_notify_delivery"]:
+                await self.safe_notify(
+                    runtime.telegram_id,
+                    "❌ <b>Ошибка автовыдачи</b>\n\n"
+                    f"Сделка: <code>{html.escape(str(deal.id))}</code>\n"
+                    f"Объявление: <b>{html.escape(clipped(rule['item_title'], 700))}</b>\n"
+                    f"Причина: <code>{html.escape(error)}</code>",
+                    marketplace="playerok",
+                )
+            return
+        delivery_text = render_playerok_template(
+            rule["response"], runtime.account, chat=chat, deal=deal
+        ).replace("$product", "\n".join(products))
+        try:
+            await asyncio.to_thread(runtime.account.send_message, chat_id, delivery_text)
+        except Exception as exc:  # noqa: BLE001 - PlayerokAPI exposes heterogeneous transport errors.
+            await self.db.restore_playerok_delivery_products(
+                runtime.telegram_id, rule["id"], products
+            )
+            await self.db.finish_playerok_delivery(
+                runtime.telegram_id, str(deal.id), "failed", clipped(exc, 600)
+            )
+            if row["playerok_notify_delivery"]:
+                await self.safe_notify(
+                    runtime.telegram_id,
+                    "❌ <b>Автовыдача не отправлена</b>\n\n"
+                    f"Сделка: <code>{html.escape(str(deal.id))}</code>\n"
+                    f"Причина: <code>{html.escape(clipped(exc, 600))}</code>",
+                    marketplace="playerok",
+                )
+            return
+
+        completion = "не запрашивалось"
+        if row["playerok_auto_confirm_enabled"]:
+            if PlayerokItemDealStatuses is None:
+                completion = "не выполнено: библиотека не загрузила статусы"
+            else:
+                try:
+                    await asyncio.to_thread(
+                        runtime.account.update_deal,
+                        str(deal.id),
+                        PlayerokItemDealStatuses.SENT,
+                    )
+                    completion = "заказ отмечен выполненным"
+                except Exception as exc:
+                    completion = f"не удалось отметить выполненным: {clipped(exc, 240)}"
+                    logger.exception("Playerok: не обновлён статус сделки %s", deal.id)
+        await self.db.finish_playerok_delivery(
+            runtime.telegram_id, str(deal.id), "sent", delivery_text
+        )
+        if row["playerok_notify_delivery"]:
+            await self.safe_notify(
+                runtime.telegram_id,
+                "✅ <b>Автовыдача выполнена</b>\n\n"
+                f"Сделка: <code>{html.escape(str(deal.id))}</code>\n"
+                f"Объявление: <b>{html.escape(clipped(rule['item_title'], 700))}</b>\n"
+                f"Остаток: <b>{remaining}</b>\n"
+                f"Статус: <b>{html.escape(completion)}</b>\n\n"
+                f"<pre>{html.escape(clipped(delivery_text, 1200))}</pre>",
+                marketplace="playerok",
+            )
+
     async def _playerok_snapshot(self, runtime: PlayerokRuntime) -> tuple[Any, Any, Any]:
         deals_call = {
             "count": 24,
@@ -1653,6 +2139,11 @@ class RuntimeManager:
             runtime.initialized = True
             return
 
+        for chat in chats:
+            message = getattr(chat, "last_message", None)
+            if message and runtime.message_ids.get(str(chat.id)) != str(message.id):
+                await self._process_playerok_message(runtime, row, chat, message)
+
         if row["playerok_notify_messages"]:
             for chat in chats:
                 message = getattr(chat, "last_message", None)
@@ -1668,7 +2159,12 @@ class RuntimeManager:
                     f"🆔 Чат: <code>{html.escape(str(chat.id))}</code>\n\n"
                     f"<pre>{html.escape(clipped(getattr(message, 'text', None) or '[изображение]', 1400))}</pre>",
                     marketplace="playerok",
+                    reply_markup=keyboard([[("↩️ Ответить", f"po_reply:{chat.id}"), ("💬 Чат", f"po_chat_full:{chat.id}:0")]]),
                 )
+
+        for deal in deals:
+            if runtime.deal_statuses.get(str(deal.id)) is None:
+                await self._process_playerok_delivery(runtime, row, deal)
 
         if row["playerok_notify_deals"]:
             for deal in deals:
@@ -1689,6 +2185,7 @@ class RuntimeManager:
                     f"🏷 Объявление: <b>{html.escape(clipped(getattr(item, 'name', '—'), 700))}</b>\n"
                     f"💰 Цена: <b>{format_money(getattr(item, 'price', 0))} ₽</b>",
                     marketplace="playerok",
+                    reply_markup=keyboard([[("📦 Сделка", f"po_deal:{deal_id}")]]),
                 )
 
         if row["playerok_notify_reviews"]:
@@ -1707,6 +2204,7 @@ class RuntimeManager:
                     f"🏷 Объявление: <b>{html.escape(clipped(getattr(item, 'name', '—'), 500))}</b>\n\n"
                     f"<pre>{html.escape(clipped(getattr(review, 'text', None) or 'Без комментария', 1200))}</pre>",
                     marketplace="playerok",
+                    reply_markup=keyboard([[("📦 Сделка", f"po_deal:{getattr(deal, 'id', '')}")]]) if deal else None,
                 )
 
         runtime.message_ids = message_ids
@@ -2392,6 +2890,36 @@ class PlayerokConnectState(StatesGroup):
     cookie = State()
 
 
+class PlayerokChatState(StatesGroup):
+    text = State()
+    image = State()
+
+
+class PlayerokAutoReplyState(StatesGroup):
+    text = State()
+    delay = State()
+    cooldown = State()
+    hours = State()
+
+
+class PlayerokCommandState(StatesGroup):
+    trigger = State()
+    response = State()
+
+
+class PlayerokDeliveryState(StatesGroup):
+    response = State()
+    products = State()
+
+
+class PlayerokItemCreateState(StatesGroup):
+    game_search = State()
+    name = State()
+    price = State()
+    description = State()
+    field_value = State()
+
+
 class AutoReplyState(StatesGroup):
     text = State()
     cooldown = State()
@@ -2466,7 +2994,10 @@ def main_keyboard(marketplace: str = "funpay") -> InlineKeyboardMarkup:
         return keyboard([
             switch,
             [("👤 Профиль", "po_profile"), ("💰 Баланс", "po_balance")],
-            [("📢 Объявления", "po_items"), ("🔔 Уведомления", "po_notifications")],
+            [("💬 Чаты", "po_chats"), ("📦 Сделки", "po_deals")],
+            [("📢 Объявления", "po_items"), ("➕ Создать", "po_item_create")],
+            [("🤖 Автоответчик", "po_autoreply"), ("📤 Автовыдача", "po_delivery")],
+            [("🔔 Уведомления", "po_notifications")],
             [("⚙️ Аккаунт Playerok", "po_account")],
         ])
     return keyboard([
@@ -2831,6 +3362,895 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
             reply_markup=keyboard([[("🔄 Обновить", "po_balance"), ("⬅️ Меню", "menu")]]),
         )
 
+    async def show_playerok_chat_carousel(target: Message, user_id: int, index: int) -> None:
+        runtime = await require_playerok_runtime(target, user_id)
+        if not runtime:
+            return
+        try:
+            page = await asyncio.to_thread(runtime.account.get_chats, count=24)
+            chats = list(getattr(page, "chats", []) or [])
+        except Exception as exc:
+            logger.exception("Не удалось получить чаты Playerok")
+            await target.answer(f"❌ Чаты недоступны: {html.escape(clipped(exc, 400))}")
+            return
+        if not chats:
+            await target.answer("Чатов Playerok пока нет.", reply_markup=keyboard([[("⬅️ Меню", "menu")]]))
+            return
+        index %= len(chats)
+        chat = chats[index]
+        message = getattr(chat, "last_message", None)
+        sender = getattr(message, "user", None)
+        author = getattr(sender, "username", None) or "—"
+        text = (
+            f"💬 <b>{html.escape(clipped(author, 160))}</b>\n"
+            f"Чат: <code>{html.escape(str(chat.id))}</code> · непрочитано: <b>{getattr(chat, 'unread_messages_counter', 0)}</b>\n"
+            f"Позиция: <b>{index + 1}/{len(chats)}</b>\n\n"
+            f"<pre>{html.escape(clipped(getattr(message, 'text', None) or '[изображение / событие]', 1700))}</pre>"
+        )
+        markup = keyboard([
+            [("⬅️", f"po_chat_view:{(index - 1) % len(chats)}"), (f"{index + 1}/{len(chats)}", "noop"), ("➡️", f"po_chat_view:{(index + 1) % len(chats)}")],
+            [("📖 Открыть диалог", f"po_chat_full:{chat.id}:{index}")],
+            [("↩️ Ответить", f"po_reply:{chat.id}"), ("📷 Фото", f"po_image:{chat.id}")],
+            [("✓ Прочитать", f"po_chat_read:{chat.id}"), ("⬅️ Меню", "menu")],
+        ])
+        try:
+            await target.edit_text(text, reply_markup=markup)
+        except TelegramBadRequest:
+            await target.answer(text, reply_markup=markup)
+
+    @router.callback_query(F.data == "po_chats")
+    async def playerok_chats(callback: CallbackQuery) -> None:
+        await callback.answer("Загружаю…")
+        await show_playerok_chat_carousel(callback.message, callback.from_user.id, 0)
+
+    @router.callback_query(F.data.startswith("po_chat_view:"))
+    async def playerok_chat_view(callback: CallbackQuery) -> None:
+        await callback.answer()
+        await show_playerok_chat_carousel(
+            callback.message, callback.from_user.id, int(callback.data.split(":", 1)[1])
+        )
+
+    @router.callback_query(F.data.startswith("po_chat_full:"))
+    async def playerok_chat_full(callback: CallbackQuery) -> None:
+        await callback.answer("Загружаю историю…")
+        _, chat_id, raw_index = callback.data.split(":", 2)
+        runtime = await require_playerok_runtime(callback.message, callback.from_user.id)
+        if not runtime:
+            return
+        try:
+            messages: list[Any] = []
+            cursor = None
+            for _ in range(10):  # Защитный предел: до 240 сообщений.
+                page = await asyncio.to_thread(
+                    runtime.account.get_chat_messages, chat_id, count=24, after_cursor=cursor
+                )
+                batch = list(getattr(page, "messages", []) or [])
+                messages.extend(batch)
+                page_info = getattr(page, "page_info", None)
+                cursor = getattr(page_info, "end_cursor", None)
+                if not batch or not getattr(page_info, "has_next_page", False) or not cursor:
+                    break
+        except Exception as exc:
+            logger.exception("Не удалось загрузить чат Playerok %s", chat_id)
+            await callback.message.answer(f"❌ История недоступна: {html.escape(clipped(exc, 400))}")
+            return
+        lines = [f"💬 <b>Чат Playerok</b> · <code>{html.escape(chat_id)}</code>\n"]
+        for item in reversed(messages):
+            sender = getattr(item, "user", None)
+            author = getattr(sender, "username", None) or "Система"
+            own = str(getattr(sender, "id", "")) == str(runtime.account.id)
+            prefix = "Вы" if own else author
+            lines.append(
+                f"<b>{html.escape(clipped(prefix, 100))}</b>\n"
+                f"<pre>{html.escape(clipped(getattr(item, 'text', None) or '[изображение / событие]', 1200))}</pre>"
+            )
+        text = "\n".join(lines)
+        for part in [text[i:i + 3500] for i in range(0, len(text), 3500)] or ["Сообщений нет."]:
+            await callback.message.answer(part)
+        await callback.message.answer(
+            "Показано до 240 последних сообщений — это защитный предел для длинных диалогов.",
+            reply_markup=keyboard([
+                [("↩️ Ответить", f"po_reply:{chat_id}"), ("📷 Фото", f"po_image:{chat_id}")],
+                [("⬅️ К чатам", f"po_chat_view:{raw_index}")],
+            ]),
+        )
+
+    @router.callback_query(F.data.startswith("po_chat_read:"))
+    async def playerok_chat_read(callback: CallbackQuery) -> None:
+        chat_id = callback.data.split(":", 1)[1]
+        runtime = await require_playerok_runtime(callback.message, callback.from_user.id)
+        if not runtime:
+            return
+        try:
+            await asyncio.to_thread(runtime.account.mark_chat_as_read, chat_id)
+        except Exception as exc:  # noqa: BLE001 - PlayerokAPI exposes heterogeneous errors.
+            await callback.answer(f"Не удалось: {clipped(exc, 120)}", show_alert=True)
+            return
+        await callback.answer("Чат отмечен прочитанным")
+
+    @router.callback_query(F.data.startswith("po_reply:"))
+    async def playerok_reply(callback: CallbackQuery, state: FSMContext) -> None:
+        await callback.answer()
+        if not await require_playerok_runtime(callback.message, callback.from_user.id):
+            return
+        await state.clear()
+        await state.set_state(PlayerokChatState.text)
+        await state.update_data(playerok_chat_id=callback.data.split(":", 1)[1])
+        await callback.message.answer("Введите ответ до 4000 символов или /cancel.")
+
+    @router.message(PlayerokChatState.text, F.text)
+    async def playerok_reply_text(message: Message, state: FSMContext) -> None:
+        text = message.text.strip()
+        if not 1 <= len(text) <= 4000:
+            await message.answer("Сообщение должно быть от 1 до 4000 символов.")
+            return
+        runtime = await require_playerok_runtime(message, message.from_user.id)
+        if not runtime:
+            await state.clear()
+            return
+        chat_id = str((await state.get_data()).get("playerok_chat_id") or "")
+        if not chat_id:
+            await state.clear()
+            return
+        try:
+            await asyncio.to_thread(runtime.account.send_message, chat_id, text)
+        except Exception as exc:  # noqa: BLE001 - PlayerokAPI exposes heterogeneous errors.
+            await message.answer(f"❌ Playerok не отправил сообщение: {html.escape(clipped(exc, 400))}")
+            return
+        await state.clear()
+        await message.answer(
+            "✅ Сообщение отправлено.",
+            reply_markup=keyboard([[("✍️ Написать ещё", f"po_reply:{chat_id}"), ("💬 Открыть чат", f"po_chat_full:{chat_id}:0")]]),
+        )
+
+    @router.callback_query(F.data.startswith("po_image:"))
+    async def playerok_image(callback: CallbackQuery, state: FSMContext) -> None:
+        await callback.answer()
+        if not await require_playerok_runtime(callback.message, callback.from_user.id):
+            return
+        await state.clear()
+        await state.set_state(PlayerokChatState.image)
+        await state.update_data(playerok_chat_id=callback.data.split(":", 1)[1])
+        await callback.message.answer("Отправьте фото или изображение-файл до 20 МБ. Для отмены: /cancel")
+
+    @router.message(PlayerokChatState.image)
+    async def playerok_image_send(message: Message, state: FSMContext) -> None:
+        runtime = await require_playerok_runtime(message, message.from_user.id)
+        if not runtime:
+            await state.clear()
+            return
+        image = await download_telegram_image(message)
+        if image is None:
+            return
+        chat_id = str((await state.get_data()).get("playerok_chat_id") or "")
+        try:
+            await asyncio.to_thread(runtime.account.send_message, chat_id, None, [image])
+        except Exception as exc:  # noqa: BLE001 - PlayerokAPI exposes heterogeneous errors.
+            await message.answer(f"❌ Не удалось отправить изображение: {html.escape(clipped(exc, 400))}")
+            return
+        await state.clear()
+        await message.answer("✅ Изображение отправлено.", reply_markup=keyboard([[("💬 Чат", f"po_chat_full:{chat_id}:0")]]))
+
+    async def show_playerok_deals(target: Message, user_id: int) -> None:
+        runtime = await require_playerok_runtime(target, user_id)
+        if not runtime:
+            return
+        try:
+            page = await asyncio.to_thread(
+                runtime.account.get_deals, direction=PlayerokItemDealDirections.OUT, count=24
+            )
+            deals = list(getattr(page, "deals", []) or [])
+        except Exception as exc:  # noqa: BLE001 - PlayerokAPI may fail at the request/parser layer.
+            await target.answer(f"❌ Сделки недоступны: {html.escape(clipped(exc, 400))}")
+            return
+        rows = [[(
+            f"{getattr(getattr(deal, 'status', None), 'name', '—')} · {clipped(getattr(getattr(deal, 'item', None), 'name', '—'), 26)}",
+            f"po_deal:{deal.id}",
+        )] for deal in deals]
+        rows.append([("⬅️ Меню", "menu")])
+        await target.answer(
+            f"📦 <b>Продажи Playerok</b>\n\nПоказано: <b>{len(deals)}</b>.",
+            reply_markup=keyboard(rows),
+        )
+
+    @router.callback_query(F.data == "po_deals")
+    async def playerok_deals(callback: CallbackQuery) -> None:
+        await callback.answer("Загружаю…")
+        await show_playerok_deals(callback.message, callback.from_user.id)
+
+    async def show_playerok_deal(target: Message, user_id: int, deal_id: str) -> None:
+        runtime = await require_playerok_runtime(target, user_id)
+        if not runtime:
+            return
+        try:
+            deal = await asyncio.to_thread(runtime.account.get_deal, deal_id)
+        except Exception as exc:  # noqa: BLE001 - PlayerokAPI exposes heterogeneous errors.
+            await target.answer(f"❌ Сделка недоступна: {html.escape(clipped(exc, 400))}")
+            return
+        item = getattr(deal, "item", None)
+        buyer = getattr(deal, "user", None)
+        chat = getattr(deal, "chat", None)
+        status = getattr(getattr(deal, "status", None), "name", "—")
+        rows = []
+        if status in {"PENDING", "PAID"}:
+            rows.append([("✅ Отметить выполненным", f"po_deal_sent_ask:{deal_id}")])
+        if getattr(chat, "id", None):
+            rows.append([("💬 Открыть чат", f"po_chat_full:{chat.id}:0")])
+        rows.append([("⬅️ Сделки", "po_deals")])
+        await target.answer(
+            "📦 <b>Сделка Playerok</b>\n\n"
+            f"ID: <code>{html.escape(str(deal.id))}</code>\n"
+            f"Статус: <b>{html.escape(status)}</b>\n"
+            f"Покупатель: <b>{html.escape(clipped(getattr(buyer, 'username', '—'), 160))}</b>\n"
+            f"Объявление: <b>{html.escape(clipped(getattr(item, 'name', '—'), 700))}</b>\n"
+            f"Цена: <b>{format_money(getattr(item, 'price', 0))} ₽</b>\n"
+            f"Комментарий: <pre>{html.escape(clipped(getattr(deal, 'comment_from_buyer', None) or '—', 1200))}</pre>",
+            reply_markup=keyboard(rows),
+        )
+
+    @router.callback_query(F.data.startswith("po_deal:"))
+    async def playerok_deal(callback: CallbackQuery) -> None:
+        await callback.answer()
+        await show_playerok_deal(callback.message, callback.from_user.id, callback.data.split(":", 1)[1])
+
+    @router.callback_query(F.data.startswith("po_deal_sent_ask:"))
+    async def playerok_deal_sent_ask(callback: CallbackQuery) -> None:
+        deal_id = callback.data.split(":", 1)[1]
+        await callback.answer()
+        await callback.message.answer(
+            "Отметить сделку выполненной? Это действие меняет статус сделки на Playerok.",
+            reply_markup=keyboard([[("Да, выполнить", f"po_deal_sent:{deal_id}"), ("Отмена", f"po_deal:{deal_id}")]]),
+        )
+
+    @router.callback_query(F.data.startswith("po_deal_sent:"))
+    async def playerok_deal_sent(callback: CallbackQuery) -> None:
+        deal_id = callback.data.split(":", 1)[1]
+        runtime = await require_playerok_runtime(callback.message, callback.from_user.id)
+        if not runtime or PlayerokItemDealStatuses is None:
+            return
+        try:
+            await asyncio.to_thread(runtime.account.update_deal, deal_id, PlayerokItemDealStatuses.SENT)
+        except Exception as exc:  # noqa: BLE001 - Playerok may reject a status transition.
+            await callback.answer(f"Не удалось: {clipped(exc, 120)}", show_alert=True)
+            return
+        await callback.answer("Сделка отмечена выполненной")
+        await show_playerok_deal(callback.message, callback.from_user.id, deal_id)
+
+    async def show_playerok_autoreply(target: Message, user_id: int) -> None:
+        row = await db.get_user(user_id)
+        await target.answer(
+            "🤖 <b>Автоответчик Playerok</b>\n\n"
+            f"Рабочее время: <b>{row['playerok_autoreply_work_start']:02d}:00–{row['playerok_autoreply_work_end']:02d}:00</b>\n"
+            f"Задержка: <b>{row['playerok_autoreply_delay_seconds']} сек.</b> · повтор: <b>{row['playerok_autoreply_cooldown_minutes']} мин.</b>\n\n"
+            f"Текст:\n<pre>{html.escape(clipped(row['playerok_autoreply_text'], 1200))}</pre>",
+            reply_markup=keyboard([
+                [(f"{bool_icon(row['playerok_autoreply_enabled'])} Включён", "po_toggle:playerok_autoreply_enabled")],
+                [("✏️ Текст", "po_ar_text"), ("⌨️ Команды", "po_commands")],
+                [("⏱ Задержка", "po_ar_delay"), ("🔁 Интервал", "po_ar_cooldown")],
+                [("🕒 Рабочее время", "po_ar_hours")],
+                [("⬅️ Меню", "menu")],
+            ]),
+        )
+
+    @router.callback_query(F.data == "po_autoreply")
+    async def playerok_autoreply(callback: CallbackQuery) -> None:
+        await callback.answer()
+        await show_playerok_autoreply(callback.message, callback.from_user.id)
+
+    @router.callback_query(F.data == "po_ar_text")
+    async def playerok_autoreply_text(callback: CallbackQuery, state: FSMContext) -> None:
+        await callback.answer()
+        await state.clear()
+        await state.set_state(PlayerokAutoReplyState.text)
+        await callback.message.answer("Отправьте текст автоответа до 1500 символов или /cancel.")
+
+    @router.message(PlayerokAutoReplyState.text, F.text)
+    async def playerok_autoreply_text_save(message: Message, state: FSMContext) -> None:
+        text = message.text.strip()
+        if not 1 <= len(text) <= 1500:
+            await message.answer("Текст должен быть от 1 до 1500 символов.")
+            return
+        await db.set_playerok_autoreply_text(message.from_user.id, text)
+        await state.clear()
+        await show_playerok_autoreply(message, message.from_user.id)
+
+    @router.callback_query(F.data.in_({"po_ar_delay", "po_ar_cooldown"}))
+    async def playerok_autoreply_number(callback: CallbackQuery, state: FSMContext) -> None:
+        await callback.answer()
+        await state.clear()
+        is_delay = callback.data == "po_ar_delay"
+        await state.set_state(PlayerokAutoReplyState.delay if is_delay else PlayerokAutoReplyState.cooldown)
+        await callback.message.answer(
+            "Введите задержку от 0 до 300 секунд." if is_delay else "Введите интервал от 0 до 1440 минут."
+        )
+
+    @router.message(PlayerokAutoReplyState.delay, F.text)
+    async def playerok_autoreply_delay_save(message: Message, state: FSMContext) -> None:
+        value = message.text.strip()
+        if not value.isdigit() or not 0 <= int(value) <= 300:
+            await message.answer("Введите целое число от 0 до 300.")
+            return
+        await db.set_integer_setting(message.from_user.id, "playerok_autoreply_delay_seconds", int(value))
+        await state.clear()
+        await show_playerok_autoreply(message, message.from_user.id)
+
+    @router.message(PlayerokAutoReplyState.cooldown, F.text)
+    async def playerok_autoreply_cooldown_save(message: Message, state: FSMContext) -> None:
+        value = message.text.strip()
+        if not value.isdigit() or not 0 <= int(value) <= 1440:
+            await message.answer("Введите целое число от 0 до 1440.")
+            return
+        await db.set_integer_setting(message.from_user.id, "playerok_autoreply_cooldown_minutes", int(value))
+        await state.clear()
+        await show_playerok_autoreply(message, message.from_user.id)
+
+    @router.callback_query(F.data == "po_ar_hours")
+    async def playerok_autoreply_hours(callback: CallbackQuery, state: FSMContext) -> None:
+        await callback.answer()
+        await state.clear()
+        await state.set_state(PlayerokAutoReplyState.hours)
+        await callback.message.answer("Введите рабочее время в формате <code>9-22</code> или <code>0-24</code>.")
+
+    @router.message(PlayerokAutoReplyState.hours, F.text)
+    async def playerok_autoreply_hours_save(message: Message, state: FSMContext) -> None:
+        match = re.fullmatch(r"\s*(\d{1,2})\s*[-:]\s*(\d{1,2})\s*", message.text)
+        if not match:
+            await message.answer("Используйте формат 9-22 или 0-24.")
+            return
+        start, end = map(int, match.groups())
+        if not 0 <= start <= 23 or not 1 <= end <= 24 or start == end:
+            await message.answer("Начало: 0–23, окончание: 1–24; значения не должны совпадать.")
+            return
+        await db.set_integer_setting(message.from_user.id, "playerok_autoreply_work_start", start)
+        await db.set_integer_setting(message.from_user.id, "playerok_autoreply_work_end", end)
+        await state.clear()
+        await show_playerok_autoreply(message, message.from_user.id)
+
+    async def show_playerok_commands(target: Message, user_id: int) -> None:
+        items = await db.list_playerok_command_replies(user_id)
+        rows = [[(
+            f"{'✅' if item['enabled'] else '❌'} {clipped(item['trigger'], 35)}",
+            f"po_command:{item['id']}",
+        )] for item in items[:50]]
+        rows.extend([[("➕ Добавить", "po_command_add")], [("⬅️ Автоответчик", "po_autoreply")]])
+        await target.answer(
+            "⌨️ <b>Команды Playerok</b>\n\n"
+            "Ответ отправляется, когда сообщение покупателя полностью совпадает с командой без учёта регистра.",
+            reply_markup=keyboard(rows),
+        )
+
+    @router.callback_query(F.data == "po_commands")
+    async def playerok_commands(callback: CallbackQuery) -> None:
+        await callback.answer()
+        await show_playerok_commands(callback.message, callback.from_user.id)
+
+    @router.callback_query(F.data == "po_command_add")
+    async def playerok_command_add(callback: CallbackQuery, state: FSMContext) -> None:
+        await callback.answer()
+        await state.clear()
+        await state.set_state(PlayerokCommandState.trigger)
+        await callback.message.answer("Отправьте команду до 100 символов, например <code>#status</code>.")
+
+    @router.message(PlayerokCommandState.trigger, F.text)
+    async def playerok_command_trigger(message: Message, state: FSMContext) -> None:
+        trigger = message.text.casefold().strip()
+        if not 1 <= len(trigger) <= 100 or "\n" in trigger:
+            await message.answer("Команда должна быть одной строкой от 1 до 100 символов.")
+            return
+        await state.update_data(playerok_command_trigger=trigger)
+        await state.set_state(PlayerokCommandState.response)
+        await message.answer("Теперь отправьте ответ до 3000 символов.")
+
+    @router.message(PlayerokCommandState.response, F.text)
+    async def playerok_command_response(message: Message, state: FSMContext) -> None:
+        response = message.text.strip()
+        trigger = (await state.get_data()).get("playerok_command_trigger")
+        if not trigger or not 1 <= len(response) <= 3000:
+            await message.answer("Ответ должен быть от 1 до 3000 символов.")
+            return
+        item = await db.save_playerok_command_reply(message.from_user.id, trigger, response)
+        await state.clear()
+        await show_playerok_command(message, message.from_user.id, int(item["id"]))
+
+    async def show_playerok_command(target: Message, user_id: int, reply_id: int) -> None:
+        item = await db.get_playerok_command_reply(user_id, reply_id)
+        if not item:
+            await target.answer("Команда не найдена.")
+            return
+        await target.answer(
+            f"⌨️ <b>{html.escape(item['trigger'])}</b>\n\n"
+            f"Состояние: {bool_icon(item['enabled'])}\n\n<pre>{html.escape(clipped(item['response'], 2200))}</pre>",
+            reply_markup=keyboard([
+                [("Выключить" if item["enabled"] else "Включить", f"po_command_toggle:{reply_id}")],
+                [("🗑 Удалить", f"po_command_delete_ask:{reply_id}")],
+                [("⬅️ Команды", "po_commands")],
+            ]),
+        )
+
+    @router.callback_query(F.data.startswith("po_command:"))
+    async def playerok_command(callback: CallbackQuery) -> None:
+        await callback.answer()
+        await show_playerok_command(callback.message, callback.from_user.id, int(callback.data.split(":", 1)[1]))
+
+    @router.callback_query(F.data.startswith("po_command_toggle:"))
+    async def playerok_command_toggle(callback: CallbackQuery) -> None:
+        reply_id = int(callback.data.split(":", 1)[1])
+        await db.toggle_playerok_command_reply(callback.from_user.id, reply_id)
+        await callback.answer("Сохранено")
+        await show_playerok_command(callback.message, callback.from_user.id, reply_id)
+
+    @router.callback_query(F.data.startswith("po_command_delete_ask:"))
+    async def playerok_command_delete_ask(callback: CallbackQuery) -> None:
+        reply_id = int(callback.data.split(":", 1)[1])
+        await callback.answer()
+        await callback.message.answer(
+            "Удалить команду без возможности восстановления?",
+            reply_markup=keyboard([[("Да, удалить", f"po_command_delete:{reply_id}"), ("Отмена", f"po_command:{reply_id}")]]),
+        )
+
+    @router.callback_query(F.data.startswith("po_command_delete:"))
+    async def playerok_command_delete(callback: CallbackQuery) -> None:
+        reply_id = int(callback.data.split(":", 1)[1])
+        await db.delete_playerok_command_reply(callback.from_user.id, reply_id)
+        await callback.answer("Команда удалена")
+        await show_playerok_commands(callback.message, callback.from_user.id)
+
+    async def show_playerok_delivery(target: Message, user_id: int) -> None:
+        runtime = await require_playerok_runtime(target, user_id)
+        if not runtime:
+            return
+        row = await db.get_user(user_id)
+        rules = await db.list_playerok_delivery_rules(user_id)
+        rows = [[(
+            f"{'✅' if rule['enabled'] else '❌'} {clipped(rule['item_title'], 28)} · {len(rule['products'])}",
+            f"po_delivery_rule:{rule['id']}",
+        )] for rule in rules[:30]]
+        rows.extend([
+            [("➕ Добавить из объявлений", "po_delivery_add")],
+            [(f"{bool_icon(row['playerok_auto_delivery_enabled'])} Автовыдача", "po_toggle:playerok_auto_delivery_enabled")],
+            [(f"{bool_icon(row['playerok_auto_confirm_enabled'])} Отмечать выполненным", "po_toggle:playerok_auto_confirm_enabled")],
+            [(f"{bool_icon(row['playerok_notify_delivery'])} Уведомлять", "po_toggle:playerok_notify_delivery")],
+            [("⬅️ Меню", "menu")],
+        ])
+        await target.answer(
+            "📤 <b>Автовыдача Playerok</b>\n\n"
+            "Правило привязано к одному объявлению. В шаблоне используйте <code>$product</code>, "
+            "чтобы выдать одну строку запаса. Включение «Отмечать выполненным» переводит сделку в "
+            "<code>SENT</code> только после успешной выдачи.",
+            reply_markup=keyboard(rows),
+        )
+
+    @router.callback_query(F.data == "po_delivery")
+    async def playerok_delivery(callback: CallbackQuery) -> None:
+        await callback.answer()
+        await show_playerok_delivery(callback.message, callback.from_user.id)
+
+    @router.callback_query(F.data == "po_delivery_add")
+    async def playerok_delivery_add(callback: CallbackQuery) -> None:
+        runtime = await require_playerok_runtime(callback.message, callback.from_user.id)
+        if not runtime or PlayerokItemStatuses is None:
+            return
+        await callback.answer("Получаю объявления…")
+        try:
+            page = await asyncio.to_thread(
+                runtime.account.get_my_items, statuses=list(PlayerokItemStatuses), count=24
+            )
+            items = list(getattr(page, "items", []) or [])
+        except Exception as exc:  # noqa: BLE001 - PlayerokAPI may fail at the request/parser layer.
+            await callback.message.answer(f"❌ Не удалось загрузить объявления: {html.escape(clipped(exc, 400))}")
+            return
+        rows = [[(clipped(item.name, 38), f"po_delivery_pick:{item.id}")] for item in items]
+        rows.append([("⬅️ Автовыдача", "po_delivery")])
+        await callback.message.answer("Выберите объявление для автовыдачи:", reply_markup=keyboard(rows))
+
+    @router.callback_query(F.data.startswith("po_delivery_pick:"))
+    async def playerok_delivery_pick(callback: CallbackQuery, state: FSMContext) -> None:
+        item_id = callback.data.split(":", 1)[1]
+        runtime = await require_playerok_runtime(callback.message, callback.from_user.id)
+        if not runtime:
+            return
+        try:
+            item = await asyncio.to_thread(runtime.account.get_item, id=item_id)
+        except Exception as exc:  # noqa: BLE001 - PlayerokAPI exposes heterogeneous errors.
+            await callback.answer(f"Не удалось: {clipped(exc, 120)}", show_alert=True)
+            return
+        await callback.answer()
+        await state.clear()
+        await state.set_state(PlayerokDeliveryState.response)
+        await state.update_data(playerok_delivery_item_id=item_id, playerok_delivery_item_title=item.name)
+        await callback.message.answer(
+            f"Объявление: <b>{html.escape(clipped(item.name, 800))}</b>\n\n"
+            "Отправьте шаблон выдачи до 3000 символов. Используйте <code>$product</code> для строк из запаса."
+        )
+
+    @router.message(PlayerokDeliveryState.response, F.text)
+    async def playerok_delivery_response(message: Message, state: FSMContext) -> None:
+        response = message.text.strip()
+        data = await state.get_data()
+        if not 1 <= len(response) <= 3000:
+            await message.answer("Шаблон должен быть от 1 до 3000 символов.")
+            return
+        rule_id = data.get("playerok_delivery_rule_id")
+        if rule_id:
+            rule = await db.get_playerok_delivery_rule(message.from_user.id, int(rule_id))
+            if not rule:
+                await state.clear()
+                await message.answer("Правило не найдено.")
+                return
+            saved = await db.save_playerok_delivery_rule(message.from_user.id, rule["item_id"], rule["item_title"], response)
+        else:
+            item_id = data.get("playerok_delivery_item_id")
+            title = data.get("playerok_delivery_item_title")
+            if not item_id or not title:
+                await state.clear()
+                await message.answer("Сессия настройки истекла.")
+                return
+            saved = await db.save_playerok_delivery_rule(message.from_user.id, item_id, title, response)
+        await state.clear()
+        await show_playerok_delivery_rule(message, message.from_user.id, int(saved["id"]))
+
+    async def show_playerok_delivery_rule(target: Message, user_id: int, rule_id: int) -> None:
+        rule = await db.get_playerok_delivery_rule(user_id, rule_id)
+        if not rule:
+            await target.answer("Правило не найдено.")
+            return
+        stock = list(rule["products"] or [])
+        await target.answer(
+            f"📦 <b>{html.escape(clipped(rule['item_title'], 900))}</b>\n\n"
+            f"ID объявления: <code>{html.escape(rule['item_id'])}</code>\n"
+            f"Состояние: {bool_icon(rule['enabled'])} · запас: <b>{len(stock)}</b>\n"
+            f"Шаблон:\n<pre>{html.escape(clipped(rule['response'], 1600))}</pre>"
+            + (f"\nПервые товары:\n<pre>{html.escape(chr(10).join(stock[:5]))}</pre>" if stock else ""),
+            reply_markup=keyboard([
+                [("➕ Добавить товары", f"po_delivery_stock:{rule_id}"), ("✏️ Шаблон", f"po_delivery_edit:{rule_id}")],
+                [("🧹 Очистить запас", f"po_delivery_clear_ask:{rule_id}")],
+                [("Выключить" if rule["enabled"] else "Включить", f"po_delivery_toggle:{rule_id}")],
+                [("🗑 Удалить", f"po_delivery_delete_ask:{rule_id}")],
+                [("⬅️ Автовыдача", "po_delivery")],
+            ]),
+        )
+
+    @router.callback_query(F.data.startswith("po_delivery_rule:"))
+    async def playerok_delivery_rule(callback: CallbackQuery) -> None:
+        await callback.answer()
+        await show_playerok_delivery_rule(callback.message, callback.from_user.id, int(callback.data.split(":", 1)[1]))
+
+    @router.callback_query(F.data.startswith("po_delivery_stock:"))
+    async def playerok_delivery_stock(callback: CallbackQuery, state: FSMContext) -> None:
+        rule_id = int(callback.data.split(":", 1)[1])
+        if not await db.get_playerok_delivery_rule(callback.from_user.id, rule_id):
+            await callback.answer("Правило не найдено", show_alert=True)
+            return
+        await callback.answer()
+        await state.clear()
+        await state.set_state(PlayerokDeliveryState.products)
+        await state.update_data(playerok_delivery_rule_id=rule_id)
+        await callback.message.answer("Отправьте до 500 товаров: один ключ или товар на строку.")
+
+    @router.message(PlayerokDeliveryState.products, F.text)
+    async def playerok_delivery_stock_save(message: Message, state: FSMContext) -> None:
+        products = [line.strip() for line in message.text.splitlines() if line.strip()]
+        if not products or len(products) > 500 or any(len(product) > 1000 for product in products):
+            await message.answer("Нужно от 1 до 500 непустых строк до 1000 символов каждая.")
+            return
+        rule_id = int((await state.get_data()).get("playerok_delivery_rule_id") or 0)
+        await db.add_playerok_delivery_products(message.from_user.id, rule_id, products)
+        await state.clear()
+        await show_playerok_delivery_rule(message, message.from_user.id, rule_id)
+
+    @router.callback_query(F.data.startswith("po_delivery_edit:"))
+    async def playerok_delivery_edit(callback: CallbackQuery, state: FSMContext) -> None:
+        rule_id = int(callback.data.split(":", 1)[1])
+        rule = await db.get_playerok_delivery_rule(callback.from_user.id, rule_id)
+        if not rule:
+            await callback.answer("Правило не найдено", show_alert=True)
+            return
+        await callback.answer()
+        await state.clear()
+        await state.set_state(PlayerokDeliveryState.response)
+        await state.update_data(playerok_delivery_rule_id=rule_id)
+        await callback.message.answer(f"Отправьте новый шаблон. Сейчас:\n<pre>{html.escape(clipped(rule['response'], 1600))}</pre>")
+
+    @router.callback_query(F.data.startswith("po_delivery_toggle:"))
+    async def playerok_delivery_toggle(callback: CallbackQuery) -> None:
+        rule_id = int(callback.data.split(":", 1)[1])
+        await db.toggle_playerok_delivery_rule(callback.from_user.id, rule_id)
+        await callback.answer("Сохранено")
+        await show_playerok_delivery_rule(callback.message, callback.from_user.id, rule_id)
+
+    @router.callback_query(F.data.startswith("po_delivery_clear_ask:"))
+    async def playerok_delivery_clear_ask(callback: CallbackQuery) -> None:
+        rule_id = int(callback.data.split(":", 1)[1])
+        await callback.answer()
+        await callback.message.answer("Очистить весь запас?", reply_markup=keyboard([[("Да, очистить", f"po_delivery_clear:{rule_id}"), ("Отмена", f"po_delivery_rule:{rule_id}")]]))
+
+    @router.callback_query(F.data.startswith("po_delivery_clear:"))
+    async def playerok_delivery_clear(callback: CallbackQuery) -> None:
+        rule_id = int(callback.data.split(":", 1)[1])
+        await db.clear_playerok_delivery_products(callback.from_user.id, rule_id)
+        await callback.answer("Запас очищен")
+        await show_playerok_delivery_rule(callback.message, callback.from_user.id, rule_id)
+
+    @router.callback_query(F.data.startswith("po_delivery_delete_ask:"))
+    async def playerok_delivery_delete_ask(callback: CallbackQuery) -> None:
+        rule_id = int(callback.data.split(":", 1)[1])
+        await callback.answer()
+        await callback.message.answer("Удалить правило и запас?", reply_markup=keyboard([[("Да, удалить", f"po_delivery_delete:{rule_id}"), ("Отмена", f"po_delivery_rule:{rule_id}")]]))
+
+    @router.callback_query(F.data.startswith("po_delivery_delete:"))
+    async def playerok_delivery_delete(callback: CallbackQuery) -> None:
+        rule_id = int(callback.data.split(":", 1)[1])
+        await db.delete_playerok_delivery_rule(callback.from_user.id, rule_id)
+        await callback.answer("Правило удалено")
+        await show_playerok_delivery(callback.message, callback.from_user.id)
+
+    async def show_playerok_item_options(target: Message, state: FSMContext, runtime: PlayerokRuntime) -> None:
+        data = await state.get_data()
+        category = await asyncio.to_thread(runtime.account.get_game_category, id=data["playerok_category_id"])
+        options = list(getattr(category, "options", []) or [])[:40]
+        selected = set(data.get("playerok_option_ids", []))
+        rows = [[(
+            f"{'✅' if str(option.id) in selected else '⬜'} {clipped(getattr(option, 'label', option.value), 30)}",
+            f"po_new_option:{option.id}",
+        )] for option in options]
+        rows.append([("Продолжить", "po_new_options_done")])
+        await target.answer(
+            "Выберите нужные опции категории. Если для объявления опции не требуются — сразу нажмите «Продолжить». "
+            "Playerok проверит обязательные ограничения при создании черновика.",
+            reply_markup=keyboard(rows),
+        )
+
+    async def ask_playerok_item_field(target: Message, state: FSMContext) -> None:
+        data = await state.get_data()
+        fields = data.get("playerok_item_fields", [])
+        index = int(data.get("playerok_item_field_index", 0))
+        if index >= len(fields):
+            await target.answer(
+                "🧾 <b>Проверьте черновик объявления</b>\n\n"
+                f"Название: <b>{html.escape(data['playerok_item_name'])}</b>\n"
+                f"Цена: <b>{data['playerok_item_price']} ₽</b>\n"
+                f"Описание: <pre>{html.escape(clipped(data['playerok_item_description'], 1200))}</pre>\n"
+                f"Опций: <b>{len(data.get('playerok_option_ids', []))}</b> · полей: <b>{len(fields)}</b>\n\n"
+                "После подтверждения будет создан черновик. Публикация остаётся отдельным действием.",
+                reply_markup=keyboard([[("✅ Создать черновик", "po_new_create"), ("Отмена", "po_items")]]),
+            )
+            return
+        field = fields[index]
+        await state.set_state(PlayerokItemCreateState.field_value)
+        await target.answer(
+            f"Поле <b>{html.escape(field['label'])}</b> ({index + 1}/{len(fields)}).\n"
+            "Отправьте значение до 1000 символов. Для отмены: /cancel"
+        )
+
+    @router.callback_query(F.data == "po_item_create")
+    async def playerok_item_create(callback: CallbackQuery, state: FSMContext) -> None:
+        await callback.answer()
+        if not await require_playerok_runtime(callback.message, callback.from_user.id):
+            return
+        await state.clear()
+        await state.set_state(PlayerokItemCreateState.game_search)
+        await callback.message.answer("Введите название игры или приложения Playerok для поиска.")
+
+    @router.message(PlayerokItemCreateState.game_search, F.text)
+    async def playerok_item_game_search(message: Message, state: FSMContext) -> None:
+        query = message.text.strip()
+        if not 2 <= len(query) <= 100:
+            await message.answer("Введите от 2 до 100 символов названия.")
+            return
+        runtime = await require_playerok_runtime(message, message.from_user.id)
+        if not runtime:
+            await state.clear()
+            return
+        try:
+            page = await asyncio.to_thread(runtime.account.get_games, name=query, count=24)
+            games = list(getattr(page, "games", []) or [])
+        except Exception as exc:  # noqa: BLE001 - PlayerokAPI may fail at the request/parser layer.
+            await message.answer(f"❌ Не удалось найти игру: {html.escape(clipped(exc, 400))}")
+            return
+        if not games:
+            await message.answer("Ничего не найдено. Попробуйте другое название.")
+            return
+        await message.answer(
+            "Выберите игру или приложение:",
+            reply_markup=keyboard([[(clipped(game.name, 48), f"po_new_game:{game.id}")] for game in games]),
+        )
+
+    @router.callback_query(F.data.startswith("po_new_game:"))
+    async def playerok_item_game_pick(callback: CallbackQuery, state: FSMContext) -> None:
+        game_id = callback.data.split(":", 1)[1]
+        runtime = await require_playerok_runtime(callback.message, callback.from_user.id)
+        if not runtime:
+            return
+        try:
+            game = await asyncio.to_thread(runtime.account.get_game, id=game_id)
+            categories = list(getattr(game, "categories", []) or [])
+        except Exception as exc:  # noqa: BLE001 - PlayerokAPI exposes heterogeneous errors.
+            await callback.answer(f"Не удалось: {clipped(exc, 120)}", show_alert=True)
+            return
+        if not categories:
+            await callback.answer("У игры нет доступных категорий", show_alert=True)
+            return
+        await callback.answer()
+        await state.update_data(playerok_game_id=game_id)
+        await callback.message.answer(
+            "Выберите категорию:",
+            reply_markup=keyboard([[(clipped(category.name, 48), f"po_new_category:{category.id}")] for category in categories[:40]]),
+        )
+
+    @router.callback_query(F.data.startswith("po_new_category:"))
+    async def playerok_item_category_pick(callback: CallbackQuery, state: FSMContext) -> None:
+        category_id = callback.data.split(":", 1)[1]
+        runtime = await require_playerok_runtime(callback.message, callback.from_user.id)
+        if not runtime:
+            return
+        try:
+            page = await asyncio.to_thread(runtime.account.get_game_category_obtaining_types, category_id)
+            obtaining_types = list(getattr(page, "obtaining_types", []) or [])
+        except Exception as exc:  # noqa: BLE001 - PlayerokAPI exposes heterogeneous errors.
+            await callback.answer(f"Не удалось: {clipped(exc, 120)}", show_alert=True)
+            return
+        if not obtaining_types:
+            await callback.answer("Для категории нет способов получения", show_alert=True)
+            return
+        await callback.answer()
+        await state.update_data(playerok_category_id=category_id)
+        await callback.message.answer(
+            "Выберите способ получения:",
+            reply_markup=keyboard([[(clipped(item.name, 48), f"po_new_obtain:{item.id}")] for item in obtaining_types[:40]]),
+        )
+
+    @router.callback_query(F.data.startswith("po_new_obtain:"))
+    async def playerok_item_obtaining_pick(callback: CallbackQuery, state: FSMContext) -> None:
+        await callback.answer()
+        await state.update_data(playerok_obtaining_type_id=callback.data.split(":", 1)[1], playerok_option_ids=[])
+        await state.set_state(PlayerokItemCreateState.name)
+        await callback.message.answer("Введите название объявления: от 3 до 120 символов.")
+
+    @router.message(PlayerokItemCreateState.name, F.text)
+    async def playerok_item_name(message: Message, state: FSMContext) -> None:
+        value = message.text.strip()
+        if not 3 <= len(value) <= 120:
+            await message.answer("Название должно быть от 3 до 120 символов.")
+            return
+        await state.update_data(playerok_item_name=value)
+        await state.set_state(PlayerokItemCreateState.price)
+        await message.answer("Введите цену в рублях: целое число от 1 до 10 000 000.")
+
+    @router.message(PlayerokItemCreateState.price, F.text)
+    async def playerok_item_price(message: Message, state: FSMContext) -> None:
+        value = message.text.strip()
+        if not value.isdigit() or not 1 <= int(value) <= 10_000_000:
+            await message.answer("Введите целую цену от 1 до 10 000 000.")
+            return
+        await state.update_data(playerok_item_price=int(value))
+        await state.set_state(PlayerokItemCreateState.description)
+        await message.answer("Введите описание объявления: от 1 до 3000 символов.")
+
+    @router.message(PlayerokItemCreateState.description, F.text)
+    async def playerok_item_description(message: Message, state: FSMContext) -> None:
+        value = message.text.strip()
+        if not 1 <= len(value) <= 3000:
+            await message.answer("Описание должно быть от 1 до 3000 символов.")
+            return
+        runtime = await require_playerok_runtime(message, message.from_user.id)
+        if not runtime:
+            await state.clear()
+            return
+        await state.update_data(playerok_item_description=value)
+        try:
+            await show_playerok_item_options(message, state, runtime)
+        except Exception as exc:  # noqa: BLE001 - PlayerokAPI may fail at the request/parser layer.
+            await message.answer(f"❌ Не удалось загрузить опции: {html.escape(clipped(exc, 400))}")
+
+    @router.callback_query(F.data.startswith("po_new_option:"))
+    async def playerok_item_option_toggle(callback: CallbackQuery, state: FSMContext) -> None:
+        option_id = callback.data.split(":", 1)[1]
+        data = await state.get_data()
+        selected = set(data.get("playerok_option_ids", []))
+        if option_id in selected:
+            selected.remove(option_id)
+        else:
+            selected.add(option_id)
+        await state.update_data(playerok_option_ids=list(selected))
+        runtime = await require_playerok_runtime(callback.message, callback.from_user.id)
+        if not runtime:
+            return
+        await callback.answer("Выбрано" if option_id in selected else "Снято")
+        await show_playerok_item_options(callback.message, state, runtime)
+
+    @router.callback_query(F.data == "po_new_options_done")
+    async def playerok_item_options_done(callback: CallbackQuery, state: FSMContext) -> None:
+        runtime = await require_playerok_runtime(callback.message, callback.from_user.id)
+        if not runtime:
+            return
+        data = await state.get_data()
+        try:
+            page = await asyncio.to_thread(
+                runtime.account.get_game_category_data_fields,
+                data["playerok_category_id"],
+                data["playerok_obtaining_type_id"],
+            )
+            fields = [
+                {"id": str(field.id), "label": str(field.label)}
+                for field in list(getattr(page, "data_fields", []) or [])
+                if getattr(field, "required", False)
+                and getattr(getattr(field, "type", None), "name", "") == "ITEM_DATA"
+            ]
+        except Exception as exc:  # noqa: BLE001 - PlayerokAPI may fail at the request/parser layer.
+            await callback.answer(f"Не удалось: {clipped(exc, 120)}", show_alert=True)
+            return
+        await callback.answer()
+        await state.update_data(playerok_item_fields=fields, playerok_item_field_index=0, playerok_item_field_values={})
+        await ask_playerok_item_field(callback.message, state)
+
+    @router.message(PlayerokItemCreateState.field_value, F.text)
+    async def playerok_item_field_value(message: Message, state: FSMContext) -> None:
+        value = message.text.strip()
+        if not 1 <= len(value) <= 1000:
+            await message.answer("Введите значение от 1 до 1000 символов.")
+            return
+        data = await state.get_data()
+        index = int(data.get("playerok_item_field_index", 0))
+        fields = data.get("playerok_item_fields", [])
+        if index >= len(fields):
+            await state.clear()
+            return
+        values = dict(data.get("playerok_item_field_values", {}))
+        values[fields[index]["id"]] = value
+        await state.update_data(playerok_item_field_values=values, playerok_item_field_index=index + 1)
+        await ask_playerok_item_field(message, state)
+
+    @router.callback_query(F.data == "po_new_create")
+    async def playerok_item_create_confirm(callback: CallbackQuery, state: FSMContext) -> None:
+        runtime = await require_playerok_runtime(callback.message, callback.from_user.id)
+        if not runtime:
+            return
+        data = await state.get_data()
+        required = {"playerok_category_id", "playerok_obtaining_type_id", "playerok_item_name", "playerok_item_price", "playerok_item_description"}
+        if not required <= set(data):
+            await callback.answer("Сессия создания истекла", show_alert=True)
+            await state.clear()
+            return
+        await callback.answer("Создаю черновик…")
+        try:
+            category = await asyncio.to_thread(runtime.account.get_game_category, id=data["playerok_category_id"])
+            fields_page = await asyncio.to_thread(
+                runtime.account.get_game_category_data_fields,
+                data["playerok_category_id"],
+                data["playerok_obtaining_type_id"],
+            )
+            values = data.get("playerok_item_field_values", {})
+            fields = []
+            for field in list(getattr(fields_page, "data_fields", []) or []):
+                if str(field.id) in values:
+                    field.value = values[str(field.id)]
+                    fields.append(field)
+            selected = set(data.get("playerok_option_ids", []))
+            options = [option for option in list(getattr(category, "options", []) or []) if str(option.id) in selected]
+            item = await asyncio.to_thread(
+                runtime.account.create_item,
+                data["playerok_category_id"],
+                data["playerok_obtaining_type_id"],
+                data["playerok_item_name"],
+                data["playerok_item_price"],
+                data["playerok_item_description"],
+                options,
+                fields,
+            )
+        except Exception as exc:
+            logger.exception("Playerok: не создан черновик")
+            await callback.message.answer(
+                "❌ Playerok не создал черновик. Обычно не хватает обязательной опции или поля категории.\n\n"
+                f"<code>{html.escape(clipped(exc, 700))}</code>"
+            )
+            return
+        await state.clear()
+        await callback.message.answer(
+            f"✅ Создан черновик <b>{html.escape(clipped(getattr(item, 'name', data['playerok_item_name']), 700))}</b>\n"
+            f"ID: <code>{html.escape(str(item.id))}</code>",
+            reply_markup=keyboard([[("📢 Объявления", "po_items"), ("➕ Создать ещё", "po_item_create")]]),
+        )
+
     async def show_playerok_items(target: Message, user_id: int) -> None:
         runtime = await require_playerok_runtime(target, user_id)
         if not runtime or PlayerokItemStatuses is None:
@@ -2912,6 +4332,7 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
                 [(f"{bool_icon(row['playerok_notify_messages'])} Сообщения", "po_toggle:playerok_notify_messages")],
                 [(f"{bool_icon(row['playerok_notify_deals'])} Сделки и статусы", "po_toggle:playerok_notify_deals")],
                 [(f"{bool_icon(row['playerok_notify_reviews'])} Отзывы", "po_toggle:playerok_notify_reviews")],
+                [(f"{bool_icon(row['playerok_notify_delivery'])} Автовыдача", "po_toggle:playerok_notify_delivery")],
                 [(f"{bool_icon(row['playerok_notify_system'])} Ошибки подключения", "po_toggle:playerok_notify_system")],
                 [("⬅️ Меню", "menu")],
             ]),
@@ -2930,6 +4351,10 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
             "playerok_notify_deals",
             "playerok_notify_reviews",
             "playerok_notify_system",
+            "playerok_notify_delivery",
+            "playerok_autoreply_enabled",
+            "playerok_auto_delivery_enabled",
+            "playerok_auto_confirm_enabled",
         }
         row = await db.get_user(callback.from_user.id)
         if not row or column not in allowed:
@@ -2937,7 +4362,12 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
             return
         await db.set_flag(callback.from_user.id, column, not row[column])
         await callback.answer("Сохранено")
-        await show_playerok_notifications(callback.message, callback.from_user.id)
+        if column == "playerok_autoreply_enabled":
+            await show_playerok_autoreply(callback.message, callback.from_user.id)
+        elif column in {"playerok_auto_delivery_enabled", "playerok_auto_confirm_enabled"}:
+            await show_playerok_delivery(callback.message, callback.from_user.id)
+        else:
+            await show_playerok_notifications(callback.message, callback.from_user.id)
 
     async def show_playerok_account(target: Message, user_id: int) -> None:
         row = await db.get_user(user_id)
