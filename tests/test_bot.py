@@ -1,4 +1,5 @@
 import asyncio
+import sys
 import threading
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -246,6 +247,7 @@ def test_main_menu_has_no_direct_message_or_image_buttons():
     assert "images" not in callbacks
     assert "plugins" in callbacks
     assert "marketplace_switch" in callbacks
+    assert "account_switch:funpay" in callbacks
     assert {"delivery", "command_replies"} <= callbacks
 
 
@@ -399,6 +401,7 @@ def test_playerok_menu_and_independent_account_adapter(monkeypatch):
         for button in row
     }
     assert {"marketplace_switch", "po_profile", "po_balance", "po_items"} <= callbacks
+    assert "account_switch:playerok" in callbacks
     assert {
         "po_chats",
         "po_deals",
@@ -436,6 +439,88 @@ def test_playerok_menu_and_independent_account_adapter(monkeypatch):
     recovered = create_playerok_account("token-three-123", "http://127.0.0.1:8080")
     assert recovered.refreshed is True
     assert recovered._tmp_cert_path == bot_module.certifi.where()
+
+
+def test_playerok_email_code_auth_returns_token_cookie(monkeypatch):
+    calls = []
+
+    class Cookies(dict):
+        def get_dict(self):
+            return dict(self)
+
+    class Response:
+        status_code = 200
+
+        def __init__(self, payload, cookies=None):
+            self._payload = payload
+            self.cookies = Cookies(cookies or {})
+
+        def json(self):
+            return self._payload
+
+    class Session:
+        def __init__(self, **kwargs):
+            calls.append(("session", kwargs))
+            self.cookies = Cookies({"device": "abc"})
+
+        def post(self, url, *, json, headers):
+            calls.append((json["operationName"], url, headers))
+            if json["operationName"] == "getEmailAuthCode":
+                return Response({"data": {"getEmailAuthCode": True}})
+            return Response(
+                {"data": {"checkEmailAuthCode": {"id": "seller-1"}}},
+                {"token": "token-from-email"},
+            )
+
+    monkeypatch.setitem(
+        sys.modules,
+        "curl_cffi",
+        SimpleNamespace(requests=SimpleNamespace(Session=Session)),
+    )
+    proxy = "http://user:pass@127.0.0.1:8080"
+    pending_cookie = bot_module.request_playerok_email_code("seller@example.com", proxy)
+    cookie, viewer = bot_module.verify_playerok_email_code(
+        "seller@example.com", "123456", proxy, pending_cookie
+    )
+
+    assert "device=abc" in pending_cookie
+    assert "token=token-from-email" in cookie
+    assert viewer["id"] == "seller-1"
+    assert [call[0] for call in calls if call[0] != "session"] == [
+        "getEmailAuthCode",
+        "checkEmailAuthCode",
+    ]
+
+
+def test_notification_identifies_marketplace_account():
+    sent = []
+
+    class FakeBot:
+        async def send_message(self, chat_id, text, **kwargs):
+            sent.append((chat_id, text, kwargs))
+
+    class FakeDatabase:
+        async def list_notification_targets(self, _telegram_id):
+            return []
+
+    manager = bot_module.RuntimeManager(FakeBot(), FakeDatabase(), SimpleNamespace())
+    runtime = bot_module.PlayerokRuntime(
+        10,
+        SimpleNamespace(id="seller-42", username="Seller"),
+        account_key=7,
+        account_label="Main Playerok",
+    )
+    asyncio.run(
+        manager.safe_notify(
+            10,
+            "Test",
+            marketplace="playerok",
+            account_runtime=runtime,
+        )
+    )
+    assert "Playerok" in sent[0][1]
+    assert "Main Playerok" in sent[0][1]
+    assert "seller-42" in sent[0][1]
 
 
 def test_playerok_template_uses_chat_deal_and_message_variables():

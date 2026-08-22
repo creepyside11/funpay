@@ -219,6 +219,8 @@ class Database:
                 funpay_username TEXT,
                 account_active BOOLEAN NOT NULL DEFAULT FALSE,
                 active_marketplace TEXT NOT NULL DEFAULT 'funpay',
+                active_funpay_account_id BIGINT,
+                active_playerok_account_id BIGINT,
                 playerok_proxy_enc TEXT,
                 playerok_cookie_enc TEXT,
                 playerok_id TEXT,
@@ -270,6 +272,8 @@ class Database:
 
             ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS notify_reviews BOOLEAN NOT NULL DEFAULT TRUE;
             ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS active_marketplace TEXT NOT NULL DEFAULT 'funpay';
+            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS active_funpay_account_id BIGINT;
+            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS active_playerok_account_id BIGINT;
             ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS playerok_proxy_enc TEXT;
             ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS playerok_cookie_enc TEXT;
             ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS playerok_id TEXT;
@@ -309,6 +313,25 @@ class Database:
             ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS review_reply_3 TEXT NOT NULL DEFAULT 'Спасибо за отзыв! Учтём ваши замечания.';
             ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS review_reply_4 TEXT NOT NULL DEFAULT 'Спасибо за хорошую оценку и ваш заказ!';
             ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS review_reply_5 TEXT NOT NULL DEFAULT 'Спасибо за отличную оценку! Будем рады видеть вас снова.';
+
+            CREATE TABLE IF NOT EXISTS marketplace_accounts (
+                id BIGSERIAL PRIMARY KEY,
+                telegram_id BIGINT NOT NULL REFERENCES funpay_users(telegram_id) ON DELETE CASCADE,
+                marketplace TEXT NOT NULL CHECK (marketplace IN ('funpay', 'playerok')),
+                label TEXT NOT NULL,
+                external_id TEXT NOT NULL,
+                username TEXT,
+                proxy_enc TEXT NOT NULL,
+                credential_enc TEXT NOT NULL,
+                auth_method TEXT NOT NULL DEFAULT 'cookie',
+                enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE (telegram_id, marketplace, external_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS marketplace_accounts_user_idx
+                ON marketplace_accounts (telegram_id, marketplace, enabled, created_at);
 
             CREATE TABLE IF NOT EXISTS funpay_autoreply_log (
                 telegram_id BIGINT NOT NULL REFERENCES funpay_users(telegram_id) ON DELETE CASCADE,
@@ -499,6 +522,7 @@ class Database:
                 (is_official DESC, install_count DESC, updated_at DESC);
             """
         )
+        await self.migrate_legacy_marketplace_accounts()
         await self.seed_official_plugins()
         await self.seed_official_playerok_plugins()
 
@@ -530,40 +554,233 @@ class Database:
     async def get_user(self, telegram_id: int) -> asyncpg.Record | None:
         return await self.fetchrow("SELECT * FROM funpay_users WHERE telegram_id=$1", telegram_id)
 
+    async def migrate_legacy_marketplace_accounts(self) -> None:
+        """Однократно переносит старые одиночные подключения без раскрытия секретов."""
+        await self.execute(
+            """
+            INSERT INTO marketplace_accounts
+                (telegram_id, marketplace, label, external_id, username,
+                 proxy_enc, credential_enc, auth_method)
+            SELECT telegram_id, 'funpay', COALESCE(funpay_username, 'FunPay'),
+                   funpay_id::TEXT, funpay_username, proxy_enc, golden_key_enc, 'golden_key'
+              FROM funpay_users u
+             WHERE account_active=TRUE AND proxy_enc IS NOT NULL
+               AND golden_key_enc IS NOT NULL AND funpay_id IS NOT NULL
+            ON CONFLICT (telegram_id, marketplace, external_id) DO NOTHING;
+
+            INSERT INTO marketplace_accounts
+                (telegram_id, marketplace, label, external_id, username,
+                 proxy_enc, credential_enc, auth_method)
+            SELECT telegram_id, 'playerok', COALESCE(playerok_username, 'Playerok'),
+                   playerok_id, playerok_username, playerok_proxy_enc,
+                   playerok_cookie_enc, 'cookie'
+              FROM funpay_users u
+             WHERE playerok_active=TRUE AND playerok_proxy_enc IS NOT NULL
+               AND playerok_cookie_enc IS NOT NULL AND playerok_id IS NOT NULL
+            ON CONFLICT (telegram_id, marketplace, external_id) DO NOTHING;
+
+            UPDATE funpay_users u
+               SET active_funpay_account_id = COALESCE(
+                       active_funpay_account_id,
+                       (SELECT a.id FROM marketplace_accounts a
+                         WHERE a.telegram_id=u.telegram_id AND a.marketplace='funpay'
+                         ORDER BY a.created_at, a.id LIMIT 1)
+                   ),
+                   active_playerok_account_id = COALESCE(
+                       active_playerok_account_id,
+                       (SELECT a.id FROM marketplace_accounts a
+                         WHERE a.telegram_id=u.telegram_id AND a.marketplace='playerok'
+                         ORDER BY a.created_at, a.id LIMIT 1)
+                   );
+            """
+        )
+
+    @staticmethod
+    def _active_account_column(marketplace: str) -> str:
+        if marketplace == "funpay":
+            return "active_funpay_account_id"
+        if marketplace == "playerok":
+            return "active_playerok_account_id"
+        raise ValueError("Неизвестная площадка")
+
+    async def list_marketplace_accounts(
+        self, telegram_id: int, marketplace: str
+    ) -> list[asyncpg.Record]:
+        self._active_account_column(marketplace)
+        return await self.fetch(
+            """
+            SELECT * FROM marketplace_accounts
+             WHERE telegram_id=$1 AND marketplace=$2 AND enabled=TRUE
+             ORDER BY created_at, id
+            """,
+            telegram_id,
+            marketplace,
+        )
+
+    async def get_marketplace_account(
+        self, telegram_id: int, marketplace: str, account_id: int
+    ) -> asyncpg.Record | None:
+        self._active_account_column(marketplace)
+        return await self.fetchrow(
+            """
+            SELECT * FROM marketplace_accounts
+             WHERE telegram_id=$1 AND marketplace=$2 AND id=$3 AND enabled=TRUE
+            """,
+            telegram_id,
+            marketplace,
+            account_id,
+        )
+
+    async def get_active_marketplace_account(
+        self, telegram_id: int, marketplace: str
+    ) -> asyncpg.Record | None:
+        column = self._active_account_column(marketplace)
+        row = await self.fetchrow(
+            f"""
+            SELECT a.* FROM marketplace_accounts a
+              JOIN funpay_users u ON u.telegram_id=a.telegram_id
+             WHERE a.telegram_id=$1 AND a.marketplace=$2 AND a.enabled=TRUE
+             ORDER BY (a.id=u.{column}) DESC, a.created_at, a.id
+             LIMIT 1
+            """,
+            telegram_id,
+            marketplace,
+        )
+        if row:
+            await self.execute(
+                f"UPDATE funpay_users SET {column}=$2 WHERE telegram_id=$1",
+                telegram_id,
+                row["id"],
+            )
+        return row
+
+    async def add_marketplace_account(
+        self,
+        telegram_id: int,
+        marketplace: str,
+        proxy_enc: str,
+        credential_enc: str,
+        external_id: str,
+        username: str | None,
+        *,
+        auth_method: str,
+    ) -> asyncpg.Record:
+        column = self._active_account_column(marketplace)
+        await self.ensure_user(telegram_id)
+        label = (username or f"{marketplace.title()} {external_id}").strip()[:120]
+        row = await self.fetchrow(
+            """
+            INSERT INTO marketplace_accounts
+                (telegram_id, marketplace, label, external_id, username,
+                 proxy_enc, credential_enc, auth_method, enabled, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, TRUE, NOW())
+            ON CONFLICT (telegram_id, marketplace, external_id) DO UPDATE
+                SET label=EXCLUDED.label, username=EXCLUDED.username,
+                    proxy_enc=EXCLUDED.proxy_enc,
+                    credential_enc=EXCLUDED.credential_enc,
+                    auth_method=EXCLUDED.auth_method, enabled=TRUE, updated_at=NOW()
+            RETURNING *
+            """,
+            telegram_id,
+            marketplace,
+            label,
+            str(external_id),
+            username,
+            proxy_enc,
+            credential_enc,
+            auth_method,
+        )
+        await self.execute(
+            f"""
+            UPDATE funpay_users
+               SET {column}=$2, active_marketplace=$3,
+                   account_active=CASE WHEN $3='funpay' THEN TRUE ELSE account_active END,
+                   playerok_active=CASE WHEN $3='playerok' THEN TRUE ELSE playerok_active END,
+                   updated_at=NOW()
+             WHERE telegram_id=$1
+            """,
+            telegram_id,
+            row["id"],
+            marketplace,
+        )
+        return row
+
+    async def set_active_account(
+        self, telegram_id: int, marketplace: str, account_id: int
+    ) -> asyncpg.Record:
+        column = self._active_account_column(marketplace)
+        row = await self.get_marketplace_account(telegram_id, marketplace, account_id)
+        if not row:
+            raise ValueError("Аккаунт не найден")
+        await self.execute(
+            f"""
+            UPDATE funpay_users SET {column}=$2, active_marketplace=$3, updated_at=NOW()
+             WHERE telegram_id=$1
+            """,
+            telegram_id,
+            account_id,
+            marketplace,
+        )
+        return row
+
+    async def delete_marketplace_account(
+        self, telegram_id: int, marketplace: str, account_id: int
+    ) -> asyncpg.Record | None:
+        column = self._active_account_column(marketplace)
+        await self.execute(
+            """
+            DELETE FROM marketplace_accounts
+             WHERE telegram_id=$1 AND marketplace=$2 AND id=$3
+            """,
+            telegram_id,
+            marketplace,
+            account_id,
+        )
+        replacement = await self.fetchrow(
+            """
+            SELECT * FROM marketplace_accounts
+             WHERE telegram_id=$1 AND marketplace=$2 AND enabled=TRUE
+             ORDER BY created_at, id LIMIT 1
+            """,
+            telegram_id,
+            marketplace,
+        )
+        await self.execute(
+            f"""
+            UPDATE funpay_users
+               SET {column}=$2,
+                   account_active=CASE WHEN $3='funpay' THEN ($2::BIGINT IS NOT NULL) ELSE account_active END,
+                   playerok_active=CASE WHEN $3='playerok' THEN ($2::BIGINT IS NOT NULL) ELSE playerok_active END,
+                   updated_at=NOW()
+             WHERE telegram_id=$1
+            """,
+            telegram_id,
+            replacement["id"] if replacement else None,
+            marketplace,
+        )
+        return replacement
+
     async def save_account(
         self,
         telegram_id: int,
         proxy_enc: str,
         golden_key_enc: str,
         account: Account,
-    ) -> None:
-        await self.ensure_user(telegram_id)
-        await self.execute(
-            """
-            UPDATE funpay_users
-               SET proxy_enc=$2, golden_key_enc=$3, funpay_id=$4, funpay_username=$5,
-                   account_active=TRUE, active_marketplace='funpay', updated_at=NOW()
-             WHERE telegram_id=$1
-            """,
+    ) -> asyncpg.Record:
+        return await self.add_marketplace_account(
             telegram_id,
+            "funpay",
             proxy_enc,
             golden_key_enc,
-            account.id,
+            str(account.id),
             account.username,
+            auth_method="golden_key",
         )
 
     async def disconnect_account(self, telegram_id: int) -> None:
-        await self.execute(
-            """
-            UPDATE funpay_users
-               SET proxy_enc=NULL, golden_key_enc=NULL, funpay_id=NULL, funpay_username=NULL,
-                   account_active=FALSE,
-                   active_marketplace=CASE WHEN playerok_active THEN 'playerok' ELSE 'funpay' END,
-                   updated_at=NOW()
-             WHERE telegram_id=$1
-            """,
-            telegram_id,
-        )
+        account = await self.get_active_marketplace_account(telegram_id, "funpay")
+        if account:
+            await self.delete_marketplace_account(telegram_id, "funpay", int(account["id"]))
 
     async def save_playerok_account(
         self,
@@ -571,35 +788,22 @@ class Database:
         proxy_enc: str,
         cookie_enc: str,
         account: Any,
-    ) -> None:
-        await self.ensure_user(telegram_id)
-        await self.execute(
-            """
-            UPDATE funpay_users
-               SET playerok_proxy_enc=$2, playerok_cookie_enc=$3,
-                   playerok_id=$4, playerok_username=$5, playerok_active=TRUE,
-                   active_marketplace='playerok', updated_at=NOW()
-             WHERE telegram_id=$1
-            """,
+        auth_method: str = "cookie",
+    ) -> asyncpg.Record:
+        return await self.add_marketplace_account(
             telegram_id,
+            "playerok",
             proxy_enc,
             cookie_enc,
             str(account.id),
             account.username,
+            auth_method=auth_method,
         )
 
     async def disconnect_playerok_account(self, telegram_id: int) -> None:
-        await self.execute(
-            """
-            UPDATE funpay_users
-               SET playerok_proxy_enc=NULL, playerok_cookie_enc=NULL,
-                   playerok_id=NULL, playerok_username=NULL, playerok_active=FALSE,
-                   active_marketplace=CASE WHEN account_active THEN 'funpay' ELSE 'playerok' END,
-                   updated_at=NOW()
-             WHERE telegram_id=$1
-            """,
-            telegram_id,
-        )
+        account = await self.get_active_marketplace_account(telegram_id, "playerok")
+        if account:
+            await self.delete_marketplace_account(telegram_id, "playerok", int(account["id"]))
 
     async def set_active_marketplace(self, telegram_id: int, marketplace: str) -> None:
         if marketplace not in {"funpay", "playerok"}:
@@ -1121,18 +1325,18 @@ class Database:
     async def active_users(self) -> list[asyncpg.Record]:
         return await self.fetch(
             """
-            SELECT * FROM funpay_users
-             WHERE account_active=TRUE AND proxy_enc IS NOT NULL AND golden_key_enc IS NOT NULL
+            SELECT * FROM marketplace_accounts
+             WHERE marketplace='funpay' AND enabled=TRUE
+               AND proxy_enc IS NOT NULL AND credential_enc IS NOT NULL
             """
         )
 
     async def active_playerok_users(self) -> list[asyncpg.Record]:
         return await self.fetch(
             """
-            SELECT * FROM funpay_users
-             WHERE playerok_active=TRUE
-               AND playerok_proxy_enc IS NOT NULL
-               AND playerok_cookie_enc IS NOT NULL
+            SELECT * FROM marketplace_accounts
+             WHERE marketplace='playerok' AND enabled=TRUE
+               AND proxy_enc IS NOT NULL AND credential_enc IS NOT NULL
             """
         )
 
@@ -1713,6 +1917,135 @@ def create_playerok_account(cookie: str, proxy: str) -> Any:
     return account
 
 
+PLAYEROK_CHECK_EMAIL_QUERY = """mutation checkEmailAuthCode($input: CheckEmailAuthCodeInput!) {
+  checkEmailAuthCode(input: $input) {
+    id
+    username
+    email
+    role
+    __typename
+  }
+}"""
+
+
+def _playerok_auth_headers(operation: str, cookie: str = "") -> dict[str, str]:
+    headers = {
+        "accept": "*/*",
+        "content-type": "application/json",
+        "origin": "https://playerok.com",
+        "referer": "https://playerok.com/",
+        "user-agent": USER_AGENT,
+        "x-apollo-operation-name": operation,
+        "x-gql-op": operation,
+        "x-gql-path": "/",
+    }
+    if cookie:
+        headers["cookie"] = cookie
+    return headers
+
+
+def _playerok_response_json(response: Any) -> dict[str, Any]:
+    try:
+        payload = response.json()
+    except Exception as exc:
+        raise RuntimeError(
+            f"Playerok вернул не JSON (HTTP {getattr(response, 'status_code', '—')})"
+        ) from exc
+    if getattr(response, "status_code", 0) != 200:
+        raise RuntimeError(f"Playerok вернул HTTP {response.status_code}")
+    errors = payload.get("errors") or []
+    if errors:
+        message = errors[0].get("message", "Неизвестная ошибка Playerok")
+        raise RuntimeError(str(message))
+    return payload
+
+
+def _playerok_session_cookies(session: Any, response: Any | None = None) -> str:
+    cookies: dict[str, str] = {}
+    for source in (getattr(session, "cookies", None), getattr(response, "cookies", None)):
+        if source is None:
+            continue
+        try:
+            cookies.update({str(key): str(value) for key, value in source.get_dict().items()})
+        except AttributeError:
+            try:
+                cookies.update({str(key): str(value) for key, value in source.items()})
+            except (AttributeError, TypeError, ValueError):
+                continue
+    return "; ".join(f"{key}={value}" for key, value in cookies.items())
+
+
+def request_playerok_email_code(email: str, proxy: str) -> str:
+    """Отправляет одноразовый код и возвращает cookie незавершённой auth-сессии."""
+    try:
+        from curl_cffi import requests as curl_requests
+    except ImportError as exc:
+        raise RuntimeError("curl_cffi не установлен в текущей сборке") from exc
+    session = curl_requests.Session(
+        impersonate="chrome",
+        proxy=proxy,
+        timeout=25,
+    )
+    payload = {
+        "operationName": "getEmailAuthCode",
+        "query": (
+            "mutation getEmailAuthCode($email: String!) {\n"
+            "  getEmailAuthCode(input: {email: $email})\n}"
+        ),
+        "variables": {"email": email},
+    }
+    response = session.post(
+        "https://playerok.com/graphql",
+        json=payload,
+        headers=_playerok_auth_headers("getEmailAuthCode"),
+    )
+    data = _playerok_response_json(response)
+    if not data.get("data", {}).get("getEmailAuthCode"):
+        raise RuntimeError("Playerok не подтвердил отправку кода")
+    return _playerok_session_cookies(session, response)
+
+
+def verify_playerok_email_code(
+    email: str, code: str, proxy: str, session_cookie: str
+) -> tuple[str, dict[str, Any]]:
+    """Подтверждает код и возвращает полный cookie-заголовок и профиль viewer."""
+    try:
+        from curl_cffi import requests as curl_requests
+    except ImportError as exc:
+        raise RuntimeError("curl_cffi не установлен в текущей сборке") from exc
+    session = curl_requests.Session(
+        impersonate="chrome",
+        proxy=proxy,
+        timeout=25,
+    )
+    payload = {
+        "operationName": "checkEmailAuthCode",
+        "query": PLAYEROK_CHECK_EMAIL_QUERY,
+        "variables": {"input": {"email": email, "code": code}},
+    }
+    response = session.post(
+        "https://playerok.com/graphql",
+        json=payload,
+        headers=_playerok_auth_headers("checkEmailAuthCode", session_cookie),
+    )
+    data = _playerok_response_json(response)
+    viewer = data.get("data", {}).get("checkEmailAuthCode")
+    if not viewer:
+        raise RuntimeError("Playerok не подтвердил код")
+    cookie = _playerok_session_cookies(session, response)
+    merged: dict[str, str] = {}
+    for raw in (session_cookie, cookie):
+        for part in raw.split(";"):
+            if "=" in part:
+                key, value = part.split("=", 1)
+                merged[key.strip()] = value.strip()
+    if not merged.get("token"):
+        raise RuntimeError(
+            "Playerok подтвердил код, но не выдал cookie token; используйте вход по cookie"
+        )
+    return "; ".join(f"{key}={value}" for key, value in merged.items()), viewer
+
+
 def clipped(value: Any, size: int = 700) -> str:
     text = str(value or "")
     return text if len(text) <= size else text[: size - 1] + "…"
@@ -2083,6 +2416,8 @@ class AccountRuntime:
     telegram_id: int
     account: Account
     runner: Runner
+    account_key: int = 0
+    account_label: str = ""
     keep_online_enabled: bool = True
     auto_raise_enabled: bool = False
     stop_event: threading.Event = field(default_factory=threading.Event)
@@ -2099,6 +2434,8 @@ class AccountRuntime:
 class PlayerokRuntime:
     telegram_id: int
     account: Any
+    account_key: int = 0
+    account_label: str = ""
     stop_event: asyncio.Event = field(default_factory=asyncio.Event)
     task: asyncio.Task[Any] | None = None
     publish_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -2117,6 +2454,8 @@ class RuntimeManager:
         self.secrets = secrets
         self.runtimes: dict[int, AccountRuntime] = {}
         self.playerok_runtimes: dict[int, PlayerokRuntime] = {}
+        self.funpay_account_runtimes: dict[int, AccountRuntime] = {}
+        self.playerok_account_runtimes: dict[int, PlayerokRuntime] = {}
         self.loop: asyncio.AbstractEventLoop | None = None
         self.plugins = PluginManager(db, bot)
         self.playerok_plugins = PlayerokPluginManager(db, bot)
@@ -2125,35 +2464,60 @@ class RuntimeManager:
         self.loop = asyncio.get_running_loop()
         for row in await self.db.active_users():
             user_id = int(row["telegram_id"])
+            settings = await self.db.get_user(user_id)
             try:
-                await self.start(user_id, row=row)
-                if row["notify_system"]:
-                    await self.safe_notify(user_id, "🟢 FunPay Runner восстановлен после запуска бота.")
+                runtime = await self.start(
+                    user_id,
+                    row=row,
+                    make_active=bool(
+                        settings
+                        and int(settings["active_funpay_account_id"] or 0) == int(row["id"])
+                    ),
+                )
+                if settings and settings["notify_system"]:
+                    await self.safe_notify(
+                        user_id,
+                        "🟢 FunPay Runner восстановлен после запуска бота.",
+                        account_runtime=runtime,
+                    )
             except Exception:
                 logger.exception("Не удалось запустить FunPay-аккаунт пользователя %s", user_id)
-                if row["notify_system"]:
+                if settings and settings["notify_system"]:
                     await self.safe_notify(
                         user_id,
                         "⚠️ Не удалось восстановить подключение к FunPay. "
                         "Нажмите «Переподключить» или обновите данные.",
+                        account_name=row["label"],
+                        account_external_id=row["external_id"],
                     )
         for row in await self.db.active_playerok_users():
             user_id = int(row["telegram_id"])
+            settings = await self.db.get_user(user_id)
             try:
-                await self.start_playerok(user_id, row=row)
-                if row["playerok_notify_system"]:
+                runtime = await self.start_playerok(
+                    user_id,
+                    row=row,
+                    make_active=bool(
+                        settings
+                        and int(settings["active_playerok_account_id"] or 0) == int(row["id"])
+                    ),
+                )
+                if settings and settings["playerok_notify_system"]:
                     await self.safe_notify(
                         user_id,
                         "🟢 Слежение за аккаунтом восстановлено после запуска бота.",
                         marketplace="playerok",
+                        account_runtime=runtime,
                     )
             except Exception:
                 logger.exception("Не удалось запустить Playerok-аккаунт пользователя %s", user_id)
-                if row["playerok_notify_system"]:
+                if settings and settings["playerok_notify_system"]:
                     await self.safe_notify(
                         user_id,
                         "⚠️ Не удалось восстановить Playerok. Обновите cookie или прокси.",
                         marketplace="playerok",
+                        account_name=row["label"],
+                        account_external_id=row["external_id"],
                     )
 
     async def start_playerok(
@@ -2161,27 +2525,47 @@ class RuntimeManager:
         telegram_id: int,
         row: asyncpg.Record | None = None,
         account: Any | None = None,
+        *,
+        make_active: bool = True,
     ) -> PlayerokRuntime:
-        await self.stop_playerok(telegram_id)
-        row = row or await self.db.get_user(telegram_id)
-        if not row or not row["playerok_proxy_enc"] or not row["playerok_cookie_enc"]:
+        row = row or await self.db.get_active_marketplace_account(telegram_id, "playerok")
+        if not row or not row["proxy_enc"] or not row["credential_enc"]:
             raise RuntimeError("Playerok не настроен")
+        account_key = int(row["id"])
+        if account_key in self.playerok_account_runtimes:
+            await self.stop_playerok_account(account_key)
         if account is None:
-            proxy = self.secrets.decrypt(row["playerok_proxy_enc"])
-            cookie = self.secrets.decrypt(row["playerok_cookie_enc"])
+            proxy = self.secrets.decrypt(row["proxy_enc"])
+            cookie = self.secrets.decrypt(row["credential_enc"])
             account = create_playerok_account(cookie, proxy)
             await asyncio.wait_for(asyncio.to_thread(account.get), timeout=50)
-        runtime = PlayerokRuntime(telegram_id=telegram_id, account=account)
-        self.playerok_runtimes[telegram_id] = runtime
-        await self.playerok_plugins.load_runtime(telegram_id, runtime)
+        runtime = PlayerokRuntime(
+            telegram_id=telegram_id,
+            account=account,
+            account_key=account_key,
+            account_label=str(row["label"]),
+        )
+        self.playerok_account_runtimes[account_key] = runtime
+        if make_active or telegram_id not in self.playerok_runtimes:
+            if telegram_id in self.playerok_plugins.runtimes:
+                await self.playerok_plugins.stop_runtime(telegram_id)
+            self.playerok_runtimes[telegram_id] = runtime
+            await self.playerok_plugins.load_runtime(telegram_id, runtime)
         runtime.task = asyncio.create_task(self._playerok_poll_loop(runtime))
-        logger.info("Playerok runtime запущен: telegram=%s playerok=%s", telegram_id, account.id)
+        logger.info(
+            "Playerok runtime запущен: telegram=%s account=%s playerok=%s",
+            telegram_id,
+            account_key,
+            account.id,
+        )
         return runtime
 
     async def publish_playerok_drafts(
-        self, telegram_id: int
+        self,
+        telegram_id: int,
+        runtime_override: PlayerokRuntime | None = None,
     ) -> tuple[int, int, list[str]]:
-        runtime = self.playerok_runtimes.get(telegram_id)
+        runtime = runtime_override or self.playerok_runtimes.get(telegram_id)
         if not runtime or PlayerokItemStatuses is None:
             raise RuntimeError("Playerok не подключён")
         async with runtime.publish_lock:
@@ -2247,6 +2631,7 @@ class RuntimeManager:
                         f"Покупатель: <b>{html.escape(clipped(getattr(sender, 'username', '—'), 120))}</b>\n"
                         f"Чат: <code>{html.escape(str(chat.id))}</code>",
                         marketplace="playerok",
+                        account_runtime=runtime,
                     )
             return
         hour = datetime.now().astimezone().hour
@@ -2267,7 +2652,10 @@ class RuntimeManager:
         delay = int(row["playerok_autoreply_delay_seconds"])
         if delay:
             await asyncio.sleep(delay)
-        if self.get_playerok(runtime.telegram_id) is not runtime or runtime.stop_event.is_set():
+        if (
+            self.playerok_account_runtimes.get(runtime.account_key) is not runtime
+            or runtime.stop_event.is_set()
+        ):
             return
         response = render_playerok_template(
             row["playerok_autoreply_text"], runtime.account, chat=chat, message=message
@@ -2307,6 +2695,7 @@ class RuntimeManager:
                     f"Объявление: <b>{html.escape(clipped(rule['item_title'], 700))}</b>\n"
                     f"Причина: <code>{html.escape(error)}</code>",
                     marketplace="playerok",
+                    account_runtime=runtime,
                 )
             return
         delivery_text = render_playerok_template(
@@ -2328,6 +2717,7 @@ class RuntimeManager:
                     f"Сделка: <code>{html.escape(str(deal.id))}</code>\n"
                     f"Причина: <code>{html.escape(clipped(exc, 600))}</code>",
                     marketplace="playerok",
+                    account_runtime=runtime,
                 )
             return
 
@@ -2359,6 +2749,7 @@ class RuntimeManager:
                 f"Статус: <b>{html.escape(completion)}</b>\n\n"
                 f"<pre>{html.escape(clipped(delivery_text, 1200))}</pre>",
                 marketplace="playerok",
+                account_runtime=runtime,
             )
 
     async def _playerok_snapshot(self, runtime: PlayerokRuntime) -> tuple[Any, Any, Any]:
@@ -2400,9 +2791,10 @@ class RuntimeManager:
             message = getattr(chat, "last_message", None)
             if message and runtime.message_ids.get(str(chat.id)) != str(message.id):
                 await self._process_playerok_message(runtime, row, chat, message)
-                await self.playerok_plugins.dispatch(
-                    runtime.telegram_id, "BIND_TO_NEW_MESSAGE", chat, message
-                )
+                if self.get_playerok(runtime.telegram_id) is runtime:
+                    await self.playerok_plugins.dispatch(
+                        runtime.telegram_id, "BIND_TO_NEW_MESSAGE", chat, message
+                    )
 
         if row["playerok_notify_messages"]:
             for chat in chats:
@@ -2419,13 +2811,21 @@ class RuntimeManager:
                     f"🆔 Чат: <code>{html.escape(str(chat.id))}</code>\n\n"
                     f"<pre>{html.escape(clipped(getattr(message, 'text', None) or '[изображение]', 1400))}</pre>",
                     marketplace="playerok",
-                    reply_markup=keyboard([[("↩️ Ответить", f"po_reply:{chat.id}"), ("💬 Чат", f"po_chat_full:{chat.id}:0")]]),
+                    account_runtime=runtime,
+                    reply_markup=(
+                        keyboard([[("↩️ Ответить", f"po_reply:{chat.id}"), ("💬 Чат", f"po_chat_full:{chat.id}:0")]])
+                        if self.get_playerok(runtime.telegram_id) is runtime
+                        else keyboard([[("🔄 Переключиться на аккаунт", f"account_select:playerok:{runtime.account_key}")]])
+                    ),
                 )
 
         for deal in deals:
             if runtime.deal_statuses.get(str(deal.id)) is None:
                 await self._process_playerok_delivery(runtime, row, deal)
-            if runtime.deal_statuses.get(str(deal.id)) != deal_statuses[str(deal.id)]:
+            if (
+                runtime.deal_statuses.get(str(deal.id)) != deal_statuses[str(deal.id)]
+                and self.get_playerok(runtime.telegram_id) is runtime
+            ):
                 await self.playerok_plugins.dispatch(
                     runtime.telegram_id,
                     "BIND_TO_DEAL_CHANGED",
@@ -2452,7 +2852,12 @@ class RuntimeManager:
                     f"🏷 Объявление: <b>{html.escape(clipped(getattr(item, 'name', '—'), 700))}</b>\n"
                     f"💰 Цена: <b>{format_money(getattr(item, 'price', 0))} ₽</b>",
                     marketplace="playerok",
-                    reply_markup=keyboard([[("📦 Сделка", f"po_deal:{deal_id}")]]),
+                    account_runtime=runtime,
+                    reply_markup=(
+                        keyboard([[("📦 Сделка", f"po_deal:{deal_id}")]])
+                        if self.get_playerok(runtime.telegram_id) is runtime
+                        else keyboard([[("🔄 Переключиться на аккаунт", f"account_select:playerok:{runtime.account_key}")]])
+                    ),
                 )
 
         if row["playerok_notify_reviews"]:
@@ -2471,11 +2876,19 @@ class RuntimeManager:
                     f"🏷 Объявление: <b>{html.escape(clipped(getattr(item, 'name', '—'), 500))}</b>\n\n"
                     f"<pre>{html.escape(clipped(getattr(review, 'text', None) or 'Без комментария', 1200))}</pre>",
                     marketplace="playerok",
-                    reply_markup=keyboard([[("📦 Сделка", f"po_deal:{getattr(deal, 'id', '')}")]]) if deal else None,
+                    account_runtime=runtime,
+                    reply_markup=(
+                        keyboard([[("📦 Сделка", f"po_deal:{getattr(deal, 'id', '')}")]])
+                        if deal and self.get_playerok(runtime.telegram_id) is runtime
+                        else keyboard([[("🔄 Переключиться на аккаунт", f"account_select:playerok:{runtime.account_key}")]])
+                    ),
                 )
 
         for review in reviews:
-            if str(review.id) not in runtime.review_ids:
+            if (
+                str(review.id) not in runtime.review_ids
+                and self.get_playerok(runtime.telegram_id) is runtime
+            ):
                 await self.playerok_plugins.dispatch(
                     runtime.telegram_id, "BIND_TO_NEW_REVIEW", review
                 )
@@ -2492,12 +2905,15 @@ class RuntimeManager:
                     return
                 snapshot = await self._playerok_snapshot(runtime)
                 await self._handle_playerok_snapshot(runtime, row, snapshot)
-                await self.playerok_plugins.dispatch(
-                    runtime.telegram_id, "BIND_TO_TICK"
-                )
+                if self.get_playerok(runtime.telegram_id) is runtime:
+                    await self.playerok_plugins.dispatch(
+                        runtime.telegram_id, "BIND_TO_TICK"
+                    )
                 now = asyncio.get_running_loop().time()
                 if row["playerok_auto_publish_enabled"] and now >= runtime.next_auto_publish_at:
-                    published, total, errors = await self.publish_playerok_drafts(runtime.telegram_id)
+                    published, total, errors = await self.publish_playerok_drafts(
+                        runtime.telegram_id, runtime_override=runtime
+                    )
                     runtime.next_auto_publish_at = now + PLAYEROK_AUTO_PUBLISH_SECONDS
                     if published or errors:
                         await self.safe_notify(
@@ -2505,6 +2921,7 @@ class RuntimeManager:
                             f"📢 Автопубликация черновиков: <b>{published}/{total}</b> опубликовано"
                             + (f"\nОшибок: <b>{len(errors)}</b>" if errors else ""),
                             marketplace="playerok",
+                            account_runtime=runtime,
                         )
                 runtime.poll_failures = 0
             except asyncio.CancelledError:
@@ -2519,6 +2936,7 @@ class RuntimeManager:
                             runtime.telegram_id,
                             f"⚠️ Ошибка проверки Playerok: {html.escape(clipped(exc, 400))}",
                             marketplace="playerok",
+                            account_runtime=runtime,
                         )
             try:
                 await asyncio.wait_for(
@@ -2532,15 +2950,19 @@ class RuntimeManager:
         telegram_id: int,
         row: asyncpg.Record | None = None,
         account: Account | None = None,
+        *,
+        make_active: bool = True,
     ) -> AccountRuntime:
         self.loop = asyncio.get_running_loop()
-        await self.stop(telegram_id)
-        row = row or await self.db.get_user(telegram_id)
-        if not row or not row["proxy_enc"] or not row["golden_key_enc"]:
+        row = row or await self.db.get_active_marketplace_account(telegram_id, "funpay")
+        if not row or not row["proxy_enc"] or not row["credential_enc"]:
             raise RuntimeError("Аккаунт не настроен")
+        account_key = int(row["id"])
+        if account_key in self.funpay_account_runtimes:
+            await self.stop_funpay_account(account_key)
         if account is None:
             proxy = self.secrets.decrypt(row["proxy_enc"])
-            golden_key = self.secrets.decrypt(row["golden_key_enc"])
+            golden_key = self.secrets.decrypt(row["credential_enc"])
             account = Account(
                 golden_key,
                 user_agent=USER_AGENT,
@@ -2549,22 +2971,34 @@ class RuntimeManager:
                 locale="ru",
             )
             await asyncio.to_thread(account.get)
+        settings = await self.db.get_user(telegram_id)
         runner = Runner(account)
         runtime = AccountRuntime(
             telegram_id,
             account,
             runner,
-            keep_online_enabled=bool(row["keep_online_enabled"]),
-            auto_raise_enabled=bool(row["auto_raise_enabled"]),
+            account_key=account_key,
+            account_label=str(row["label"]),
+            keep_online_enabled=bool(settings and settings["keep_online_enabled"]),
+            auto_raise_enabled=bool(settings and settings["auto_raise_enabled"]),
         )
-        self.runtimes[telegram_id] = runtime
-        await self.plugins.load_runtime(telegram_id, runtime)
+        self.funpay_account_runtimes[account_key] = runtime
+        if make_active or telegram_id not in self.runtimes:
+            if telegram_id in self.plugins.runtimes:
+                await self.plugins.stop_runtime(telegram_id)
+            self.runtimes[telegram_id] = runtime
+            await self.plugins.load_runtime(telegram_id, runtime)
         runtime.tasks = [
             asyncio.create_task(asyncio.to_thread(runner.loop, runtime.stop_event)),
             asyncio.create_task(asyncio.to_thread(self._listen, runtime)),
             asyncio.create_task(self._auto_raise_loop(runtime)),
         ]
-        logger.info("FunPay runtime запущен: telegram=%s funpay=%s", telegram_id, account.id)
+        logger.info(
+            "FunPay runtime запущен: telegram=%s account=%s funpay=%s",
+            telegram_id,
+            account_key,
+            account.id,
+        )
         return runtime
 
     def _listen(self, runtime: AccountRuntime) -> None:
@@ -2592,15 +3026,26 @@ class RuntimeManager:
         while not runtime.stop_event.is_set():
             try:
                 row = await self.db.get_user(runtime.telegram_id)
-                enabled = bool(row and row["account_active"] and row["auto_raise_enabled"])
+                enabled = bool(row and row["auto_raise_enabled"])
                 if enabled and asyncio.get_running_loop().time() >= runtime.next_raise_at:
-                    await self.raise_lots_now(runtime.telegram_id, notify=True, force=False)
+                    await self.raise_lots_now(
+                        runtime.telegram_id,
+                        notify=True,
+                        force=False,
+                        runtime_override=runtime,
+                    )
             except Exception:
                 logger.exception("Ошибка цикла автоподнятия для %s", runtime.telegram_id)
             await asyncio.sleep(5)
 
-    async def raise_lots_now(self, telegram_id: int, notify: bool = False, force: bool = True) -> str:
-        runtime = self.get(telegram_id)
+    async def raise_lots_now(
+        self,
+        telegram_id: int,
+        notify: bool = False,
+        force: bool = True,
+        runtime_override: AccountRuntime | None = None,
+    ) -> str:
+        runtime = runtime_override or self.get(telegram_id)
         if not runtime:
             raise RuntimeError("FunPay Runner не запущен")
         async with runtime.raise_lock:
@@ -2615,7 +3060,11 @@ class RuntimeManager:
             results: list[str] = []
             waits: list[int] = []
             now = asyncio.get_running_loop().time()
-            plugin_runtime = self.plugins.runtimes.get(telegram_id)
+            plugin_runtime = (
+                self.plugins.runtimes.get(telegram_id)
+                if self.get(telegram_id) is runtime
+                else None
+            )
             for category_id, category in categories.items():
                 category_name = category.name
                 scheduled = runtime.raise_schedule.get(category_id, 0)
@@ -2665,14 +3114,24 @@ class RuntimeManager:
             text = "🆙 <b>Поднятие лотов</b>\n" + html.escape(runtime.last_raise_summary)
             row = await self.db.get_user(telegram_id)
             if notify and row and row["notify_lots_raise"]:
-                await self.safe_notify(telegram_id, text)
+                await self.safe_notify(
+                    telegram_id, text, account_runtime=runtime
+                )
             return text
 
     async def stop(self, telegram_id: int) -> None:
-        runtime = self.runtimes.pop(telegram_id, None)
+        runtime = self.runtimes.get(telegram_id)
         if not runtime:
             return
-        await self.plugins.stop_runtime(telegram_id)
+        await self.stop_funpay_account(runtime.account_key)
+
+    async def stop_funpay_account(self, account_key: int) -> None:
+        runtime = self.funpay_account_runtimes.pop(account_key, None)
+        if not runtime:
+            return
+        if self.runtimes.get(runtime.telegram_id) is runtime:
+            self.runtimes.pop(runtime.telegram_id, None)
+            await self.plugins.stop_runtime(runtime.telegram_id)
         runtime.stop_event.set()
         for task in runtime.background_tasks:
             task.cancel()
@@ -2686,23 +3145,62 @@ class RuntimeManager:
                 timeout=12,
             )
         except TimeoutError:
-            logger.warning("Не все задачи runtime %s завершились вовремя", telegram_id)
+            logger.warning(
+                "Не все задачи runtime %s завершились вовремя",
+                runtime.telegram_id,
+            )
 
     async def stop_playerok(self, telegram_id: int) -> None:
-        runtime = self.playerok_runtimes.pop(telegram_id, None)
+        runtime = self.playerok_runtimes.get(telegram_id)
         if not runtime:
             return
-        await self.playerok_plugins.stop_runtime(telegram_id)
+        await self.stop_playerok_account(runtime.account_key)
+
+    async def stop_playerok_account(self, account_key: int) -> None:
+        runtime = self.playerok_account_runtimes.pop(account_key, None)
+        if not runtime:
+            return
+        if self.playerok_runtimes.get(runtime.telegram_id) is runtime:
+            self.playerok_runtimes.pop(runtime.telegram_id, None)
+            await self.playerok_plugins.stop_runtime(runtime.telegram_id)
         runtime.stop_event.set()
         if runtime.task:
             runtime.task.cancel()
             await asyncio.gather(runtime.task, return_exceptions=True)
 
     async def close(self) -> None:
-        for telegram_id in list(self.runtimes):
-            await self.stop(telegram_id)
-        for telegram_id in list(self.playerok_runtimes):
-            await self.stop_playerok(telegram_id)
+        for account_key in list(self.funpay_account_runtimes):
+            await self.stop_funpay_account(account_key)
+        for account_key in list(self.playerok_account_runtimes):
+            await self.stop_playerok_account(account_key)
+
+    async def activate_account(
+        self, telegram_id: int, marketplace: str, account_id: int
+    ) -> AccountRuntime | PlayerokRuntime:
+        account_row = await self.db.set_active_account(
+            telegram_id, marketplace, account_id
+        )
+        if marketplace == "funpay":
+            runtime = self.funpay_account_runtimes.get(account_id)
+            if not runtime:
+                runtime = await self.start(
+                    telegram_id, row=account_row, make_active=False
+                )
+            if telegram_id in self.plugins.runtimes:
+                await self.plugins.stop_runtime(telegram_id)
+            self.runtimes[telegram_id] = runtime
+            await self.plugins.load_runtime(telegram_id, runtime)
+            return runtime
+        runtime = self.playerok_account_runtimes.get(account_id)
+        if not runtime:
+            runtime = await self.start_playerok(
+                telegram_id, row=account_row, make_active=False
+            )
+        if telegram_id in self.playerok_plugins.runtimes:
+            await self.playerok_plugins.stop_runtime(telegram_id)
+        self.playerok_runtimes[telegram_id] = runtime
+        await self.playerok_plugins.load_runtime(telegram_id, runtime)
+        return runtime
 
     def get(self, telegram_id: int) -> AccountRuntime | None:
         return self.runtimes.get(telegram_id)
@@ -2716,10 +3214,31 @@ class RuntimeManager:
         text: str,
         *,
         marketplace: str = "funpay",
+        account_runtime: AccountRuntime | PlayerokRuntime | None = None,
+        account_name: str | None = None,
+        account_external_id: str | int | None = None,
         **kwargs: Any,
     ) -> None:
         label = "🟣 <b>FunPay</b>" if marketplace == "funpay" else "🔵 <b>Playerok</b>"
-        body = f"{label}\n{text}"
+        if account_runtime is None:
+            account_runtime = (
+                self.get(telegram_id)
+                if marketplace == "funpay"
+                else self.get_playerok(telegram_id)
+            )
+        if account_runtime is not None:
+            account_name = account_runtime.account_label or getattr(
+                account_runtime.account, "username", None
+            )
+            account_external_id = getattr(account_runtime.account, "id", None)
+        account_line = ""
+        if account_name or account_external_id:
+            account_line = (
+                "\n👤 Аккаунт: "
+                f"<b>{html.escape(str(account_name or '—'))}</b>"
+                f" · <code>{html.escape(str(account_external_id or '—'))}</code>"
+            )
+        body = f"{label}{account_line}\n{text}"
         try:
             await self.bot.send_message(telegram_id, body, **kwargs)
         except Exception:
@@ -2754,7 +3273,10 @@ class RuntimeManager:
         delay = int(row["autoreply_delay_seconds"])
         if delay:
             await asyncio.sleep(delay)
-        if self.get(runtime.telegram_id) is not runtime or runtime.stop_event.is_set():
+        if (
+            self.funpay_account_runtimes.get(runtime.account_key) is not runtime
+            or runtime.stop_event.is_set()
+        ):
             return
         try:
             await asyncio.to_thread(
@@ -2773,6 +3295,7 @@ class RuntimeManager:
                 await self.safe_notify(
                     runtime.telegram_id,
                     f"⚠️ Не удалось отправить автоответ в чат <code>{message.chat_id}</code>.",
+                    account_runtime=runtime,
                 )
 
     async def _process_review(
@@ -2841,16 +3364,23 @@ class RuntimeManager:
                 )
             elif row["review_reply_enabled"]:
                 text += "\n⚠️ Автоответ не отправлен: отзыв удалён, уже отвечен или данные заказа недоступны."
+            active = self.get(runtime.telegram_id) is runtime
             buttons = []
-            if order_id:
+            if order_id and active:
                 buttons.append(
                     [("📦 Заказ", f"order_view:{order_id}"), ("✍️ Ответить", f"review_manual:{order_id}")]
                 )
-            if str(message.chat_id).isdigit():
+            if str(message.chat_id).isdigit() and active:
                 buttons.append([("💬 Открыть чат", f"chat_full:{message.chat_id}:0")])
+            if not active:
+                buttons.append([(
+                    "🔄 Переключиться на аккаунт",
+                    f"account_select:funpay:{runtime.account_key}",
+                )])
             await self.safe_notify(
                 runtime.telegram_id,
                 text,
+                account_runtime=runtime,
                 reply_markup=keyboard(buttons) if buttons else None,
             )
 
@@ -2885,6 +3415,7 @@ class RuntimeManager:
                 f"Команда: <code>{html.escape(command)}</code>\n"
                 f"Покупатель: <b>{html.escape(message.author or message.chat_name or '—')}</b>\n"
                 f"Чат: <code>{html.escape(str(message.chat_id))}</code>",
+                account_runtime=runtime,
             )
         return True
 
@@ -2931,7 +3462,11 @@ class RuntimeManager:
             if claim:
                 claimed_rule, products, remaining, error = claim
                 event.goods_left = remaining
-                plugin_runtime = self.plugins.runtimes.get(runtime.telegram_id)
+                plugin_runtime = (
+                    self.plugins.runtimes.get(runtime.telegram_id)
+                    if self.get(runtime.telegram_id) is runtime
+                    else None
+                )
                 if plugin_runtime:
                     await self.plugins.dispatch(
                         runtime.telegram_id,
@@ -2991,6 +3526,7 @@ class RuntimeManager:
                             f"Лот: <b>{html.escape(clipped(order.description, 700))}</b>\n"
                             f"Выдано: <b>{event.goods_delivered}</b> · осталось: <b>{remaining}</b>\n\n"
                             f"<pre>{html.escape(clipped(event.delivery_text, 1400))}</pre>",
+                            account_runtime=runtime,
                         )
                     elif event.error:
                         await self.safe_notify(
@@ -2999,6 +3535,7 @@ class RuntimeManager:
                             f"Заказ: <code>#{html.escape(order.id)}</code>\n"
                             f"Лот: <b>{html.escape(clipped(order.description, 700))}</b>\n"
                             f"Причина: <code>{html.escape(clipped(event.error_text, 800))}</code>",
+                            account_runtime=runtime,
                         )
 
         has_stock_source = "$product" in rule["response"]
@@ -3025,13 +3562,16 @@ class RuntimeManager:
                 runtime.telegram_id,
                 ("🔴 Лот деактивирован: закончились товары.\n" if should_disable else "🟢 Лот автоматически восстановлен.\n")
                 + f"<b>{html.escape(clipped(rule['lot_title'], 1000))}</b>",
+                account_runtime=runtime,
             )
 
     async def handle_event(self, runtime: AccountRuntime, event: Any) -> None:
         row = await self.db.get_user(runtime.telegram_id)
-        if not row or not row["account_active"]:
+        if not row or runtime.stop_event.is_set():
             return
-        await self.plugins.dispatch_event(runtime.telegram_id, event)
+        active = self.get(runtime.telegram_id) is runtime
+        if active:
+            await self.plugins.dispatch_event(runtime.telegram_id, event)
         if isinstance(event, events.NewMessageEvent):
             message = event.message
             review_types = {
@@ -3061,22 +3601,32 @@ class RuntimeManager:
             chat_name = html.escape(message.chat_name or "Неизвестный пользователь")
             body = html.escape(clipped(message.text or "[изображение]", 1200))
             if row["notify_messages"]:
+                message_buttons = (
+                    InlineKeyboardMarkup(inline_keyboard=[
+                        [
+                            InlineKeyboardButton(text="↩️ Ответить", callback_data=f"reply:{chat_id}"),
+                            InlineKeyboardButton(text="💬 Весь чат", callback_data=f"chat_full:{chat_id}:0"),
+                        ],
+                        [InlineKeyboardButton(text="🌐 FunPay", url=f"https://funpay.com/chat/?node={chat_id}")],
+                    ])
+                    if active
+                    else keyboard([[(
+                        "🔄 Переключиться на аккаунт",
+                        f"account_select:funpay:{runtime.account_key}",
+                    )]])
+                )
                 await self.safe_notify(
                     runtime.telegram_id,
                     "💬 <b>Новое сообщение</b>\n\n"
                     f"👤 От: <b>{chat_name}</b>\n"
                     f"🆔 Чат: <code>{html.escape(chat_id)}</code>\n\n"
                     f"<pre>{body}</pre>",
-                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                        [
-                            InlineKeyboardButton(text="↩️ Ответить", callback_data=f"reply:{chat_id}"),
-                            InlineKeyboardButton(text="💬 Весь чат", callback_data=f"chat_full:{chat_id}:0"),
-                        ],
-                        [InlineKeyboardButton(text="🌐 FunPay", url=f"https://funpay.com/chat/?node={chat_id}")],
-                    ]),
+                    account_runtime=runtime,
+                    reply_markup=message_buttons,
                 )
             if (
                 (message.text or "").strip().casefold() == "#status"
+                and active
                 and self.plugins.is_enabled(runtime.telegram_id, STATUS_PLUGIN_UUID)
             ):
                 status_text = await self.db.get_plugin_setting(
@@ -3122,15 +3672,21 @@ class RuntimeManager:
             buttons = [[
                 InlineKeyboardButton(text="📦 Подробности", callback_data=f"order_view:{order.id}"),
                 InlineKeyboardButton(text="🌐 FunPay", url=f"https://funpay.com/orders/{order.id}/"),
-            ]]
-            if str(order.chat_id).isdigit():
+            ]] if active else []
+            if str(order.chat_id).isdigit() and active:
                 buttons.append([
                     InlineKeyboardButton(
                         text="↩️ Ответить", callback_data=f"order_reply:{order.id}"
                     ),
                     InlineKeyboardButton(text="💬 Чат", callback_data=f"chat_full:{order.chat_id}:0"),
                 ])
-            buttons.append([InlineKeyboardButton(text="💸 Вернуть деньги", callback_data=f"refund_ask:{order.id}")])
+            if active:
+                buttons.append([InlineKeyboardButton(text="💸 Вернуть деньги", callback_data=f"refund_ask:{order.id}")])
+            else:
+                buttons.append([InlineKeyboardButton(
+                    text="🔄 Переключиться на аккаунт",
+                    callback_data=f"account_select:funpay:{runtime.account_key}",
+                )])
             await self.safe_notify(
                 runtime.telegram_id,
                 "🛒 <b>Новый заказ</b>\n\n"
@@ -3139,6 +3695,7 @@ class RuntimeManager:
                 f"💰 Сумма: <b>{format_money(order.price)} {html.escape(str(order.currency))}</b>\n\n"
                 "🏷 <b>Лот</b>\n"
                 f"<blockquote>{html.escape(clipped(order.description, 1400))}</blockquote>",
+                account_runtime=runtime,
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
             )
         elif isinstance(event, events.OrderStatusChangedEvent) and row["notify_order_status"]:
@@ -3150,10 +3707,18 @@ class RuntimeManager:
                 f"📌 Новый статус: <b>{html.escape(order_status_label(order.status))}</b>\n\n"
                 "🏷 <b>Лот</b>\n"
                 f"<blockquote>{html.escape(clipped(order.description or '—', 1200))}</blockquote>",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                    InlineKeyboardButton(text="📦 Подробности", callback_data=f"order_view:{order.id}"),
-                    InlineKeyboardButton(text="🌐 FunPay", url=f"https://funpay.com/orders/{order.id}/"),
-                ]]),
+                account_runtime=runtime,
+                reply_markup=(
+                    InlineKeyboardMarkup(inline_keyboard=[[
+                        InlineKeyboardButton(text="📦 Подробности", callback_data=f"order_view:{order.id}"),
+                        InlineKeyboardButton(text="🌐 FunPay", url=f"https://funpay.com/orders/{order.id}/"),
+                    ]])
+                    if active
+                    else keyboard([[(
+                        "🔄 Переключиться на аккаунт",
+                        f"account_select:funpay:{runtime.account_key}",
+                    )]])
+                ),
             )
 
 
@@ -3165,6 +3730,8 @@ class ConnectState(StatesGroup):
 class PlayerokConnectState(StatesGroup):
     proxy = State()
     cookie = State()
+    email = State()
+    code = State()
 
 
 class PlayerokChatState(StatesGroup):
@@ -3269,16 +3836,26 @@ def keyboard(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
     )
 
 
-def main_keyboard(marketplace: str = "funpay") -> InlineKeyboardMarkup:
+def main_keyboard(
+    marketplace: str = "funpay",
+    account_label: str = "",
+    account_count: int = 0,
+) -> InlineKeyboardMarkup:
     switch = [
         (
             "🔄 Площадка: FunPay" if marketplace == "funpay" else "🔄 Площадка: Playerok",
             "marketplace_switch",
         )
     ]
+    account_switch = [(
+        f"👥 Аккаунт: {clipped(account_label or '—', 28)}"
+        + (f" · {account_count}" if account_count else ""),
+        f"account_switch:{marketplace}",
+    )]
     if marketplace == "playerok":
         return keyboard([
             switch,
+            account_switch,
             [("👤 Профиль", "po_profile"), ("💰 Баланс", "po_balance")],
             [("💬 Чаты", "po_chats"), ("📦 Сделки", "po_deals")],
             [("📢 Объявления", "po_items"), ("➕ Создать", "po_item_create")],
@@ -3288,6 +3865,7 @@ def main_keyboard(marketplace: str = "funpay") -> InlineKeyboardMarkup:
         ])
     return keyboard([
         switch,
+        account_switch,
         [("👤 Подробный профиль", "profile"), ("💰 Баланс", "balance")],
         [("🔔 Уведомления", "notifications"), ("🤖 Автоответчик", "autoreply")],
         [("💬 Последние чаты", "chats"), ("📦 Заказ по ID", "order_lookup")],
@@ -3319,7 +3897,9 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
 
     async def show_main(target: Message, user_id: int, text: str = "Выберите действие:") -> None:
         row = await db.get_user(user_id)
-        if not row or not (row["account_active"] or row["playerok_active"]):
+        funpay_accounts = await db.list_marketplace_accounts(user_id, "funpay")
+        playerok_accounts = await db.list_marketplace_accounts(user_id, "playerok")
+        if not row or not (funpay_accounts or playerok_accounts):
             await target.answer(
                 "Выберите площадку, которую хотите настроить первой:",
                 reply_markup=keyboard([
@@ -3329,31 +3909,33 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
             )
             return
         marketplace = row["active_marketplace"]
-        if marketplace == "playerok" and not row["playerok_active"]:
+        if marketplace == "playerok" and not playerok_accounts:
             marketplace = "funpay"
             await db.set_active_marketplace(user_id, marketplace)
-        elif marketplace == "funpay" and not row["account_active"]:
+        elif marketplace == "funpay" and not funpay_accounts:
             marketplace = "playerok"
             await db.set_active_marketplace(user_id, marketplace)
+        accounts = playerok_accounts if marketplace == "playerok" else funpay_accounts
+        active_account = await db.get_active_marketplace_account(user_id, marketplace)
         if marketplace == "playerok":
             online = "🟢" if manager.get_playerok(user_id) else "🔴"
-            username = row["playerok_username"] or "Playerok"
+            username = (active_account and active_account["label"]) or "Playerok"
             label = "🔵 Playerok"
         else:
             online = "🟢" if manager.get(user_id) else "🔴"
-            username = row["funpay_username"] or "FunPay"
+            username = (active_account and active_account["label"]) or "FunPay"
             label = "🟣 FunPay"
         await target.answer(
             f"{label} · {online} <b>{html.escape(username)}</b>\n{text}",
-            reply_markup=main_keyboard(marketplace),
+            reply_markup=main_keyboard(marketplace, username, len(accounts)),
         )
 
     async def require_runtime(target: Message, user_id: int) -> AccountRuntime | None:
         runtime = manager.get(user_id)
         if runtime:
             return runtime
-        row = await db.get_user(user_id)
-        if not row or not row["account_active"]:
+        account = await db.get_active_marketplace_account(user_id, "funpay")
+        if not account:
             await target.answer("Сначала подключите аккаунт FunPay через /start.")
             return None
         await target.answer("Подключение неактивно. Откройте «Аккаунт» → «Переподключить».")
@@ -3365,8 +3947,8 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
         runtime = manager.get_playerok(user_id)
         if runtime:
             return runtime
-        row = await db.get_user(user_id)
-        if not row or not row["playerok_active"]:
+        account = await db.get_active_marketplace_account(user_id, "playerok")
+        if not account:
             await target.answer(
                 "Сначала подключите Playerok.",
                 reply_markup=keyboard([[("🔵 Подключить Playerok", "connect_playerok")]]),
@@ -3387,33 +3969,34 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
 
     async def begin_playerok_connect(target: Message, state: FSMContext) -> None:
         await state.clear()
-        await state.set_state(PlayerokConnectState.proxy)
         await target.answer(
-            "🔵 <b>Playerok · шаг 1/2</b>\n\n"
-            "Отправьте IPv4 HTTP/HTTPS-прокси, желательно тот же IP, с которого получены cookie:\n"
-            "<code>http://user:password@host:port</code>\n\n"
-            "Сообщение будет удалено после обработки. Для отмены: /cancel"
+            "🔵 <b>Подключение Playerok</b>\n\n"
+            "Выберите способ входа. Email-код удобнее, cookie оставлены "
+            "как резервный способ при защите Playerok.",
+            reply_markup=keyboard([
+                [("📧 Email + код", "po_auth_email")],
+                [("🍪 Cookie", "po_auth_cookie")],
+                [("❌ Отмена", "menu")],
+            ]),
         )
 
     @router.message(CommandStart())
     async def start(message: Message, state: FSMContext) -> None:
         await state.clear()
         await db.ensure_user(message.from_user.id)
-        row = await db.get_user(message.from_user.id)
-        if row and (row["account_active"] or row["playerok_active"]):
-            if row["account_active"] and not manager.get(message.from_user.id):
+        for marketplace, runtimes, starter in (
+            ("funpay", manager.funpay_account_runtimes, manager.start),
+            ("playerok", manager.playerok_account_runtimes, manager.start_playerok),
+        ):
+            active = await db.get_active_marketplace_account(
+                message.from_user.id, marketplace
+            )
+            if active and int(active["id"]) not in runtimes:
                 try:
-                    await manager.start(message.from_user.id, row=row)
+                    await starter(message.from_user.id, row=active)
                 except Exception:
-                    logger.exception("Ручной запуск FunPay не удался")
-            if row["playerok_active"] and not manager.get_playerok(message.from_user.id):
-                try:
-                    await manager.start_playerok(message.from_user.id, row=row)
-                except Exception:
-                    logger.exception("Ручной запуск Playerok не удался")
-            await show_main(message, message.from_user.id)
-        else:
-            await show_main(message, message.from_user.id)
+                    logger.exception("Ручной запуск %s не удался", marketplace)
+        await show_main(message, message.from_user.id)
 
     @router.message(Command("cancel"))
     async def cancel(message: Message, state: FSMContext) -> None:
@@ -3429,6 +4012,21 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
     async def connect_playerok_callback(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer()
         await begin_playerok_connect(callback.message, state)
+
+    @router.callback_query(F.data.in_({"po_auth_email", "po_auth_cookie"}))
+    async def playerok_auth_method(callback: CallbackQuery, state: FSMContext) -> None:
+        method = "email" if callback.data == "po_auth_email" else "cookie"
+        await callback.answer()
+        await state.clear()
+        await state.update_data(playerok_auth_method=method)
+        await state.set_state(PlayerokConnectState.proxy)
+        await callback.message.answer(
+            f"🔵 <b>Playerok · шаг 1/{'3' if method == 'email' else '2'}</b>\n\n"
+            "Отправьте IPv4 HTTP/HTTPS-прокси:\n"
+            "<code>http://user:password@host:port</code>\n\n"
+            "Весь вход должен проходить с одного IP. Сообщение будет удалено. "
+            "Для отмены: /cancel"
+        )
 
     @router.message(ConnectState.proxy, F.text)
     async def accept_proxy(message: Message, state: FSMContext) -> None:
@@ -3481,15 +4079,16 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
                 "Отправьте golden_key повторно либо начните заново через /cancel и /start."
             )
             return
-        await db.save_account(
+        account_row = await db.save_account(
             message.from_user.id,
             secrets.encrypt(proxy),
             secrets.encrypt(golden_key),
             account,
         )
-        row = await db.get_user(message.from_user.id)
         try:
-            await manager.start(message.from_user.id, row=row, account=account)
+            await manager.start(
+                message.from_user.id, row=account_row, account=account
+            )
         except Exception:
             logger.exception("Не удалось запустить runtime после успешной авторизации")
             await wait_message.edit_text("⚠️ Аккаунт сохранён, но слежение не запустилось. Попробуйте переподключить.")
@@ -3515,14 +4114,22 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
         except TelegramBadRequest:
             pass
         await state.update_data(playerok_proxy=proxy)
-        await state.set_state(PlayerokConnectState.cookie)
-        await message.answer(
-            "🔵 <b>Playerok · шаг 2/2</b>\n\n"
-            "Отправьте полный заголовок cookie из браузера, например:\n"
-            "<code>__ddg5_=...; token=...</code>\n\n"
-            "Можно отправить только значение <code>token</code>, но при включённой защите Playerok "
-            "понадобится полный набор cookie. Сообщение будет удалено."
-        )
+        data = await state.get_data()
+        if data.get("playerok_auth_method") == "email":
+            await state.set_state(PlayerokConnectState.email)
+            await message.answer(
+                "🔵 <b>Playerok · шаг 2/3</b>\n\n"
+                "Отправьте email, привязанный к Playerok. Бот запросит одноразовый код."
+            )
+        else:
+            await state.set_state(PlayerokConnectState.cookie)
+            await message.answer(
+                "🔵 <b>Playerok · шаг 2/2</b>\n\n"
+                "Отправьте полный заголовок cookie из браузера, например:\n"
+                "<code>__ddg5_=...; token=...</code>\n\n"
+                "Можно отправить только значение <code>token</code>, но при включённой защите Playerok "
+                "понадобится полный набор cookie. Сообщение будет удалено."
+            )
 
     @router.message(PlayerokConnectState.cookie, F.text)
     async def accept_playerok_cookie(message: Message, state: FSMContext) -> None:
@@ -3550,15 +4157,16 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
                 f"и защита не запросила новую __ddg5_.\n\nОшибка: <code>{html.escape(clipped(exc, 500))}</code>"
             )
             return
-        await db.save_playerok_account(
+        account_row = await db.save_playerok_account(
             message.from_user.id,
             secrets.encrypt(proxy),
             secrets.encrypt(cookie),
             account,
         )
-        row = await db.get_user(message.from_user.id)
         try:
-            await manager.start_playerok(message.from_user.id, row=row, account=account)
+            await manager.start_playerok(
+                message.from_user.id, row=account_row, account=account
+            )
         except Exception:
             logger.exception("Playerok сохранён, но polling не запустился")
             await wait_message.edit_text(
@@ -3573,6 +4181,109 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
         )
         await show_main(message, message.from_user.id)
 
+    @router.message(PlayerokConnectState.email, F.text)
+    async def accept_playerok_email(message: Message, state: FSMContext) -> None:
+        email = message.text.strip().casefold()
+        try:
+            await message.delete()
+        except TelegramBadRequest:
+            pass
+        if not re.fullmatch(r"[^\s@]{1,128}@[^\s@.]{1,128}\.[^\s@]{2,63}", email):
+            await message.answer("❌ Email выглядит некорректно. Отправьте его снова или /cancel.")
+            return
+        data = await state.get_data()
+        proxy = data.get("playerok_proxy")
+        if not proxy:
+            await begin_playerok_connect(message, state)
+            return
+        wait_message = await message.answer("⏳ Запрашиваю код у Playerok…")
+        try:
+            auth_cookie = await asyncio.wait_for(
+                asyncio.to_thread(request_playerok_email_code, email, proxy),
+                timeout=40,
+            )
+        except Exception as exc:
+            logger.warning("Playerok не отправил email-код", exc_info=True)
+            await wait_message.edit_text(
+                "❌ Playerok не принял запрос кода. Проверьте email и прокси. "
+                "Если Playerok запросил CAPTCHA, используйте вход по cookie.\n\n"
+                f"Ошибка: <code>{html.escape(clipped(exc, 450))}</code>"
+            )
+            return
+        await state.update_data(
+            playerok_email=email,
+            playerok_auth_cookie=auth_cookie,
+        )
+        await state.set_state(PlayerokConnectState.code)
+        await wait_message.edit_text(
+            "📨 <b>Playerok · шаг 3/3</b>\n\n"
+            "Код отправлен на указанную почту. Пришлите его одним сообщением."
+        )
+
+    @router.message(PlayerokConnectState.code, F.text)
+    async def accept_playerok_email_code(message: Message, state: FSMContext) -> None:
+        code = re.sub(r"\s+", "", message.text)
+        try:
+            await message.delete()
+        except TelegramBadRequest:
+            pass
+        if not re.fullmatch(r"[A-Za-z0-9]{4,12}", code):
+            await message.answer("❌ Код выглядит некорректно. Отправьте его снова или /cancel.")
+            return
+        data = await state.get_data()
+        proxy = data.get("playerok_proxy")
+        email = data.get("playerok_email")
+        auth_cookie = data.get("playerok_auth_cookie", "")
+        if not proxy or not email:
+            await begin_playerok_connect(message, state)
+            return
+        wait_message = await message.answer("⏳ Проверяю код и вхожу в Playerok…")
+        try:
+            cookie, _viewer = await asyncio.wait_for(
+                asyncio.to_thread(
+                    verify_playerok_email_code,
+                    email,
+                    code,
+                    proxy,
+                    auth_cookie,
+                ),
+                timeout=45,
+            )
+            account = create_playerok_account(cookie, proxy)
+            await asyncio.wait_for(asyncio.to_thread(account.get), timeout=50)
+        except Exception as exc:
+            logger.warning("Playerok email-код не принят", exc_info=True)
+            await wait_message.edit_text(
+                "❌ Код не принят или Playerok не выдал сессию. Запросите новый код через /cancel и /start "
+                "либо войдите по cookie.\n\n"
+                f"Ошибка: <code>{html.escape(clipped(exc, 450))}</code>"
+            )
+            return
+        account_row = await db.save_playerok_account(
+            message.from_user.id,
+            secrets.encrypt(proxy),
+            secrets.encrypt(cookie),
+            account,
+            auth_method="email",
+        )
+        try:
+            await manager.start_playerok(
+                message.from_user.id, row=account_row, account=account
+            )
+        except Exception:
+            logger.exception("Playerok email-аккаунт сохранён, но polling не запустился")
+            await wait_message.edit_text(
+                "⚠️ Аккаунт сохранён, но слежение не запустилось. Попробуйте переподключить."
+            )
+            await state.clear()
+            return
+        await state.clear()
+        await wait_message.edit_text(
+            f"✅ По email подключён Playerok-аккаунт <b>{html.escape(account.username or '—')}</b> "
+            f"(<code>{html.escape(str(account.id))}</code>)."
+        )
+        await show_main(message, message.from_user.id)
+
     @router.callback_query(F.data == "marketplace_switch")
     async def marketplace_switch(callback: CallbackQuery) -> None:
         row = await db.get_user(callback.from_user.id)
@@ -3580,7 +4291,9 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
             await callback.answer("Сначала выберите площадку", show_alert=True)
             return
         destination = "playerok" if row["active_marketplace"] == "funpay" else "funpay"
-        configured = row["playerok_active"] if destination == "playerok" else row["account_active"]
+        configured = bool(
+            await db.list_marketplace_accounts(callback.from_user.id, destination)
+        )
         if not configured:
             await callback.answer("Эта площадка ещё не настроена", show_alert=True)
             await callback.message.answer(
@@ -3593,6 +4306,87 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
             return
         await db.set_active_marketplace(callback.from_user.id, destination)
         await callback.answer("Площадка переключена")
+        await show_main(callback.message, callback.from_user.id)
+
+    async def show_account_switcher(
+        target: Message, user_id: int, marketplace: str
+    ) -> None:
+        accounts = await db.list_marketplace_accounts(user_id, marketplace)
+        row = await db.get_user(user_id)
+        active_id = int(
+            (row[
+                "active_funpay_account_id"
+                if marketplace == "funpay"
+                else "active_playerok_account_id"
+            ] if row else 0)
+            or 0
+        )
+        rows: list[list[tuple[str, str]]] = []
+        for account_row in accounts:
+            account_id = int(account_row["id"])
+            marker = "✅" if account_id == active_id else "▫️"
+            status = (
+                account_id in manager.funpay_account_runtimes
+                if marketplace == "funpay"
+                else account_id in manager.playerok_account_runtimes
+            )
+            button_text = (
+                f"{marker} {'🟢' if status else '🔴'} "
+                f"{clipped(account_row['label'], 30)} · {account_row['external_id']}"
+            )
+            rows.append([(
+                button_text,
+                f"account_select:{marketplace}:{account_id}",
+            )])
+        rows.append([(
+            "➕ Добавить аккаунт",
+            "connect_funpay" if marketplace == "funpay" else "connect_playerok",
+        )])
+        rows.append([(
+            "⬅️ В меню",
+            "menu",
+        )])
+        await target.answer(
+            f"👥 <b>Аккаунты {'FunPay' if marketplace == 'funpay' else 'Playerok'}</b>\n\n"
+            "Нажмите на аккаунт, чтобы сделать его активным. "
+            "Уведомления продолжат приходить со всех запущенных аккаунтов.",
+            reply_markup=keyboard(rows),
+        )
+
+    @router.callback_query(F.data.startswith("account_switch:"))
+    async def account_switch(callback: CallbackQuery) -> None:
+        marketplace = callback.data.split(":", 1)[1]
+        if marketplace not in {"funpay", "playerok"}:
+            await callback.answer("Неизвестная площадка", show_alert=True)
+            return
+        await callback.answer()
+        await show_account_switcher(
+            callback.message, callback.from_user.id, marketplace
+        )
+
+    @router.callback_query(F.data.startswith("account_select:"))
+    async def account_select(callback: CallbackQuery) -> None:
+        try:
+            _, marketplace, raw_account_id = callback.data.split(":", 2)
+            account_id = int(raw_account_id)
+        except (ValueError, TypeError):
+            await callback.answer("Некорректный аккаунт", show_alert=True)
+            return
+        await callback.answer("Переключаю…")
+        try:
+            runtime = await manager.activate_account(
+                callback.from_user.id, marketplace, account_id
+            )
+        except Exception as exc:
+            logger.exception("Не удалось переключить аккаунт")
+            await callback.message.answer(
+                f"❌ Не удалось активировать аккаунт: "
+                f"<code>{html.escape(clipped(exc, 450))}</code>"
+            )
+            return
+        await callback.message.answer(
+            f"✅ Активен <b>{html.escape(runtime.account_label)}</b>."
+        )
         await show_main(callback.message, callback.from_user.id)
 
     @router.callback_query(F.data == "po_profile")
@@ -4657,25 +5451,31 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
 
     async def show_playerok_account(target: Message, user_id: int) -> None:
         row = await db.get_user(user_id)
-        if not row or not row["playerok_active"]:
+        account_row = await db.get_active_marketplace_account(user_id, "playerok")
+        accounts = await db.list_marketplace_accounts(user_id, "playerok")
+        if not row or not account_row:
             await target.answer(
                 "Playerok не подключён.",
                 reply_markup=keyboard([[("🔵 Подключить", "connect_playerok")]]),
             )
             return
         try:
-            proxy = proxy_label(secrets.decrypt(row["playerok_proxy_enc"]))
+            proxy = proxy_label(secrets.decrypt(account_row["proxy_enc"]))
         except (InvalidToken, ValueError, TypeError):
             proxy = "не удалось расшифровать"
         status = "🟢 работает" if manager.get_playerok(user_id) else "🔴 остановлен"
         await target.answer(
             "⚙️ <b>Аккаунт Playerok</b>\n\n"
-            f"Пользователь: <b>{html.escape(row['playerok_username'] or '—')}</b>\n"
-            f"ID: <code>{html.escape(str(row['playerok_id'] or '—'))}</code>\n"
+            f"Пользователь: <b>{html.escape(account_row['username'] or '—')}</b>\n"
+            f"ID: <code>{html.escape(str(account_row['external_id'] or '—'))}</code>\n"
+            f"Вход: <b>{'email + код' if account_row['auth_method'] == 'email' else 'cookie'}</b>\n"
+            f"Всего аккаунтов: <b>{len(accounts)}</b>\n"
             f"Прокси: <code>{html.escape(proxy)}</code>\n"
             f"Слежение: {status}",
             reply_markup=keyboard([
-                [("🔄 Переподключить", "po_reconnect"), ("🍪 Изменить cookie", "connect_playerok")],
+                [("👥 Переключить аккаунт", "account_switch:playerok")],
+                [("➕ Добавить", "connect_playerok"), ("🔄 Переподключить", "po_reconnect")],
+                [("🔐 Изменить вход", "connect_playerok")],
                 [("🗑 Отключить Playerok", "po_disconnect_ask")],
                 [("⬅️ Меню", "menu")],
             ]),
@@ -4690,7 +5490,12 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
     async def playerok_reconnect(callback: CallbackQuery) -> None:
         await callback.answer("Переподключаю…")
         try:
-            await manager.start_playerok(callback.from_user.id)
+            account_row = await db.get_active_marketplace_account(
+                callback.from_user.id, "playerok"
+            )
+            if not account_row:
+                raise RuntimeError("аккаунт не найден")
+            await manager.start_playerok(callback.from_user.id, row=account_row)
         except Exception as exc:
             logger.exception("Переподключение Playerok не удалось")
             await callback.message.answer(f"❌ Не удалось: {html.escape(clipped(exc, 500))}")
@@ -4708,10 +5513,21 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
     @router.callback_query(F.data == "po_disconnect")
     async def playerok_disconnect(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer()
-        await manager.stop_playerok(callback.from_user.id)
-        await db.disconnect_playerok_account(callback.from_user.id)
+        account_row = await db.get_active_marketplace_account(
+            callback.from_user.id, "playerok"
+        )
+        if account_row:
+            account_id = int(account_row["id"])
+            await manager.stop_playerok_account(account_id)
+            replacement = await db.delete_marketplace_account(
+                callback.from_user.id, "playerok", account_id
+            )
+            if replacement:
+                await manager.activate_account(
+                    callback.from_user.id, "playerok", int(replacement["id"])
+                )
         await state.clear()
-        await callback.message.answer("Playerok отключён, cookie и прокси удалены.")
+        await callback.message.answer("Текущий Playerok-аккаунт и его учётные данные удалены.")
         await show_main(callback.message, callback.from_user.id)
 
     @router.callback_query(F.data == "menu")
@@ -7655,23 +8471,29 @@ BIND_TO_NEW_MESSAGE = [on_message]
 
     async def show_account(target: Message, user_id: int) -> None:
         row = await db.get_user(user_id)
-        if not row or not row["account_active"]:
+        account_row = await db.get_active_marketplace_account(user_id, "funpay")
+        accounts = await db.list_marketplace_accounts(user_id, "funpay")
+        if not row or not account_row:
             await target.answer("Аккаунт не подключён.", reply_markup=keyboard([[("🔗 Подключить", "connect")]]))
             return
         try:
-            proxy = proxy_label(secrets.decrypt(row["proxy_enc"]))
+            proxy = proxy_label(secrets.decrypt(account_row["proxy_enc"]))
         except (InvalidToken, ValueError, TypeError):
             proxy = "не удалось расшифровать"
         status = "🟢 работает" if manager.get(user_id) else "🔴 остановлен"
         await target.answer(
             "⚙️ <b>Аккаунт</b>\n"
-            f"FunPay: <b>{html.escape(row['funpay_username'] or '—')}</b> (<code>{row['funpay_id']}</code>)\n"
+            f"FunPay: <b>{html.escape(account_row['username'] or '—')}</b> "
+            f"(<code>{account_row['external_id']}</code>)\n"
+            f"Всего аккаунтов: <b>{len(accounts)}</b>\n"
             f"Прокси: <code>{html.escape(proxy)}</code>\n"
             f"Runner: {status}\n"
             f"Вечный онлайн / обновление сессии: {bool_icon(row['keep_online_enabled'])}",
             reply_markup=keyboard([
                 [(f"{bool_icon(row['keep_online_enabled'])} Поддерживать сессию", "toggle:keep_online_enabled")],
-                [("🔄 Переподключить", "reconnect"), ("🔑 Изменить данные", "connect")],
+                [("👥 Переключить аккаунт", "account_switch:funpay")],
+                [("➕ Добавить", "connect"), ("🔄 Переподключить", "reconnect")],
+                [("🔑 Изменить данные", "connect")],
                 [("🗑 Отключить аккаунт", "disconnect_confirm")],
                 [("⬅️ Меню", "menu")],
             ]),
@@ -7686,12 +8508,18 @@ BIND_TO_NEW_MESSAGE = [on_message]
     async def reconnect(callback: CallbackQuery) -> None:
         await callback.answer("Переподключаю…")
         try:
-            await manager.start(callback.from_user.id)
+            account_row = await db.get_active_marketplace_account(
+                callback.from_user.id, "funpay"
+            )
+            if not account_row:
+                raise RuntimeError("аккаунт не найден")
+            await manager.start(callback.from_user.id, row=account_row)
         except Exception:
             logger.exception("Переподключение не удалось")
             await callback.message.answer("❌ Переподключиться не удалось. Проверьте прокси и golden_key.")
             return
-        await callback.message.answer("✅ Подключение восстановлено.", reply_markup=main_keyboard())
+        await callback.message.answer("✅ Подключение восстановлено.")
+        await show_main(callback.message, callback.from_user.id)
 
     @router.callback_query(F.data == "disconnect_confirm")
     async def disconnect_confirm(callback: CallbackQuery) -> None:
@@ -7704,13 +8532,24 @@ BIND_TO_NEW_MESSAGE = [on_message]
     @router.callback_query(F.data == "disconnect")
     async def disconnect(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer()
-        await manager.stop(callback.from_user.id)
-        await db.disconnect_account(callback.from_user.id)
+        account_row = await db.get_active_marketplace_account(
+            callback.from_user.id, "funpay"
+        )
+        if account_row:
+            account_id = int(account_row["id"])
+            await manager.stop_funpay_account(account_id)
+            replacement = await db.delete_marketplace_account(
+                callback.from_user.id, "funpay", account_id
+            )
+            if replacement:
+                await manager.activate_account(
+                    callback.from_user.id, "funpay", int(replacement["id"])
+                )
         await state.clear()
         await callback.message.answer(
-            "Аккаунт отключён, сохранённые прокси и golden_key удалены.",
-            reply_markup=keyboard([[("🔗 Подключить заново", "connect")]]),
+            "Текущий FunPay-аккаунт, его прокси и golden_key удалены.",
         )
+        await show_main(callback.message, callback.from_user.id)
 
     @router.message()
     async def fallback(message: Message) -> None:
