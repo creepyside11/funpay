@@ -235,6 +235,11 @@ class Database:
                 review_reply_3 TEXT NOT NULL DEFAULT 'Спасибо за отзыв! Учтём ваши замечания.',
                 review_reply_4 TEXT NOT NULL DEFAULT 'Спасибо за хорошую оценку и ваш заказ!',
                 review_reply_5 TEXT NOT NULL DEFAULT 'Спасибо за отличную оценку! Будем рады видеть вас снова.',
+                auto_delivery_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+                multi_delivery_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                delivery_auto_restore BOOLEAN NOT NULL DEFAULT TRUE,
+                delivery_auto_disable BOOLEAN NOT NULL DEFAULT TRUE,
+                notify_delivery BOOLEAN NOT NULL DEFAULT TRUE,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
@@ -251,6 +256,11 @@ class Database:
             ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS playerok_notify_reviews BOOLEAN NOT NULL DEFAULT TRUE;
             ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS playerok_notify_system BOOLEAN NOT NULL DEFAULT TRUE;
             ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS playerok_auto_publish_enabled BOOLEAN NOT NULL DEFAULT FALSE;
+            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS auto_delivery_enabled BOOLEAN NOT NULL DEFAULT FALSE;
+            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS multi_delivery_enabled BOOLEAN NOT NULL DEFAULT TRUE;
+            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS delivery_auto_restore BOOLEAN NOT NULL DEFAULT TRUE;
+            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS delivery_auto_disable BOOLEAN NOT NULL DEFAULT TRUE;
+            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS notify_delivery BOOLEAN NOT NULL DEFAULT TRUE;
             ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS notify_lots_raise BOOLEAN NOT NULL DEFAULT TRUE;
             ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS notify_system BOOLEAN NOT NULL DEFAULT TRUE;
             ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS auto_raise_enabled BOOLEAN NOT NULL DEFAULT FALSE;
@@ -319,6 +329,52 @@ class Database:
 
             CREATE INDEX IF NOT EXISTS funpay_plugin_catalog_order_idx
                 ON funpay_plugin_catalog (is_official DESC, install_count DESC, updated_at DESC);
+
+            CREATE TABLE IF NOT EXISTS funpay_delivery_rules (
+                id BIGSERIAL PRIMARY KEY,
+                telegram_id BIGINT NOT NULL REFERENCES funpay_users(telegram_id) ON DELETE CASCADE,
+                lot_id BIGINT NOT NULL,
+                lot_title TEXT NOT NULL,
+                response TEXT NOT NULL,
+                products TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+                enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                disable_auto_restore BOOLEAN NOT NULL DEFAULT FALSE,
+                disable_auto_disable BOOLEAN NOT NULL DEFAULT FALSE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE (telegram_id, lot_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS funpay_delivery_log (
+                telegram_id BIGINT NOT NULL REFERENCES funpay_users(telegram_id) ON DELETE CASCADE,
+                order_id TEXT NOT NULL,
+                rule_id BIGINT REFERENCES funpay_delivery_rules(id) ON DELETE SET NULL,
+                status TEXT NOT NULL,
+                details TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (telegram_id, order_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS funpay_command_replies (
+                id BIGSERIAL PRIMARY KEY,
+                telegram_id BIGINT NOT NULL REFERENCES funpay_users(telegram_id) ON DELETE CASCADE,
+                trigger TEXT NOT NULL,
+                response TEXT NOT NULL,
+                enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                notify BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE (telegram_id, trigger)
+            );
+
+            CREATE TABLE IF NOT EXISTS funpay_notification_targets (
+                telegram_id BIGINT NOT NULL REFERENCES funpay_users(telegram_id) ON DELETE CASCADE,
+                chat_id BIGINT NOT NULL,
+                title TEXT NOT NULL,
+                enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (telegram_id, chat_id)
+            );
             """
         )
         await self.seed_official_plugins()
@@ -449,6 +505,11 @@ class Database:
             "playerok_notify_reviews",
             "playerok_notify_system",
             "playerok_auto_publish_enabled",
+            "auto_delivery_enabled",
+            "multi_delivery_enabled",
+            "delivery_auto_restore",
+            "delivery_auto_disable",
+            "notify_delivery",
         }
         if column not in allowed:
             raise ValueError("Недопустимая настройка")
@@ -722,6 +783,293 @@ class Database:
                AND playerok_proxy_enc IS NOT NULL
                AND playerok_cookie_enc IS NOT NULL
             """
+        )
+
+    async def list_delivery_rules(self, telegram_id: int) -> list[asyncpg.Record]:
+        return await self.fetch(
+            "SELECT * FROM funpay_delivery_rules WHERE telegram_id=$1 ORDER BY lot_title",
+            telegram_id,
+        )
+
+    async def get_delivery_rule(self, telegram_id: int, rule_id: int) -> asyncpg.Record | None:
+        return await self.fetchrow(
+            "SELECT * FROM funpay_delivery_rules WHERE telegram_id=$1 AND id=$2",
+            telegram_id,
+            rule_id,
+        )
+
+    async def find_delivery_rule(
+        self, telegram_id: int, lot_title: str
+    ) -> asyncpg.Record | None:
+        return await self.fetchrow(
+            """
+            SELECT * FROM funpay_delivery_rules
+             WHERE telegram_id=$1 AND position(lot_title in $2)>0
+             ORDER BY length(lot_title) DESC LIMIT 1
+            """,
+            telegram_id,
+            lot_title,
+        )
+
+    async def save_delivery_rule(
+        self, telegram_id: int, lot_id: int, lot_title: str, response: str
+    ) -> asyncpg.Record:
+        return await self.fetchrow(
+            """
+            INSERT INTO funpay_delivery_rules (telegram_id, lot_id, lot_title, response)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (telegram_id, lot_id) DO UPDATE
+                SET lot_title=EXCLUDED.lot_title, response=EXCLUDED.response,
+                    enabled=TRUE, updated_at=NOW()
+            RETURNING *
+            """,
+            telegram_id,
+            lot_id,
+            lot_title,
+            response,
+        )
+
+    async def add_delivery_products(
+        self, telegram_id: int, rule_id: int, products: list[str]
+    ) -> None:
+        await self.execute(
+            """
+            UPDATE funpay_delivery_rules
+               SET products=products || $3::TEXT[], updated_at=NOW()
+             WHERE telegram_id=$1 AND id=$2
+            """,
+            telegram_id,
+            rule_id,
+            products,
+        )
+
+    async def clear_delivery_products(self, telegram_id: int, rule_id: int) -> None:
+        await self.execute(
+            """
+            UPDATE funpay_delivery_rules
+               SET products=ARRAY[]::TEXT[], updated_at=NOW()
+             WHERE telegram_id=$1 AND id=$2
+            """,
+            telegram_id,
+            rule_id,
+        )
+
+    async def toggle_delivery_rule(self, telegram_id: int, rule_id: int) -> None:
+        await self.execute(
+            """
+            UPDATE funpay_delivery_rules SET enabled=NOT enabled, updated_at=NOW()
+             WHERE telegram_id=$1 AND id=$2
+            """,
+            telegram_id,
+            rule_id,
+        )
+
+    async def toggle_delivery_rule_option(
+        self, telegram_id: int, rule_id: int, column: str
+    ) -> None:
+        if column not in {"disable_auto_restore", "disable_auto_disable"}:
+            raise ValueError("Неизвестная настройка правила автовыдачи")
+        await self.execute(
+            f"""
+            UPDATE funpay_delivery_rules
+               SET {column}=NOT {column}, updated_at=NOW()
+             WHERE telegram_id=$1 AND id=$2
+            """,
+            telegram_id,
+            rule_id,
+        )
+
+    async def delete_delivery_rule(self, telegram_id: int, rule_id: int) -> None:
+        await self.execute(
+            "DELETE FROM funpay_delivery_rules WHERE telegram_id=$1 AND id=$2",
+            telegram_id,
+            rule_id,
+        )
+
+    async def claim_delivery(
+        self, telegram_id: int, order_id: str, lot_title: str, amount: int
+    ) -> tuple[asyncpg.Record, list[str], int, str | None] | None:
+        if not self.pool:
+            raise RuntimeError("База данных не подключена")
+        async with self.pool.acquire() as connection:  # noqa: SIM117 - transaction needs connection.
+            async with connection.transaction():
+                duplicate = await connection.fetchval(
+                    "SELECT 1 FROM funpay_delivery_log WHERE telegram_id=$1 AND order_id=$2",
+                    telegram_id,
+                    order_id,
+                )
+                if duplicate:
+                    return None
+                rule = await connection.fetchrow(
+                    """
+                    SELECT * FROM funpay_delivery_rules
+                     WHERE telegram_id=$1 AND enabled=TRUE
+                       AND position(lot_title in $2)>0
+                     ORDER BY length(lot_title) DESC
+                     LIMIT 1 FOR UPDATE
+                    """,
+                    telegram_id,
+                    lot_title,
+                )
+                if not rule:
+                    return None
+                stock = list(rule["products"] or [])
+                needs_product = "$product" in rule["response"]
+                if needs_product and len(stock) < amount:
+                    error = f"Недостаточно товаров: нужно {amount}, доступно {len(stock)}"
+                    await connection.execute(
+                        """
+                        INSERT INTO funpay_delivery_log
+                            (telegram_id, order_id, rule_id, status, details)
+                        VALUES ($1, $2, $3, 'failed', $4)
+                        """,
+                        telegram_id,
+                        order_id,
+                        rule["id"],
+                        error,
+                    )
+                    return rule, [], len(stock), error
+                products = stock[:amount] if needs_product else []
+                remaining = stock[amount:] if needs_product else stock
+                await connection.execute(
+                    "UPDATE funpay_delivery_rules SET products=$3, updated_at=NOW() WHERE telegram_id=$1 AND id=$2",
+                    telegram_id,
+                    rule["id"],
+                    remaining,
+                )
+                await connection.execute(
+                    """
+                    INSERT INTO funpay_delivery_log
+                        (telegram_id, order_id, rule_id, status)
+                    VALUES ($1, $2, $3, 'processing')
+                    """,
+                    telegram_id,
+                    order_id,
+                    rule["id"],
+                )
+                return rule, products, len(remaining), None
+
+    async def finish_delivery(
+        self, telegram_id: int, order_id: str, status: str, details: str = ""
+    ) -> None:
+        await self.execute(
+            """
+            UPDATE funpay_delivery_log SET status=$3, details=$4
+             WHERE telegram_id=$1 AND order_id=$2
+            """,
+            telegram_id,
+            order_id,
+            status,
+            details,
+        )
+
+    async def restore_delivery_products(
+        self, telegram_id: int, rule_id: int, products: list[str]
+    ) -> None:
+        if products:
+            await self.execute(
+                """
+                UPDATE funpay_delivery_rules
+                   SET products=$3::TEXT[] || products, updated_at=NOW()
+                 WHERE telegram_id=$1 AND id=$2
+                """,
+                telegram_id,
+                rule_id,
+                products,
+            )
+
+    async def list_command_replies(self, telegram_id: int) -> list[asyncpg.Record]:
+        return await self.fetch(
+            "SELECT * FROM funpay_command_replies WHERE telegram_id=$1 ORDER BY trigger",
+            telegram_id,
+        )
+
+    async def get_command_reply(self, telegram_id: int, reply_id: int) -> asyncpg.Record | None:
+        return await self.fetchrow(
+            "SELECT * FROM funpay_command_replies WHERE telegram_id=$1 AND id=$2",
+            telegram_id,
+            reply_id,
+        )
+
+    async def find_command_reply(self, telegram_id: int, trigger: str) -> asyncpg.Record | None:
+        return await self.fetchrow(
+            """
+            SELECT * FROM funpay_command_replies
+             WHERE telegram_id=$1 AND trigger=$2 AND enabled=TRUE
+            """,
+            telegram_id,
+            trigger.casefold().strip(),
+        )
+
+    async def save_command_reply(
+        self, telegram_id: int, trigger: str, response: str
+    ) -> asyncpg.Record:
+        return await self.fetchrow(
+            """
+            INSERT INTO funpay_command_replies (telegram_id, trigger, response)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (telegram_id, trigger) DO UPDATE
+                SET response=EXCLUDED.response, enabled=TRUE, updated_at=NOW()
+            RETURNING *
+            """,
+            telegram_id,
+            trigger.casefold().strip(),
+            response,
+        )
+
+    async def toggle_command_reply(self, telegram_id: int, reply_id: int) -> None:
+        await self.execute(
+            """
+            UPDATE funpay_command_replies SET enabled=NOT enabled, updated_at=NOW()
+             WHERE telegram_id=$1 AND id=$2
+            """,
+            telegram_id,
+            reply_id,
+        )
+
+    async def toggle_command_notification(self, telegram_id: int, reply_id: int) -> None:
+        await self.execute(
+            """
+            UPDATE funpay_command_replies SET notify=NOT notify, updated_at=NOW()
+             WHERE telegram_id=$1 AND id=$2
+            """,
+            telegram_id,
+            reply_id,
+        )
+
+    async def delete_command_reply(self, telegram_id: int, reply_id: int) -> None:
+        await self.execute(
+            "DELETE FROM funpay_command_replies WHERE telegram_id=$1 AND id=$2",
+            telegram_id,
+            reply_id,
+        )
+
+    async def list_notification_targets(self, telegram_id: int) -> list[asyncpg.Record]:
+        return await self.fetch(
+            "SELECT * FROM funpay_notification_targets WHERE telegram_id=$1 ORDER BY created_at",
+            telegram_id,
+        )
+
+    async def save_notification_target(
+        self, telegram_id: int, chat_id: int, title: str
+    ) -> None:
+        await self.execute(
+            """
+            INSERT INTO funpay_notification_targets (telegram_id, chat_id, title)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (telegram_id, chat_id) DO UPDATE
+                SET title=EXCLUDED.title, enabled=TRUE
+            """,
+            telegram_id,
+            chat_id,
+            title,
+        )
+
+    async def delete_notification_target(self, telegram_id: int, chat_id: int) -> None:
+        await self.execute(
+            "DELETE FROM funpay_notification_targets WHERE telegram_id=$1 AND chat_id=$2",
+            telegram_id,
+            chat_id,
         )
 
 
@@ -1596,10 +1944,34 @@ class RuntimeManager:
         **kwargs: Any,
     ) -> None:
         label = "🟣 <b>FunPay</b>" if marketplace == "funpay" else "🔵 <b>Playerok</b>"
+        body = f"{label}\n{text}"
         try:
-            await self.bot.send_message(telegram_id, f"{label}\n{text}", **kwargs)
+            await self.bot.send_message(telegram_id, body, **kwargs)
         except Exception:
             logger.exception("Не удалось отправить Telegram-уведомление пользователю %s", telegram_id)
+        try:
+            targets = await self.db.list_notification_targets(telegram_id)
+        except Exception:
+            logger.exception("Не удалось получить дополнительные чаты уведомлений")
+            return
+        for target in targets:
+            if not target["enabled"] or int(target["chat_id"]) == telegram_id:
+                continue
+            try:
+                # Кнопки уведомления предназначены владельцу аккаунта. В группе
+                # они позволяли бы участнику вызвать callback от своего Telegram ID.
+                target_kwargs = {
+                    key: value for key, value in kwargs.items() if key != "reply_markup"
+                }
+                await self.bot.send_message(
+                    int(target["chat_id"]), body, **target_kwargs
+                )
+            except Exception:
+                logger.warning(
+                    "Не отправлено уведомление в дополнительный чат %s",
+                    target["chat_id"],
+                    exc_info=True,
+                )
 
     async def _send_autoreply(
         self, runtime: AccountRuntime, message: Any, row: asyncpg.Record
@@ -1707,6 +2079,179 @@ class RuntimeManager:
                 reply_markup=keyboard(buttons) if buttons else None,
             )
 
+    async def _process_command_reply(
+        self, runtime: AccountRuntime, message: Any
+    ) -> bool:
+        command = (message.text or "").casefold().strip()
+        if not command:
+            return False
+        rule = await self.db.find_command_reply(runtime.telegram_id, command)
+        if not rule:
+            return False
+        response = render_template(
+            rule["response"],
+            message=message,
+            account=runtime.account,
+        )
+        try:
+            await asyncio.to_thread(
+                runtime.account.send_message,
+                message.chat_id,
+                response,
+                message.chat_name,
+            )
+        except Exception:
+            logger.exception("Не отправлен ответ на команду %s", command)
+            return False
+        if rule["notify"]:
+            await self.safe_notify(
+                runtime.telegram_id,
+                "⌨️ <b>Сработала команда</b>\n\n"
+                f"Команда: <code>{html.escape(command)}</code>\n"
+                f"Покупатель: <b>{html.escape(message.author or message.chat_name or '—')}</b>\n"
+                f"Чат: <code>{html.escape(str(message.chat_id))}</code>",
+            )
+        return True
+
+    async def _set_delivery_lot_state(
+        self, runtime: AccountRuntime, rule: asyncpg.Record, active: bool
+    ) -> bool:
+        try:
+            fields = await asyncio.to_thread(runtime.account.get_lot_fields, rule["lot_id"])
+            if bool(fields.active) == active:
+                return False
+            fields.active = active
+            await asyncio.to_thread(runtime.account.save_lot, fields)
+            return True
+        except Exception:
+            logger.exception("Не изменено состояние лота автовыдачи %s", rule["lot_id"])
+            return False
+
+    async def _process_delivery(
+        self, runtime: AccountRuntime, event: Any, row: asyncpg.Record
+    ) -> None:
+        order = event.order
+        rule = await self.db.find_delivery_rule(
+            runtime.telegram_id, order.description or ""
+        )
+        if not rule:
+            return
+        event.delivery_rule_id = rule["id"]
+        event.delivered = False
+        event.delivery_text = None
+        event.goods_delivered = 0
+        event.goods_left = len(rule["products"] or [])
+        event.error = 0
+        event.error_text = None
+
+        remaining = len(rule["products"] or [])
+        if row["auto_delivery_enabled"] and rule["enabled"]:
+            amount = max(int(order.amount or 1), 1) if row["multi_delivery_enabled"] else 1
+            claim = await self.db.claim_delivery(
+                runtime.telegram_id,
+                order.id,
+                order.description or "",
+                amount,
+            )
+            if claim:
+                claimed_rule, products, remaining, error = claim
+                event.goods_left = remaining
+                plugin_runtime = self.plugins.runtimes.get(runtime.telegram_id)
+                if plugin_runtime:
+                    await self.plugins.dispatch(
+                        runtime.telegram_id,
+                        "BIND_TO_PRE_DELIVERY",
+                        plugin_runtime.adapter,
+                        event,
+                    )
+                if error:
+                    event.error = 1
+                    event.error_text = error
+                else:
+                    delivery_text = render_template(
+                        claimed_rule["response"],
+                        order=order,
+                        account=runtime.account,
+                    ).replace("$product", "\n".join(products))
+                    try:
+                        result = await asyncio.to_thread(
+                            runtime.account.send_message,
+                            order.chat_id,
+                            delivery_text,
+                            order.buyer_username,
+                        )
+                        if not result:
+                            raise RuntimeError("FunPay не подтвердил отправку сообщения")
+                    except Exception as exc:  # noqa: BLE001 - FunPay may raise several request errors.
+                        await self.db.restore_delivery_products(
+                            runtime.telegram_id, claimed_rule["id"], products
+                        )
+                        await self.db.finish_delivery(
+                            runtime.telegram_id, order.id, "failed", clipped(exc, 600)
+                        )
+                        remaining += len(products)
+                        event.goods_left = remaining
+                        event.error = 1
+                        event.error_text = clipped(exc, 600)
+                    else:
+                        await self.db.finish_delivery(
+                            runtime.telegram_id, order.id, "sent", delivery_text
+                        )
+                        event.delivered = True
+                        event.delivery_text = delivery_text
+                        event.goods_delivered = amount
+                if plugin_runtime:
+                    await self.plugins.dispatch(
+                        runtime.telegram_id,
+                        "BIND_TO_POST_DELIVERY",
+                        plugin_runtime.adapter,
+                        event,
+                    )
+                if row["notify_delivery"]:
+                    if event.delivered:
+                        await self.safe_notify(
+                            runtime.telegram_id,
+                            "✅ <b>Автовыдача выполнена</b>\n\n"
+                            f"Заказ: <code>#{html.escape(order.id)}</code>\n"
+                            f"Лот: <b>{html.escape(clipped(order.description, 700))}</b>\n"
+                            f"Выдано: <b>{event.goods_delivered}</b> · осталось: <b>{remaining}</b>\n\n"
+                            f"<pre>{html.escape(clipped(event.delivery_text, 1400))}</pre>",
+                        )
+                    elif event.error:
+                        await self.safe_notify(
+                            runtime.telegram_id,
+                            "❌ <b>Ошибка автовыдачи</b>\n\n"
+                            f"Заказ: <code>#{html.escape(order.id)}</code>\n"
+                            f"Лот: <b>{html.escape(clipped(order.description, 700))}</b>\n"
+                            f"Причина: <code>{html.escape(clipped(event.error_text, 800))}</code>",
+                        )
+
+        has_stock_source = "$product" in rule["response"]
+        should_disable = (
+            rule["enabled"]
+            and row["delivery_auto_disable"]
+            and not rule["disable_auto_disable"]
+            and has_stock_source
+            and remaining == 0
+        )
+        should_restore = (
+            rule["enabled"]
+            and row["delivery_auto_restore"]
+            and not rule["disable_auto_restore"]
+            and not should_disable
+        )
+        changed = False
+        if should_disable:
+            changed = await self._set_delivery_lot_state(runtime, rule, False)
+        elif should_restore:
+            changed = await self._set_delivery_lot_state(runtime, rule, True)
+        if changed and row["notify_delivery"]:
+            await self.safe_notify(
+                runtime.telegram_id,
+                ("🔴 Лот деактивирован: закончились товары.\n" if should_disable else "🟢 Лот автоматически восстановлен.\n")
+                + f"<b>{html.escape(clipped(rule['lot_title'], 1000))}</b>",
+            )
+
     async def handle_event(self, runtime: AccountRuntime, event: Any) -> None:
         row = await self.db.get_user(runtime.telegram_id)
         if not row or not row["account_active"]:
@@ -1776,6 +2321,8 @@ class RuntimeManager:
                     message.chat_name,
                 )
                 return
+            if await self._process_command_reply(runtime, message):
+                return
             hour = datetime.now().astimezone().hour
             if (
                 row["autoreply_enabled"]
@@ -1792,8 +2339,11 @@ class RuntimeManager:
                 task = asyncio.create_task(self._send_autoreply(runtime, message, row))
                 runtime.background_tasks.add(task)
                 task.add_done_callback(runtime.background_tasks.discard)
-        elif isinstance(event, events.NewOrderEvent) and row["notify_new_orders"]:
+        elif isinstance(event, events.NewOrderEvent):
             order = event.order
+            await self._process_delivery(runtime, event, row)
+            if not row["notify_new_orders"]:
+                return
             buttons = [[
                 InlineKeyboardButton(text="📦 Подробности", callback_data=f"order_view:{order.id}"),
                 InlineKeyboardButton(text="🌐 FunPay", url=f"https://funpay.com/orders/{order.id}/"),
@@ -1848,6 +2398,20 @@ class AutoReplyState(StatesGroup):
     delay = State()
     hours = State()
     review_text = State()
+
+
+class DeliveryRuleState(StatesGroup):
+    response = State()
+    products = State()
+
+
+class CommandReplyState(StatesGroup):
+    trigger = State()
+    response = State()
+
+
+class NotificationTargetState(StatesGroup):
+    chat_id = State()
 
 
 class ReviewReplyState(StatesGroup):
@@ -1910,6 +2474,7 @@ def main_keyboard(marketplace: str = "funpay") -> InlineKeyboardMarkup:
         [("👤 Подробный профиль", "profile"), ("💰 Баланс", "balance")],
         [("🔔 Уведомления", "notifications"), ("🤖 Автоответчик", "autoreply")],
         [("💬 Последние чаты", "chats"), ("📦 Заказ по ID", "order_lookup")],
+        [("📤 Автовыдача", "delivery"), ("⌨️ Команды", "command_replies")],
         [("🆙 Автоподнятие", "auto_raise"), ("🧩 Плагины", "plugins")],
         [("⚙️ Аккаунт", "account")],
     ])
@@ -2567,6 +3132,8 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
                 [(f"{bool_icon(row['notify_order_status'])} Статусы заказов", "toggle:notify_order_status")],
                 [(f"{bool_icon(row['notify_reviews'])} Отзывы", "toggle:notify_reviews")],
                 [(f"{bool_icon(row['notify_lots_raise'])} Поднятие лотов", "toggle:notify_lots_raise")],
+                [(f"{bool_icon(row['notify_delivery'])} Автовыдача", "toggle:notify_delivery")],
+                [("📡 Дополнительные чаты", "notification_targets")],
                 [(f"{bool_icon(row['notify_system'])} Запуск и ошибки", "toggle:notify_system")],
                 [("⬅️ Меню", "menu")],
             ]),
@@ -2593,6 +3160,11 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
             "autoreply_enabled",
             "autoreply_new_chats_only",
             "review_reply_enabled",
+            "auto_delivery_enabled",
+            "multi_delivery_enabled",
+            "delivery_auto_restore",
+            "delivery_auto_disable",
+            "notify_delivery",
         }
         if not row or column not in allowed_columns:
             await callback.answer("Неизвестная настройка", show_alert=True)
@@ -2614,8 +3186,518 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
             await show_autoreply(callback.message, callback.from_user.id)
         elif column == "review_reply_enabled":
             await show_review_replies(callback.message, callback.from_user.id)
+        elif column in {
+            "auto_delivery_enabled",
+            "multi_delivery_enabled",
+            "delivery_auto_restore",
+            "delivery_auto_disable",
+            "notify_delivery",
+        }:
+            await show_delivery(callback.message, callback.from_user.id)
         else:
             await show_notifications(callback.message, callback.from_user.id)
+
+    async def show_notification_targets(target: Message, user_id: int) -> None:
+        targets = await db.list_notification_targets(user_id)
+        rows = [
+            [(
+                f"🗑 {clipped(item['title'], 28)} · {item['chat_id']}",
+                f"notification_target_delete:{item['chat_id']}",
+            )]
+            for item in targets
+        ]
+        rows.extend([
+            [("➕ Добавить чат", "notification_target_add")],
+            [("⬅️ Уведомления", "notifications")],
+        ])
+        await target.answer(
+            "📡 <b>Дополнительные чаты уведомлений</b>\n\n"
+            "Бот отправляет копии всех помеченных FunPay/Playerok-уведомлений владельцу и в эти чаты. "
+            "Перед добавлением включите бота в группу или канал и выдайте право отправлять сообщения.",
+            reply_markup=keyboard(rows),
+        )
+
+    @router.callback_query(F.data == "notification_targets")
+    async def notification_targets(callback: CallbackQuery) -> None:
+        await callback.answer()
+        await show_notification_targets(callback.message, callback.from_user.id)
+
+    @router.callback_query(F.data == "notification_target_add")
+    async def notification_target_add(callback: CallbackQuery, state: FSMContext) -> None:
+        await callback.answer()
+        await state.clear()
+        await state.set_state(NotificationTargetState.chat_id)
+        await callback.message.answer(
+            "Отправьте числовой ID группы или канала, например <code>-1001234567890</code>. "
+            "Бот должен уже состоять в этом чате. Для отмены: /cancel"
+        )
+
+    @router.message(NotificationTargetState.chat_id, F.text)
+    async def notification_target_save(message: Message, state: FSMContext) -> None:
+        try:
+            chat_id = int(message.text.strip())
+        except ValueError:
+            await message.answer("❌ Нужен числовой ID чата.")
+            return
+        try:
+            chat = await message.bot.get_chat(chat_id)
+            member = await message.bot.get_chat_member(chat_id, message.from_user.id)
+            member_status = getattr(member.status, "value", str(member.status))
+            if member_status not in {"administrator", "creator"}:
+                await message.answer(
+                    "❌ Добавлять группу или канал может только его создатель или администратор."
+                )
+                return
+            title = getattr(chat, "title", None) or getattr(chat, "full_name", None) or str(chat_id)
+            await message.bot.send_message(
+                chat_id,
+                "✅ Этот чат подключён для уведомлений FunPay/Playerok.",
+            )
+        except Exception as exc:  # noqa: BLE001 - Telegram returns several API exception types.
+            await message.answer(
+                f"❌ Бот не может писать в этот чат: {html.escape(clipped(exc, 400))}"
+            )
+            return
+        await db.save_notification_target(message.from_user.id, chat_id, clipped(title, 120))
+        await state.clear()
+        await message.answer("✅ Дополнительный чат сохранён.")
+        await show_notification_targets(message, message.from_user.id)
+
+    @router.callback_query(F.data.startswith("notification_target_delete:"))
+    async def notification_target_delete_ask(callback: CallbackQuery) -> None:
+        chat_id = int(callback.data.split(":", 1)[1])
+        await callback.answer()
+        await callback.message.answer(
+            f"Удалить дополнительный чат <code>{chat_id}</code>?",
+            reply_markup=keyboard([
+                [("Да, удалить", f"notification_target_delete_do:{chat_id}")],
+                [("Отмена", "notification_targets")],
+            ]),
+        )
+
+    @router.callback_query(F.data.startswith("notification_target_delete_do:"))
+    async def notification_target_delete(callback: CallbackQuery) -> None:
+        chat_id = int(callback.data.split(":", 1)[1])
+        await db.delete_notification_target(callback.from_user.id, chat_id)
+        await callback.answer("Чат удалён")
+        await show_notification_targets(callback.message, callback.from_user.id)
+
+    async def show_delivery(target: Message, user_id: int) -> None:
+        if not await require_runtime(target, user_id):
+            return
+        row = await db.get_user(user_id)
+        rules = await db.list_delivery_rules(user_id)
+        rows = [
+            [(
+                f"{'✅' if rule['enabled'] else '❌'} {clipped(rule['lot_title'], 28)} · {len(rule['products'])}",
+                f"delivery_rule:{rule['id']}",
+            )]
+            for rule in rules[:30]
+        ]
+        rows.extend([
+            [("➕ Добавить из лотов", "delivery_add")],
+            [(f"{bool_icon(row['auto_delivery_enabled'])} Автовыдача", "toggle:auto_delivery_enabled")],
+            [(f"{bool_icon(row['multi_delivery_enabled'])} Выдавать количество заказа", "toggle:multi_delivery_enabled")],
+            [(f"{bool_icon(row['delivery_auto_restore'])} Автовосстановление", "toggle:delivery_auto_restore")],
+            [(f"{bool_icon(row['delivery_auto_disable'])} Выключать без товара", "toggle:delivery_auto_disable")],
+            [(f"{bool_icon(row['notify_delivery'])} Уведомлять о выдаче", "toggle:notify_delivery")],
+            [("⬅️ Меню", "menu")],
+        ])
+        await target.answer(
+            "📤 <b>Автовыдача Cardinal</b>\n\n"
+            f"Правил: <b>{len(rules)}</b>. Число справа — остаток штучных товаров. "
+            "Если в шаблоне нет <code>$product</code>, ответ считается безлимитным.\n\n"
+            "Переменные заказа: $order_id, $order_title, $username, $chat_id, $date, $time. "
+            "При $product одна строка запаса выдаётся за каждую купленную единицу.",
+            reply_markup=keyboard(rows),
+        )
+
+    @router.callback_query(F.data == "delivery")
+    async def delivery(callback: CallbackQuery) -> None:
+        await callback.answer()
+        await show_delivery(callback.message, callback.from_user.id)
+
+    @router.callback_query(F.data == "delivery_add")
+    async def delivery_add(callback: CallbackQuery) -> None:
+        runtime = await require_runtime(callback.message, callback.from_user.id)
+        if not runtime:
+            await callback.answer()
+            return
+        await callback.answer("Получаю лоты…")
+        try:
+            profile = await asyncio.to_thread(runtime.account.get_user, runtime.account.id)
+            lots = [
+                lot
+                for lot in profile.get_lots()
+                if lot.subcategory.type is types.SubCategoryTypes.COMMON and lot.description
+            ]
+        except Exception:
+            logger.exception("Не загружены лоты для автовыдачи")
+            await callback.message.answer("❌ FunPay не отдал список обычных лотов.")
+            return
+        rows = [
+            [(clipped(lot.description, 35), f"delivery_pick:{lot.id}")]
+            for lot in lots[:40]
+        ]
+        rows.append([("⬅️ Автовыдача", "delivery")])
+        await callback.message.answer(
+            "Выберите лот. Показаны первые 40 обычных лотов:",
+            reply_markup=keyboard(rows),
+        )
+
+    async def resolve_funpay_lot(runtime: AccountRuntime, lot_id: int) -> Any | None:
+        profile = await asyncio.to_thread(runtime.account.get_user, runtime.account.id)
+        return next((lot for lot in profile.get_lots() if int(lot.id) == lot_id), None)
+
+    @router.callback_query(F.data.startswith("delivery_pick:"))
+    async def delivery_pick(callback: CallbackQuery, state: FSMContext) -> None:
+        lot_id = int(callback.data.split(":", 1)[1])
+        runtime = await require_runtime(callback.message, callback.from_user.id)
+        if not runtime:
+            await callback.answer()
+            return
+        try:
+            lot = await resolve_funpay_lot(runtime, lot_id)
+        except Exception:  # noqa: BLE001 - stale lots can fail in several FunPay API layers.
+            lot = None
+        if not lot or not lot.description:
+            await callback.answer("Лот больше не найден", show_alert=True)
+            return
+        await callback.answer()
+        await state.clear()
+        await state.set_state(DeliveryRuleState.response)
+        await state.update_data(delivery_lot_id=lot_id, delivery_lot_title=lot.description)
+        await callback.message.answer(
+            f"Лот: <b>{html.escape(clipped(lot.description, 1000))}</b>\n\n"
+            "Отправьте текст выдачи до 3000 символов. Добавьте <code>$product</code> в место, "
+            "куда должны подставляться строки из запаса. Для отмены: /cancel"
+        )
+
+    @router.message(DeliveryRuleState.response, F.text)
+    async def delivery_response_save(message: Message, state: FSMContext) -> None:
+        response = message.text.strip()
+        if not 1 <= len(response) <= 3000:
+            await message.answer("Текст должен содержать от 1 до 3000 символов.")
+            return
+        data = await state.get_data()
+        existing_rule_id = data.get("delivery_rule_id")
+        if existing_rule_id:
+            existing = await db.get_delivery_rule(
+                message.from_user.id, int(existing_rule_id)
+            )
+            if not existing:
+                await state.clear()
+                await message.answer("Правило больше не найдено.")
+                return
+            rule = await db.save_delivery_rule(
+                message.from_user.id,
+                existing["lot_id"],
+                existing["lot_title"],
+                response,
+            )
+            await state.clear()
+            await message.answer("✅ Шаблон выдачи обновлён.")
+            await show_delivery_rule(message, message.from_user.id, int(rule["id"]))
+            return
+        lot_id = data.get("delivery_lot_id")
+        lot_title = data.get("delivery_lot_title")
+        if not lot_id or not lot_title:
+            await state.clear()
+            await message.answer("Сессия настройки истекла.")
+            return
+        rule = await db.save_delivery_rule(message.from_user.id, lot_id, lot_title, response)
+        await state.clear()
+        await message.answer("✅ Правило автовыдачи сохранено.")
+        await show_delivery_rule(message, message.from_user.id, int(rule["id"]))
+
+    async def show_delivery_rule(target: Message, user_id: int, rule_id: int) -> None:
+        rule = await db.get_delivery_rule(user_id, rule_id)
+        if not rule:
+            await target.answer("Правило не найдено.")
+            return
+        stock = list(rule["products"] or [])
+        preview = "\n".join(f"• {html.escape(clipped(item, 100))}" for item in stock[:5])
+        await target.answer(
+            f"📦 <b>{html.escape(clipped(rule['lot_title'], 1000))}</b>\n\n"
+            f"Лот ID: <code>{rule['lot_id']}</code>\n"
+            f"Состояние: {bool_icon(rule['enabled'])}\n"
+            f"Запас: <b>{len(stock)}</b>\n"
+            f"Шаблон:\n<pre>{html.escape(clipped(rule['response'], 1500))}</pre>"
+            + (f"\nПервые товары:\n{preview}" if preview else ""),
+            reply_markup=keyboard([
+                [("➕ Добавить товары", f"delivery_stock:{rule_id}")],
+                [("✏️ Изменить шаблон", f"delivery_edit:{rule_id}")],
+                [("🧹 Очистить запас", f"delivery_clear_ask:{rule_id}")],
+                [("Выключить" if rule["enabled"] else "Включить", f"delivery_toggle:{rule_id}")],
+                [(
+                    f"{bool_icon(not rule['disable_auto_restore'])} Восстанавливать этот лот",
+                    f"delivery_rule_restore:{rule_id}",
+                )],
+                [(
+                    f"{bool_icon(not rule['disable_auto_disable'])} Выключать без товара",
+                    f"delivery_rule_disable:{rule_id}",
+                )],
+                [("🗑 Удалить", f"delivery_delete_ask:{rule_id}")],
+                [("⬅️ Автовыдача", "delivery")],
+            ]),
+        )
+
+    @router.callback_query(F.data.startswith("delivery_rule:"))
+    async def delivery_rule(callback: CallbackQuery) -> None:
+        await callback.answer()
+        await show_delivery_rule(
+            callback.message, callback.from_user.id, int(callback.data.split(":", 1)[1])
+        )
+
+    @router.callback_query(F.data.startswith("delivery_stock:"))
+    async def delivery_stock(callback: CallbackQuery, state: FSMContext) -> None:
+        rule_id = int(callback.data.split(":", 1)[1])
+        if not await db.get_delivery_rule(callback.from_user.id, rule_id):
+            await callback.answer("Правило не найдено", show_alert=True)
+            return
+        await callback.answer()
+        await state.clear()
+        await state.set_state(DeliveryRuleState.products)
+        await state.update_data(delivery_rule_id=rule_id)
+        await callback.message.answer(
+            "Отправьте товары текстом: один товар или ключ на строку. До 500 строк за раз. "
+            "Последовательность сохраняется. Для отмены: /cancel"
+        )
+
+    @router.callback_query(F.data.startswith("delivery_edit:"))
+    async def delivery_edit(callback: CallbackQuery, state: FSMContext) -> None:
+        rule_id = int(callback.data.split(":", 1)[1])
+        rule = await db.get_delivery_rule(callback.from_user.id, rule_id)
+        if not rule:
+            await callback.answer("Правило не найдено", show_alert=True)
+            return
+        await callback.answer()
+        await state.clear()
+        await state.set_state(DeliveryRuleState.response)
+        await state.update_data(delivery_rule_id=rule_id)
+        await callback.message.answer(
+            "Отправьте новый шаблон выдачи до 3000 символов. "
+            "Для штучного товара используйте <code>$product</code>. Для отмены: /cancel\n\n"
+            f"Сейчас:\n<pre>{html.escape(clipped(rule['response'], 1800))}</pre>"
+        )
+
+    @router.message(DeliveryRuleState.products, F.text)
+    async def delivery_stock_save(message: Message, state: FSMContext) -> None:
+        products = [line.strip() for line in message.text.splitlines() if line.strip()]
+        if not products or len(products) > 500 or any(len(item) > 1000 for item in products):
+            await message.answer("Нужно от 1 до 500 непустых строк, каждая не длиннее 1000 символов.")
+            return
+        data = await state.get_data()
+        rule_id = int(data.get("delivery_rule_id") or 0)
+        await db.add_delivery_products(message.from_user.id, rule_id, products)
+        await state.clear()
+        await message.answer(f"✅ Добавлено товаров: <b>{len(products)}</b>.")
+        await show_delivery_rule(message, message.from_user.id, rule_id)
+
+    @router.callback_query(F.data.startswith("delivery_toggle:"))
+    async def delivery_toggle(callback: CallbackQuery) -> None:
+        rule_id = int(callback.data.split(":", 1)[1])
+        await db.toggle_delivery_rule(callback.from_user.id, rule_id)
+        await callback.answer("Сохранено")
+        await show_delivery_rule(callback.message, callback.from_user.id, rule_id)
+
+    @router.callback_query(F.data.startswith("delivery_rule_restore:"))
+    async def delivery_rule_restore(callback: CallbackQuery) -> None:
+        rule_id = int(callback.data.split(":", 1)[1])
+        await db.toggle_delivery_rule_option(
+            callback.from_user.id, rule_id, "disable_auto_restore"
+        )
+        await callback.answer("Сохранено")
+        await show_delivery_rule(callback.message, callback.from_user.id, rule_id)
+
+    @router.callback_query(F.data.startswith("delivery_rule_disable:"))
+    async def delivery_rule_disable(callback: CallbackQuery) -> None:
+        rule_id = int(callback.data.split(":", 1)[1])
+        await db.toggle_delivery_rule_option(
+            callback.from_user.id, rule_id, "disable_auto_disable"
+        )
+        await callback.answer("Сохранено")
+        await show_delivery_rule(callback.message, callback.from_user.id, rule_id)
+
+    @router.callback_query(F.data.startswith("delivery_clear_ask:"))
+    async def delivery_clear_ask(callback: CallbackQuery) -> None:
+        rule_id = int(callback.data.split(":", 1)[1])
+        await callback.answer()
+        await callback.message.answer(
+            "Удалить весь запас товаров без возможности восстановления?",
+            reply_markup=keyboard([
+                [("Да, очистить", f"delivery_clear:{rule_id}")],
+                [("Отмена", f"delivery_rule:{rule_id}")],
+            ]),
+        )
+
+    @router.callback_query(F.data.startswith("delivery_clear:"))
+    async def delivery_clear(callback: CallbackQuery) -> None:
+        rule_id = int(callback.data.split(":", 1)[1])
+        await db.clear_delivery_products(callback.from_user.id, rule_id)
+        await callback.answer("Запас очищен")
+        await show_delivery_rule(callback.message, callback.from_user.id, rule_id)
+
+    @router.callback_query(F.data.startswith("delivery_delete_ask:"))
+    async def delivery_delete_ask(callback: CallbackQuery) -> None:
+        rule_id = int(callback.data.split(":", 1)[1])
+        await callback.answer()
+        await callback.message.answer(
+            "Удалить правило и весь его запас?",
+            reply_markup=keyboard([
+                [("Да, удалить", f"delivery_delete:{rule_id}")],
+                [("Отмена", f"delivery_rule:{rule_id}")],
+            ]),
+        )
+
+    @router.callback_query(F.data.startswith("delivery_delete:"))
+    async def delivery_delete(callback: CallbackQuery) -> None:
+        rule_id = int(callback.data.split(":", 1)[1])
+        await db.delete_delivery_rule(callback.from_user.id, rule_id)
+        await callback.answer("Правило удалено")
+        await show_delivery(callback.message, callback.from_user.id)
+
+    async def show_command_replies(target: Message, user_id: int) -> None:
+        if not await require_runtime(target, user_id):
+            return
+        replies = await db.list_command_replies(user_id)
+        rows = [
+            [(
+                f"{'✅' if item['enabled'] else '❌'} {clipped(item['trigger'], 35)}",
+                f"command_reply:{item['id']}",
+            )]
+            for item in replies[:50]
+        ]
+        rows.extend([
+            [("➕ Добавить команду", "command_reply_add")],
+            [("⬅️ Меню", "menu")],
+        ])
+        await target.answer(
+            "⌨️ <b>Ответы на команды Cardinal</b>\n\n"
+            "Команда сравнивается со всем сообщением без учёта регистра и пробелов по краям. "
+            "Она имеет приоритет над обычным автоответчиком.",
+            reply_markup=keyboard(rows),
+        )
+
+    @router.callback_query(F.data == "command_replies")
+    async def command_replies(callback: CallbackQuery) -> None:
+        await callback.answer()
+        await show_command_replies(callback.message, callback.from_user.id)
+
+    @router.callback_query(F.data == "command_reply_add")
+    async def command_reply_add(callback: CallbackQuery, state: FSMContext) -> None:
+        await callback.answer()
+        await state.clear()
+        await state.set_state(CommandReplyState.trigger)
+        await callback.message.answer(
+            "Отправьте команду покупателя, например <code>!наличие</code> или <code>#help</code>. "
+            "До 100 символов, одной строкой. Для отмены: /cancel"
+        )
+
+    @router.message(CommandReplyState.trigger, F.text)
+    async def command_reply_trigger(message: Message, state: FSMContext) -> None:
+        trigger = message.text.casefold().strip()
+        if not 1 <= len(trigger) <= 100 or "\n" in trigger:
+            await message.answer("Команда должна быть одной строкой от 1 до 100 символов.")
+            return
+        await state.update_data(command_trigger=trigger)
+        await state.set_state(CommandReplyState.response)
+        await message.answer(
+            "Теперь отправьте ответ до 3000 символов. Можно использовать переменные автоответчика."
+        )
+
+    @router.message(CommandReplyState.response, F.text)
+    async def command_reply_response(message: Message, state: FSMContext) -> None:
+        response = message.text.strip()
+        if not 1 <= len(response) <= 3000:
+            await message.answer("Ответ должен содержать от 1 до 3000 символов.")
+            return
+        data = await state.get_data()
+        trigger = data.get("command_trigger")
+        if not trigger:
+            await state.clear()
+            await message.answer("Сессия настройки истекла.")
+            return
+        item = await db.save_command_reply(message.from_user.id, trigger, response)
+        await state.clear()
+        await message.answer("✅ Команда сохранена.")
+        await show_command_reply(message, message.from_user.id, int(item["id"]))
+
+    async def show_command_reply(target: Message, user_id: int, reply_id: int) -> None:
+        item = await db.get_command_reply(user_id, reply_id)
+        if not item:
+            await target.answer("Команда не найдена.")
+            return
+        await target.answer(
+            "⌨️ <b>Команда</b>\n\n"
+            f"Триггер: <code>{html.escape(item['trigger'])}</code>\n"
+            f"Состояние: {bool_icon(item['enabled'])}\n"
+            f"Уведомление о срабатывании: {bool_icon(item['notify'])}\n\n"
+            f"Ответ:\n<pre>{html.escape(clipped(item['response'], 2000))}</pre>",
+            reply_markup=keyboard([
+                [("Выключить" if item["enabled"] else "Включить", f"command_toggle:{reply_id}")],
+                [("✏️ Изменить ответ", f"command_edit:{reply_id}")],
+                [("🔔 Переключить уведомление", f"command_notify:{reply_id}")],
+                [("🗑 Удалить", f"command_delete_ask:{reply_id}")],
+                [("⬅️ Команды", "command_replies")],
+            ]),
+        )
+
+    @router.callback_query(F.data.startswith("command_reply:"))
+    async def command_reply(callback: CallbackQuery) -> None:
+        await callback.answer()
+        await show_command_reply(
+            callback.message, callback.from_user.id, int(callback.data.split(":", 1)[1])
+        )
+
+    @router.callback_query(F.data.startswith("command_toggle:"))
+    async def command_toggle(callback: CallbackQuery) -> None:
+        reply_id = int(callback.data.split(":", 1)[1])
+        await db.toggle_command_reply(callback.from_user.id, reply_id)
+        await callback.answer("Сохранено")
+        await show_command_reply(callback.message, callback.from_user.id, reply_id)
+
+    @router.callback_query(F.data.startswith("command_edit:"))
+    async def command_edit(callback: CallbackQuery, state: FSMContext) -> None:
+        reply_id = int(callback.data.split(":", 1)[1])
+        item = await db.get_command_reply(callback.from_user.id, reply_id)
+        if not item:
+            await callback.answer("Команда не найдена", show_alert=True)
+            return
+        await callback.answer()
+        await state.clear()
+        await state.set_state(CommandReplyState.response)
+        await state.update_data(command_trigger=item["trigger"])
+        await callback.message.answer(
+            "Отправьте новый ответ до 3000 символов. Для отмены: /cancel\n\n"
+            f"Сейчас:\n<pre>{html.escape(clipped(item['response'], 1800))}</pre>"
+        )
+
+    @router.callback_query(F.data.startswith("command_notify:"))
+    async def command_notify(callback: CallbackQuery) -> None:
+        reply_id = int(callback.data.split(":", 1)[1])
+        await db.toggle_command_notification(callback.from_user.id, reply_id)
+        await callback.answer("Сохранено")
+        await show_command_reply(callback.message, callback.from_user.id, reply_id)
+
+    @router.callback_query(F.data.startswith("command_delete_ask:"))
+    async def command_delete_ask(callback: CallbackQuery) -> None:
+        reply_id = int(callback.data.split(":", 1)[1])
+        await callback.answer()
+        await callback.message.answer(
+            "Удалить эту команду без возможности восстановления?",
+            reply_markup=keyboard([
+                [("Да, удалить", f"command_delete:{reply_id}")],
+                [("Отмена", f"command_reply:{reply_id}")],
+            ]),
+        )
+
+    @router.callback_query(F.data.startswith("command_delete:"))
+    async def command_delete(callback: CallbackQuery) -> None:
+        reply_id = int(callback.data.split(":", 1)[1])
+        await db.delete_command_reply(callback.from_user.id, reply_id)
+        await callback.answer("Команда удалена")
+        await show_command_replies(callback.message, callback.from_user.id)
 
     async def show_autoreply(target: Message, user_id: int) -> None:
         row = await db.get_user(user_id)

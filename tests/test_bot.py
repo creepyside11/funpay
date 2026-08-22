@@ -238,6 +238,150 @@ def test_main_menu_has_no_direct_message_or_image_buttons():
     assert "images" not in callbacks
     assert "plugins" in callbacks
     assert "marketplace_switch" in callbacks
+    assert {"delivery", "command_replies"} <= callbacks
+
+
+def test_additional_notification_copies_do_not_include_owner_buttons():
+    sent = []
+
+    class FakeBot:
+        async def send_message(self, chat_id, text, **kwargs):
+            sent.append((chat_id, text, kwargs))
+
+    class FakeDatabase:
+        async def list_notification_targets(self, telegram_id):
+            assert telegram_id == 10
+            return [{"chat_id": -10020, "enabled": True}]
+
+    manager = bot_module.RuntimeManager(
+        FakeBot(), FakeDatabase(), SimpleNamespace()
+    )
+    markup = main_keyboard()
+    asyncio.run(manager.safe_notify(10, "Тест", reply_markup=markup))
+
+    assert sent[0][0] == 10
+    assert sent[0][2]["reply_markup"] is markup
+    assert sent[1][0] == -10020
+    assert "reply_markup" not in sent[1][2]
+
+
+def test_cardinal_command_reply_matches_exact_message():
+    outgoing = []
+
+    class FakeDatabase:
+        async def find_command_reply(self, telegram_id, command):
+            assert (telegram_id, command) == (10, "#help")
+            return {"response": "Привет, $username", "notify": False}
+
+    class FakeAccount:
+        id = 50
+        username = "Seller"
+
+        def send_message(self, chat_id, text, chat_name):
+            outgoing.append((chat_id, text, chat_name))
+            return True
+
+    manager = bot_module.RuntimeManager(
+        SimpleNamespace(), FakeDatabase(), SimpleNamespace()
+    )
+    runtime = bot_module.AccountRuntime(10, FakeAccount(), SimpleNamespace())
+    message = SimpleNamespace(
+        text="  #HELP  ",
+        chat_id=77,
+        chat_name="Buyer",
+        author="Buyer",
+    )
+
+    assert asyncio.run(manager._process_command_reply(runtime, message)) is True
+    assert outgoing == [(77, "Привет, Buyer", "Buyer")]
+
+
+def test_auto_delivery_issues_stock_and_disables_empty_lot():
+    sent = []
+    finished = []
+    lot_fields = SimpleNamespace(active=True)
+
+    rule = {
+        "id": 7,
+        "lot_id": 88,
+        "lot_title": "Нужный лот",
+        "response": "Ваш товар: $product",
+        "products": ["KEY-1"],
+        "enabled": True,
+        "disable_auto_restore": False,
+        "disable_auto_disable": False,
+    }
+
+    class FakeDatabase:
+        async def find_delivery_rule(self, telegram_id, title):
+            assert (telegram_id, title) == (10, "Нужный лот")
+            return rule
+
+        async def claim_delivery(self, telegram_id, order_id, title, amount):
+            assert (telegram_id, order_id, title, amount) == (
+                10,
+                "ORDER-1",
+                "Нужный лот",
+                1,
+            )
+            return rule, ["KEY-1"], 0, None
+
+        async def finish_delivery(self, telegram_id, order_id, status, details=""):
+            finished.append((telegram_id, order_id, status, details))
+
+        async def restore_delivery_products(self, *_args):
+            raise AssertionError("Успешно выданный товар не возвращается в запас")
+
+    class FakeAccount:
+        id = 50
+        username = "Seller"
+
+        def send_message(self, chat_id, text, chat_name):
+            sent.append((chat_id, text, chat_name))
+            return True
+
+        def get_lot_fields(self, lot_id):
+            assert lot_id == 88
+            return lot_fields
+
+        def save_lot(self, fields):
+            assert fields is lot_fields
+
+    manager = bot_module.RuntimeManager(
+        SimpleNamespace(), FakeDatabase(), SimpleNamespace()
+    )
+
+    async def record_notification(_telegram_id, text, **_kwargs):
+        sent.append(("notification", text, None))
+
+    manager.safe_notify = record_notification
+    runtime = bot_module.AccountRuntime(10, FakeAccount(), SimpleNamespace())
+    event = SimpleNamespace(
+        order=SimpleNamespace(
+            id="ORDER-1",
+            amount=1,
+            description="Нужный лот",
+            chat_id=77,
+            buyer_username="Buyer",
+            title="Нужный лот",
+        )
+    )
+    settings = {
+        "auto_delivery_enabled": True,
+        "multi_delivery_enabled": True,
+        "delivery_auto_disable": True,
+        "delivery_auto_restore": True,
+        "notify_delivery": True,
+    }
+
+    asyncio.run(manager._process_delivery(runtime, event, settings))
+
+    assert sent[0] == (77, "Ваш товар: KEY-1", "Buyer")
+    assert finished[0][:3] == (10, "ORDER-1", "sent")
+    assert event.delivered is True
+    assert event.goods_delivered == 1
+    assert event.goods_left == 0
+    assert lot_fields.active is False
 
 
 def test_playerok_menu_and_independent_account_adapter(monkeypatch):
