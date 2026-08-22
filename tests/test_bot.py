@@ -492,6 +492,52 @@ def test_playerok_email_code_auth_returns_token_cookie(monkeypatch):
     ]
 
 
+def test_playerok_email_code_accepts_auid_from_set_cookie_header(monkeypatch):
+    class Headers(dict):
+        def get_list(self, key):
+            if key.casefold() == "set-cookie":
+                return [
+                    "auid=authenticated-user-id; Path=/; HttpOnly; Secure; SameSite=Lax"
+                ]
+            return []
+
+    class Response:
+        status_code = 200
+
+        def __init__(self):
+            self.cookies = {}
+            self.headers = Headers()
+            self.history = []
+
+        def json(self):
+            return {"data": {"checkEmailAuthCode": {"id": "seller-1"}}}
+
+    class Session:
+        def __init__(self, **_kwargs):
+            self.cookies = {}
+
+        def post(self, *_args, **_kwargs):
+            return Response()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "curl_cffi",
+        SimpleNamespace(requests=SimpleNamespace(Session=Session)),
+    )
+
+    cookie, viewer = bot_module.verify_playerok_email_code(
+        "seller@example.com",
+        "123456",
+        "http://127.0.0.1:8080",
+        "lb_session_id=temporary-session",
+    )
+
+    assert "auid=authenticated-user-id" in cookie
+    assert "lb_session_id=temporary-session" in cookie
+    assert "token=" not in cookie
+    assert viewer["id"] == "seller-1"
+
+
 def test_notification_identifies_marketplace_account():
     sent = []
 

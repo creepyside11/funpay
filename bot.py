@@ -11,6 +11,7 @@ import threading
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from http.cookies import CookieError, SimpleCookie
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -2060,7 +2061,10 @@ def _playerok_response_json(response: Any) -> dict[str, Any]:
 
 def _playerok_session_cookies(session: Any, response: Any | None = None) -> str:
     cookies: dict[str, str] = {}
-    for source in (getattr(session, "cookies", None), getattr(response, "cookies", None)):
+    responses = [response, *list(getattr(response, "history", None) or [])]
+    sources = [getattr(session, "cookies", None)]
+    sources.extend(getattr(item, "cookies", None) for item in responses if item)
+    for source in sources:
         if source is None:
             continue
         try:
@@ -2070,6 +2074,48 @@ def _playerok_session_cookies(session: Any, response: Any | None = None) -> str:
                 cookies.update({str(key): str(value) for key, value in source.items()})
             except (AttributeError, TypeError, ValueError):
                 continue
+    for item in responses:
+        headers = getattr(item, "headers", None)
+        if headers is None:
+            continue
+        raw_values: list[str] = []
+        get_list = getattr(headers, "get_list", None)
+        if callable(get_list):
+            try:
+                raw_values.extend(str(value) for value in get_list("set-cookie"))
+            except (KeyError, TypeError, ValueError):
+                pass
+        if not raw_values:
+            try:
+                raw = headers.get("set-cookie", "")
+            except (AttributeError, KeyError, TypeError):
+                raw = ""
+            if raw:
+                raw_values.append(str(raw))
+        for raw in raw_values:
+            parsed = SimpleCookie()
+            try:
+                parsed.load(raw)
+            except (CookieError, TypeError, ValueError):
+                continue
+            cookies.update(
+                {
+                    str(key): str(morsel.value)
+                    for key, morsel in parsed.items()
+                    if morsel.value
+                }
+            )
+        for header_name in (
+            "x-auth-token",
+            "x-access-token",
+            "authorization",
+        ):
+            try:
+                raw_token = str(headers.get(header_name, "") or "").strip()
+            except (AttributeError, KeyError, TypeError):
+                raw_token = ""
+            if raw_token:
+                cookies.setdefault("token", raw_token.removeprefix("Bearer ").strip())
     return "; ".join(f"{key}={value}" for key, value in cookies.items())
 
 
@@ -2137,9 +2183,12 @@ def verify_playerok_email_code(
             if "=" in part:
                 key, value = part.split("=", 1)
                 merged[key.strip()] = value.strip()
-    if not merged.get("token"):
+    # Playerok постепенно переводит сессии с cookie `token` на `auid`.
+    # Не требуем конкретное имя: сразу после этой функции обработчик
+    # создаёт Account и вызывает get(), то есть проверяет сессию у самого Playerok.
+    if not merged:
         raise RuntimeError(
-            "Playerok подтвердил код, но не выдал cookie token; используйте вход по cookie"
+            "Playerok подтвердил код, но не вернул cookie сесии"
         )
     return "; ".join(f"{key}={value}" for key, value in merged.items()), viewer
 
