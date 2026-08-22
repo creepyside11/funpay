@@ -17,6 +17,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import asyncpg
+import certifi
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatType, ParseMode
@@ -39,6 +40,15 @@ from FunPayAPI import Account, Runner, events, types
 from FunPayAPI import exceptions as fp_exceptions
 from plugin_system import PluginData, PluginManager, PluginValidationError
 
+try:
+    from playerokapi.account import Account as PlayerokAccount
+    from playerokapi.enums import ItemDealDirections as PlayerokItemDealDirections
+    from playerokapi.enums import ItemStatuses as PlayerokItemStatuses
+except ImportError:  # Playerok — опциональная интеграция для локальных тестов без зависимости.
+    PlayerokAccount = None
+    PlayerokItemDealDirections = None
+    PlayerokItemStatuses = None
+
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -58,6 +68,8 @@ PLUGIN_SETTINGS_CALLBACK_PREFIX = "47"
 PLUGIN_CATALOG_PAGE_SIZE = 6
 PLUGIN_CATALOG_DESCRIPTION_MIN = 40
 PLUGIN_CATALOG_DESCRIPTION_MAX = 2000
+PLAYEROK_POLL_SECONDS = 20
+PLAYEROK_AUTO_PUBLISH_SECONDS = 300
 
 
 @dataclass(frozen=True, slots=True)
@@ -191,6 +203,17 @@ class Database:
                 funpay_id BIGINT,
                 funpay_username TEXT,
                 account_active BOOLEAN NOT NULL DEFAULT FALSE,
+                active_marketplace TEXT NOT NULL DEFAULT 'funpay',
+                playerok_proxy_enc TEXT,
+                playerok_cookie_enc TEXT,
+                playerok_id TEXT,
+                playerok_username TEXT,
+                playerok_active BOOLEAN NOT NULL DEFAULT FALSE,
+                playerok_notify_messages BOOLEAN NOT NULL DEFAULT TRUE,
+                playerok_notify_deals BOOLEAN NOT NULL DEFAULT TRUE,
+                playerok_notify_reviews BOOLEAN NOT NULL DEFAULT TRUE,
+                playerok_notify_system BOOLEAN NOT NULL DEFAULT TRUE,
+                playerok_auto_publish_enabled BOOLEAN NOT NULL DEFAULT FALSE,
                 notify_messages BOOLEAN NOT NULL DEFAULT TRUE,
                 notify_new_orders BOOLEAN NOT NULL DEFAULT TRUE,
                 notify_order_status BOOLEAN NOT NULL DEFAULT TRUE,
@@ -217,6 +240,17 @@ class Database:
             );
 
             ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS notify_reviews BOOLEAN NOT NULL DEFAULT TRUE;
+            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS active_marketplace TEXT NOT NULL DEFAULT 'funpay';
+            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS playerok_proxy_enc TEXT;
+            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS playerok_cookie_enc TEXT;
+            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS playerok_id TEXT;
+            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS playerok_username TEXT;
+            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS playerok_active BOOLEAN NOT NULL DEFAULT FALSE;
+            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS playerok_notify_messages BOOLEAN NOT NULL DEFAULT TRUE;
+            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS playerok_notify_deals BOOLEAN NOT NULL DEFAULT TRUE;
+            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS playerok_notify_reviews BOOLEAN NOT NULL DEFAULT TRUE;
+            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS playerok_notify_system BOOLEAN NOT NULL DEFAULT TRUE;
+            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS playerok_auto_publish_enabled BOOLEAN NOT NULL DEFAULT FALSE;
             ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS notify_lots_raise BOOLEAN NOT NULL DEFAULT TRUE;
             ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS notify_system BOOLEAN NOT NULL DEFAULT TRUE;
             ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS auto_raise_enabled BOOLEAN NOT NULL DEFAULT FALSE;
@@ -329,7 +363,7 @@ class Database:
             """
             UPDATE funpay_users
                SET proxy_enc=$2, golden_key_enc=$3, funpay_id=$4, funpay_username=$5,
-                   account_active=TRUE, updated_at=NOW()
+                   account_active=TRUE, active_marketplace='funpay', updated_at=NOW()
              WHERE telegram_id=$1
             """,
             telegram_id,
@@ -344,10 +378,57 @@ class Database:
             """
             UPDATE funpay_users
                SET proxy_enc=NULL, golden_key_enc=NULL, funpay_id=NULL, funpay_username=NULL,
-                   account_active=FALSE, updated_at=NOW()
+                   account_active=FALSE,
+                   active_marketplace=CASE WHEN playerok_active THEN 'playerok' ELSE 'funpay' END,
+                   updated_at=NOW()
              WHERE telegram_id=$1
             """,
             telegram_id,
+        )
+
+    async def save_playerok_account(
+        self,
+        telegram_id: int,
+        proxy_enc: str,
+        cookie_enc: str,
+        account: Any,
+    ) -> None:
+        await self.ensure_user(telegram_id)
+        await self.execute(
+            """
+            UPDATE funpay_users
+               SET playerok_proxy_enc=$2, playerok_cookie_enc=$3,
+                   playerok_id=$4, playerok_username=$5, playerok_active=TRUE,
+                   active_marketplace='playerok', updated_at=NOW()
+             WHERE telegram_id=$1
+            """,
+            telegram_id,
+            proxy_enc,
+            cookie_enc,
+            str(account.id),
+            account.username,
+        )
+
+    async def disconnect_playerok_account(self, telegram_id: int) -> None:
+        await self.execute(
+            """
+            UPDATE funpay_users
+               SET playerok_proxy_enc=NULL, playerok_cookie_enc=NULL,
+                   playerok_id=NULL, playerok_username=NULL, playerok_active=FALSE,
+                   active_marketplace=CASE WHEN account_active THEN 'funpay' ELSE 'playerok' END,
+                   updated_at=NOW()
+             WHERE telegram_id=$1
+            """,
+            telegram_id,
+        )
+
+    async def set_active_marketplace(self, telegram_id: int, marketplace: str) -> None:
+        if marketplace not in {"funpay", "playerok"}:
+            raise ValueError("Неизвестная площадка")
+        await self.execute(
+            "UPDATE funpay_users SET active_marketplace=$2, updated_at=NOW() WHERE telegram_id=$1",
+            telegram_id,
+            marketplace,
         )
 
     async def set_flag(self, telegram_id: int, column: str, value: bool) -> None:
@@ -363,6 +444,11 @@ class Database:
             "autoreply_enabled",
             "autoreply_new_chats_only",
             "review_reply_enabled",
+            "playerok_notify_messages",
+            "playerok_notify_deals",
+            "playerok_notify_reviews",
+            "playerok_notify_system",
+            "playerok_auto_publish_enabled",
         }
         if column not in allowed:
             raise ValueError("Недопустимая настройка")
@@ -628,6 +714,16 @@ class Database:
             """
         )
 
+    async def active_playerok_users(self) -> list[asyncpg.Record]:
+        return await self.fetch(
+            """
+            SELECT * FROM funpay_users
+             WHERE playerok_active=TRUE
+               AND playerok_proxy_enc IS NOT NULL
+               AND playerok_cookie_enc IS NOT NULL
+            """
+        )
+
 
 def normalize_proxy(raw: str) -> str:
     value = raw.strip()
@@ -652,6 +748,47 @@ def proxy_dict(proxy: str) -> dict[str, str]:
 def proxy_label(proxy: str) -> str:
     parsed = urlsplit(proxy)
     return f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"
+
+
+def playerok_proxy_value(proxy: str) -> str:
+    parsed = urlsplit(proxy)
+    if parsed.scheme.lower() not in {"http", "https"}:
+        raise ValueError("PlayerokAPI поддерживает IPv4 HTTP/HTTPS-прокси")
+    credentials = ""
+    if parsed.username:
+        credentials = parsed.username
+        if parsed.password:
+            credentials += f":{parsed.password}"
+        credentials += "@"
+    return f"{credentials}{parsed.hostname}:{parsed.port}"
+
+
+def create_playerok_account(cookie: str, proxy: str) -> Any:
+    """Создаёт независимый аккаунт, обходя singleton в PlayerokAPI."""
+    if PlayerokAccount is None:
+        raise RuntimeError("PlayerokAPI не установлен в текущей сборке")
+    account = object.__new__(PlayerokAccount)
+    kwargs: dict[str, Any] = {
+        "user_agent": USER_AGENT,
+        "proxy": playerok_proxy_value(proxy),
+        "requests_timeout": 20,
+    }
+    if "=" in cookie:
+        kwargs["cookies"] = cookie
+    else:
+        kwargs["token"] = cookie
+    try:
+        PlayerokAccount.__init__(account, **kwargs)
+    except FileNotFoundError:
+        # PlayerokAPI 1.1 не объявляет cacert.pem в package_data. К этому моменту
+        # __init__ уже заполнил данные аккаунта, поэтому безопасно завершаем настройку клиентов.
+        account._cert_path = certifi.where()
+        account._tmp_cert_path = certifi.where()
+        account._Account__tls_requests = None
+        account._Account__curl_session = None
+        account._Account__request_lock = threading.RLock()
+        account._refresh_clients()
+    return account
 
 
 def clipped(value: Any, size: int = 700) -> str:
@@ -1013,12 +1150,28 @@ class AccountRuntime:
     raise_schedule: dict[int, float] = field(default_factory=dict)
 
 
+@dataclass
+class PlayerokRuntime:
+    telegram_id: int
+    account: Any
+    stop_event: asyncio.Event = field(default_factory=asyncio.Event)
+    task: asyncio.Task[Any] | None = None
+    publish_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    message_ids: dict[str, str] = field(default_factory=dict)
+    deal_statuses: dict[str, str] = field(default_factory=dict)
+    review_ids: set[str] = field(default_factory=set)
+    initialized: bool = False
+    next_auto_publish_at: float = 0
+    poll_failures: int = 0
+
+
 class RuntimeManager:
     def __init__(self, bot: Bot, db: Database, secrets: SecretBox):
         self.bot = bot
         self.db = db
         self.secrets = secrets
         self.runtimes: dict[int, AccountRuntime] = {}
+        self.playerok_runtimes: dict[int, PlayerokRuntime] = {}
         self.loop: asyncio.AbstractEventLoop | None = None
         self.plugins = PluginManager(db, bot)
 
@@ -1038,6 +1191,219 @@ class RuntimeManager:
                         "⚠️ Не удалось восстановить подключение к FunPay. "
                         "Нажмите «Переподключить» или обновите данные.",
                     )
+        for row in await self.db.active_playerok_users():
+            user_id = int(row["telegram_id"])
+            try:
+                await self.start_playerok(user_id, row=row)
+                if row["playerok_notify_system"]:
+                    await self.safe_notify(
+                        user_id,
+                        "🟢 Слежение за аккаунтом восстановлено после запуска бота.",
+                        marketplace="playerok",
+                    )
+            except Exception:
+                logger.exception("Не удалось запустить Playerok-аккаунт пользователя %s", user_id)
+                if row["playerok_notify_system"]:
+                    await self.safe_notify(
+                        user_id,
+                        "⚠️ Не удалось восстановить Playerok. Обновите cookie или прокси.",
+                        marketplace="playerok",
+                    )
+
+    async def start_playerok(
+        self,
+        telegram_id: int,
+        row: asyncpg.Record | None = None,
+        account: Any | None = None,
+    ) -> PlayerokRuntime:
+        await self.stop_playerok(telegram_id)
+        row = row or await self.db.get_user(telegram_id)
+        if not row or not row["playerok_proxy_enc"] or not row["playerok_cookie_enc"]:
+            raise RuntimeError("Playerok не настроен")
+        if account is None:
+            proxy = self.secrets.decrypt(row["playerok_proxy_enc"])
+            cookie = self.secrets.decrypt(row["playerok_cookie_enc"])
+            account = create_playerok_account(cookie, proxy)
+            await asyncio.wait_for(asyncio.to_thread(account.get), timeout=50)
+        runtime = PlayerokRuntime(telegram_id=telegram_id, account=account)
+        self.playerok_runtimes[telegram_id] = runtime
+        runtime.task = asyncio.create_task(self._playerok_poll_loop(runtime))
+        logger.info("Playerok runtime запущен: telegram=%s playerok=%s", telegram_id, account.id)
+        return runtime
+
+    async def publish_playerok_drafts(
+        self, telegram_id: int
+    ) -> tuple[int, int, list[str]]:
+        runtime = self.playerok_runtimes.get(telegram_id)
+        if not runtime or PlayerokItemStatuses is None:
+            raise RuntimeError("Playerok не подключён")
+        async with runtime.publish_lock:
+            page = await asyncio.to_thread(
+                runtime.account.get_my_items,
+                statuses=[PlayerokItemStatuses.DRAFT],
+                count=24,
+            )
+            drafts = list(getattr(page, "items", []) or [])
+            published = 0
+            errors: list[str] = []
+            for item in drafts:
+                try:
+                    statuses = await asyncio.to_thread(
+                        runtime.account.get_item_priority_statuses,
+                        item.id,
+                        item.price,
+                    )
+                    free_status = next(
+                        (status for status in statuses if int(status.price or 0) == 0),
+                        None,
+                    )
+                    if not free_status:
+                        raise RuntimeError("нет бесплатного статуса публикации")
+                    await asyncio.to_thread(
+                        runtime.account.publish_item,
+                        item.id,
+                        free_status.id,
+                    )
+                    published += 1
+                except Exception as exc:
+                    logger.exception("Playerok: не опубликован предмет %s", item.id)
+                    errors.append(f"{clipped(getattr(item, 'name', item.id), 80)}: {clipped(exc, 120)}")
+            return published, len(drafts), errors
+
+    async def _playerok_snapshot(self, runtime: PlayerokRuntime) -> tuple[Any, Any, Any]:
+        deals_call = {
+            "count": 24,
+            "direction": PlayerokItemDealDirections.OUT,
+        }
+        return await asyncio.gather(
+            asyncio.to_thread(runtime.account.get_chats, count=24),
+            asyncio.to_thread(runtime.account.get_deals, **deals_call),
+            asyncio.to_thread(runtime.account.get_my_reviews, count=24),
+        )
+
+    async def _handle_playerok_snapshot(
+        self, runtime: PlayerokRuntime, row: asyncpg.Record, snapshot: tuple[Any, Any, Any]
+    ) -> None:
+        chats_page, deals_page, reviews_page = snapshot
+        chats = list(getattr(chats_page, "chats", []) or [])
+        deals = list(getattr(deals_page, "deals", []) or [])
+        reviews = list(getattr(reviews_page, "reviews", []) or [])
+        message_ids = {
+            str(chat.id): str(chat.last_message.id)
+            for chat in chats
+            if getattr(chat, "last_message", None)
+        }
+        deal_statuses = {
+            str(deal.id): getattr(getattr(deal, "status", None), "name", "UNKNOWN")
+            for deal in deals
+        }
+        review_ids = {str(review.id) for review in reviews}
+        if not runtime.initialized:
+            runtime.message_ids = message_ids
+            runtime.deal_statuses = deal_statuses
+            runtime.review_ids = review_ids
+            runtime.initialized = True
+            return
+
+        if row["playerok_notify_messages"]:
+            for chat in chats:
+                message = getattr(chat, "last_message", None)
+                if not message or runtime.message_ids.get(str(chat.id)) == str(message.id):
+                    continue
+                sender = getattr(message, "user", None)
+                if str(getattr(sender, "id", "")) == str(runtime.account.id):
+                    continue
+                await self.safe_notify(
+                    runtime.telegram_id,
+                    "💬 <b>Новое сообщение</b>\n\n"
+                    f"👤 От: <b>{html.escape(clipped(getattr(sender, 'username', '—'), 120))}</b>\n"
+                    f"🆔 Чат: <code>{html.escape(str(chat.id))}</code>\n\n"
+                    f"<pre>{html.escape(clipped(getattr(message, 'text', None) or '[изображение]', 1400))}</pre>",
+                    marketplace="playerok",
+                )
+
+        if row["playerok_notify_deals"]:
+            for deal in deals:
+                deal_id = str(deal.id)
+                status = deal_statuses[deal_id]
+                previous = runtime.deal_statuses.get(deal_id)
+                if previous == status:
+                    continue
+                item = getattr(deal, "item", None)
+                buyer = getattr(deal, "user", None)
+                title = "Новая сделка" if previous is None else "Статус сделки изменён"
+                await self.safe_notify(
+                    runtime.telegram_id,
+                    f"📦 <b>{title}</b>\n\n"
+                    f"🆔 Сделка: <code>{html.escape(deal_id)}</code>\n"
+                    f"📌 Статус: <b>{html.escape(status)}</b>\n"
+                    f"👤 Покупатель: <b>{html.escape(clipped(getattr(buyer, 'username', '—'), 120))}</b>\n"
+                    f"🏷 Объявление: <b>{html.escape(clipped(getattr(item, 'name', '—'), 700))}</b>\n"
+                    f"💰 Цена: <b>{format_money(getattr(item, 'price', 0))} ₽</b>",
+                    marketplace="playerok",
+                )
+
+        if row["playerok_notify_reviews"]:
+            for review in reviews:
+                if str(review.id) in runtime.review_ids:
+                    continue
+                creator = getattr(review, "creator", None)
+                deal = getattr(review, "deal", None)
+                item = getattr(deal, "item", None)
+                rating = int(getattr(review, "rating", 0) or 0)
+                await self.safe_notify(
+                    runtime.telegram_id,
+                    "⭐ <b>Новый отзыв</b>\n\n"
+                    f"👤 Автор: <b>{html.escape(clipped(getattr(creator, 'username', '—'), 120))}</b>\n"
+                    f"🌟 Оценка: <b>{'⭐' * rating} ({rating}/5)</b>\n"
+                    f"🏷 Объявление: <b>{html.escape(clipped(getattr(item, 'name', '—'), 500))}</b>\n\n"
+                    f"<pre>{html.escape(clipped(getattr(review, 'text', None) or 'Без комментария', 1200))}</pre>",
+                    marketplace="playerok",
+                )
+
+        runtime.message_ids = message_ids
+        runtime.deal_statuses = deal_statuses
+        runtime.review_ids = review_ids
+
+    async def _playerok_poll_loop(self, runtime: PlayerokRuntime) -> None:
+        while not runtime.stop_event.is_set():
+            try:
+                row = await self.db.get_user(runtime.telegram_id)
+                if not row or not row["playerok_active"]:
+                    return
+                snapshot = await self._playerok_snapshot(runtime)
+                await self._handle_playerok_snapshot(runtime, row, snapshot)
+                now = asyncio.get_running_loop().time()
+                if row["playerok_auto_publish_enabled"] and now >= runtime.next_auto_publish_at:
+                    published, total, errors = await self.publish_playerok_drafts(runtime.telegram_id)
+                    runtime.next_auto_publish_at = now + PLAYEROK_AUTO_PUBLISH_SECONDS
+                    if published or errors:
+                        await self.safe_notify(
+                            runtime.telegram_id,
+                            f"📢 Автопубликация черновиков: <b>{published}/{total}</b> опубликовано"
+                            + (f"\nОшибок: <b>{len(errors)}</b>" if errors else ""),
+                            marketplace="playerok",
+                        )
+                runtime.poll_failures = 0
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                runtime.poll_failures += 1
+                logger.exception("Ошибка Playerok polling для %s", runtime.telegram_id)
+                if runtime.poll_failures in {1, 15}:
+                    row = await self.db.get_user(runtime.telegram_id)
+                    if row and row["playerok_notify_system"]:
+                        await self.safe_notify(
+                            runtime.telegram_id,
+                            f"⚠️ Ошибка проверки Playerok: {html.escape(clipped(exc, 400))}",
+                            marketplace="playerok",
+                        )
+            try:
+                await asyncio.wait_for(
+                    runtime.stop_event.wait(), timeout=PLAYEROK_POLL_SECONDS
+                )
+            except TimeoutError:
+                pass
 
     async def start(
         self,
@@ -1200,16 +1566,38 @@ class RuntimeManager:
         except TimeoutError:
             logger.warning("Не все задачи runtime %s завершились вовремя", telegram_id)
 
+    async def stop_playerok(self, telegram_id: int) -> None:
+        runtime = self.playerok_runtimes.pop(telegram_id, None)
+        if not runtime:
+            return
+        runtime.stop_event.set()
+        if runtime.task:
+            runtime.task.cancel()
+            await asyncio.gather(runtime.task, return_exceptions=True)
+
     async def close(self) -> None:
         for telegram_id in list(self.runtimes):
             await self.stop(telegram_id)
+        for telegram_id in list(self.playerok_runtimes):
+            await self.stop_playerok(telegram_id)
 
     def get(self, telegram_id: int) -> AccountRuntime | None:
         return self.runtimes.get(telegram_id)
 
-    async def safe_notify(self, telegram_id: int, text: str, **kwargs: Any) -> None:
+    def get_playerok(self, telegram_id: int) -> PlayerokRuntime | None:
+        return self.playerok_runtimes.get(telegram_id)
+
+    async def safe_notify(
+        self,
+        telegram_id: int,
+        text: str,
+        *,
+        marketplace: str = "funpay",
+        **kwargs: Any,
+    ) -> None:
+        label = "🟣 <b>FunPay</b>" if marketplace == "funpay" else "🔵 <b>Playerok</b>"
         try:
-            await self.bot.send_message(telegram_id, text, **kwargs)
+            await self.bot.send_message(telegram_id, f"{label}\n{text}", **kwargs)
         except Exception:
             logger.exception("Не удалось отправить Telegram-уведомление пользователю %s", telegram_id)
 
@@ -1449,6 +1837,11 @@ class ConnectState(StatesGroup):
     golden_key = State()
 
 
+class PlayerokConnectState(StatesGroup):
+    proxy = State()
+    cookie = State()
+
+
 class AutoReplyState(StatesGroup):
     text = State()
     cooldown = State()
@@ -1498,8 +1891,22 @@ def keyboard(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
     )
 
 
-def main_keyboard() -> InlineKeyboardMarkup:
+def main_keyboard(marketplace: str = "funpay") -> InlineKeyboardMarkup:
+    switch = [
+        (
+            "🔄 Площадка: FunPay" if marketplace == "funpay" else "🔄 Площадка: Playerok",
+            "marketplace_switch",
+        )
+    ]
+    if marketplace == "playerok":
+        return keyboard([
+            switch,
+            [("👤 Профиль", "po_profile"), ("💰 Баланс", "po_balance")],
+            [("📢 Объявления", "po_items"), ("🔔 Уведомления", "po_notifications")],
+            [("⚙️ Аккаунт Playerok", "po_account")],
+        ])
     return keyboard([
+        switch,
         [("👤 Подробный профиль", "profile"), ("💰 Баланс", "balance")],
         [("🔔 Уведомления", "notifications"), ("🤖 Автоответчик", "autoreply")],
         [("💬 Последние чаты", "chats"), ("📦 Заказ по ID", "order_lookup")],
@@ -1530,16 +1937,33 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
 
     async def show_main(target: Message, user_id: int, text: str = "Выберите действие:") -> None:
         row = await db.get_user(user_id)
-        if not row or not row["account_active"]:
+        if not row or not (row["account_active"] or row["playerok_active"]):
             await target.answer(
-                "Аккаунт FunPay пока не подключён.",
-                reply_markup=keyboard([[("🔗 Подключить", "connect")]]),
+                "Выберите площадку, которую хотите настроить первой:",
+                reply_markup=keyboard([
+                    [("🟣 Настроить FunPay", "connect_funpay")],
+                    [("🔵 Настроить Playerok", "connect_playerok")],
+                ]),
             )
             return
-        online = "🟢" if manager.get(user_id) else "🔴"
+        marketplace = row["active_marketplace"]
+        if marketplace == "playerok" and not row["playerok_active"]:
+            marketplace = "funpay"
+            await db.set_active_marketplace(user_id, marketplace)
+        elif marketplace == "funpay" and not row["account_active"]:
+            marketplace = "playerok"
+            await db.set_active_marketplace(user_id, marketplace)
+        if marketplace == "playerok":
+            online = "🟢" if manager.get_playerok(user_id) else "🔴"
+            username = row["playerok_username"] or "Playerok"
+            label = "🔵 Playerok"
+        else:
+            online = "🟢" if manager.get(user_id) else "🔴"
+            username = row["funpay_username"] or "FunPay"
+            label = "🟣 FunPay"
         await target.answer(
-            f"{online} <b>{html.escape(row['funpay_username'] or 'FunPay')}</b>\n{text}",
-            reply_markup=main_keyboard(),
+            f"{label} · {online} <b>{html.escape(username)}</b>\n{text}",
+            reply_markup=main_keyboard(marketplace),
         )
 
     async def require_runtime(target: Message, user_id: int) -> AccountRuntime | None:
@@ -1553,6 +1977,22 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
         await target.answer("Подключение неактивно. Откройте «Аккаунт» → «Переподключить».")
         return None
 
+    async def require_playerok_runtime(
+        target: Message, user_id: int
+    ) -> PlayerokRuntime | None:
+        runtime = manager.get_playerok(user_id)
+        if runtime:
+            return runtime
+        row = await db.get_user(user_id)
+        if not row or not row["playerok_active"]:
+            await target.answer(
+                "Сначала подключите Playerok.",
+                reply_markup=keyboard([[("🔵 Подключить Playerok", "connect_playerok")]]),
+            )
+            return None
+        await target.answer("Playerok неактивен. Откройте настройки аккаунта и переподключитесь.")
+        return None
+
     async def begin_connect(target: Message, state: FSMContext) -> None:
         await state.clear()
         await state.set_state(ConnectState.proxy)
@@ -1563,30 +2003,50 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
             "Сообщение будет удалено после обработки. Для отмены: /cancel"
         )
 
+    async def begin_playerok_connect(target: Message, state: FSMContext) -> None:
+        await state.clear()
+        await state.set_state(PlayerokConnectState.proxy)
+        await target.answer(
+            "🔵 <b>Playerok · шаг 1/2</b>\n\n"
+            "Отправьте IPv4 HTTP/HTTPS-прокси, желательно тот же IP, с которого получены cookie:\n"
+            "<code>http://user:password@host:port</code>\n\n"
+            "Сообщение будет удалено после обработки. Для отмены: /cancel"
+        )
+
     @router.message(CommandStart())
     async def start(message: Message, state: FSMContext) -> None:
         await state.clear()
         await db.ensure_user(message.from_user.id)
         row = await db.get_user(message.from_user.id)
-        if row and row["account_active"]:
-            if not manager.get(message.from_user.id):
+        if row and (row["account_active"] or row["playerok_active"]):
+            if row["account_active"] and not manager.get(message.from_user.id):
                 try:
                     await manager.start(message.from_user.id, row=row)
                 except Exception:
-                    logger.exception("Ручной запуск аккаунта не удался")
+                    logger.exception("Ручной запуск FunPay не удался")
+            if row["playerok_active"] and not manager.get_playerok(message.from_user.id):
+                try:
+                    await manager.start_playerok(message.from_user.id, row=row)
+                except Exception:
+                    logger.exception("Ручной запуск Playerok не удался")
             await show_main(message, message.from_user.id)
         else:
-            await begin_connect(message, state)
+            await show_main(message, message.from_user.id)
 
     @router.message(Command("cancel"))
     async def cancel(message: Message, state: FSMContext) -> None:
         await state.clear()
         await show_main(message, message.from_user.id, "Текущее действие отменено.")
 
-    @router.callback_query(F.data == "connect")
+    @router.callback_query(F.data.in_({"connect", "connect_funpay"}))
     async def connect_callback(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer()
         await begin_connect(callback.message, state)
+
+    @router.callback_query(F.data == "connect_playerok")
+    async def connect_playerok_callback(callback: CallbackQuery, state: FSMContext) -> None:
+        await callback.answer()
+        await begin_playerok_connect(callback.message, state)
 
     @router.message(ConnectState.proxy, F.text)
     async def accept_proxy(message: Message, state: FSMContext) -> None:
@@ -1659,6 +2119,319 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
             f"(<code>{account.id}</code>)."
         )
         await show_main(message, message.from_user.id)
+
+    @router.message(PlayerokConnectState.proxy, F.text)
+    async def accept_playerok_proxy(message: Message, state: FSMContext) -> None:
+        try:
+            proxy = normalize_proxy(message.text)
+            playerok_proxy_value(proxy)
+        except ValueError as exc:
+            await message.answer(f"❌ {html.escape(str(exc))}. Попробуйте ещё раз или /cancel.")
+            return
+        try:
+            await message.delete()
+        except TelegramBadRequest:
+            pass
+        await state.update_data(playerok_proxy=proxy)
+        await state.set_state(PlayerokConnectState.cookie)
+        await message.answer(
+            "🔵 <b>Playerok · шаг 2/2</b>\n\n"
+            "Отправьте полный заголовок cookie из браузера, например:\n"
+            "<code>__ddg5_=...; token=...</code>\n\n"
+            "Можно отправить только значение <code>token</code>, но при включённой защите Playerok "
+            "понадобится полный набор cookie. Сообщение будет удалено."
+        )
+
+    @router.message(PlayerokConnectState.cookie, F.text)
+    async def accept_playerok_cookie(message: Message, state: FSMContext) -> None:
+        cookie = message.text.strip()
+        try:
+            await message.delete()
+        except TelegramBadRequest:
+            pass
+        if not 16 <= len(cookie) <= 4096:
+            await message.answer("❌ Cookie выглядит некорректно. Отправьте его снова или /cancel.")
+            return
+        data = await state.get_data()
+        proxy = data.get("playerok_proxy")
+        if not proxy:
+            await begin_playerok_connect(message, state)
+            return
+        wait_message = await message.answer("⏳ Проверяю прокси и cookie Playerok…")
+        try:
+            account = create_playerok_account(cookie, proxy)
+            await asyncio.wait_for(asyncio.to_thread(account.get), timeout=50)
+        except Exception as exc:
+            logger.warning("Проверка Playerok не пройдена", exc_info=True)
+            await wait_message.edit_text(
+                "❌ Playerok не принял данные. Проверьте, что cookie актуальны, прокси имеет тот же IP "
+                f"и защита не запросила новую __ddg5_.\n\nОшибка: <code>{html.escape(clipped(exc, 500))}</code>"
+            )
+            return
+        await db.save_playerok_account(
+            message.from_user.id,
+            secrets.encrypt(proxy),
+            secrets.encrypt(cookie),
+            account,
+        )
+        row = await db.get_user(message.from_user.id)
+        try:
+            await manager.start_playerok(message.from_user.id, row=row, account=account)
+        except Exception:
+            logger.exception("Playerok сохранён, но polling не запустился")
+            await wait_message.edit_text(
+                "⚠️ Playerok сохранён, но слежение не запустилось. Попробуйте переподключить."
+            )
+            await state.clear()
+            return
+        await state.clear()
+        await wait_message.edit_text(
+            f"✅ Подключён Playerok-аккаунт <b>{html.escape(account.username or '—')}</b> "
+            f"(<code>{html.escape(str(account.id))}</code>)."
+        )
+        await show_main(message, message.from_user.id)
+
+    @router.callback_query(F.data == "marketplace_switch")
+    async def marketplace_switch(callback: CallbackQuery) -> None:
+        row = await db.get_user(callback.from_user.id)
+        if not row:
+            await callback.answer("Сначала выберите площадку", show_alert=True)
+            return
+        destination = "playerok" if row["active_marketplace"] == "funpay" else "funpay"
+        configured = row["playerok_active"] if destination == "playerok" else row["account_active"]
+        if not configured:
+            await callback.answer("Эта площадка ещё не настроена", show_alert=True)
+            await callback.message.answer(
+                f"Подключите {'Playerok' if destination == 'playerok' else 'FunPay'}, чтобы переключиться.",
+                reply_markup=keyboard([[(
+                    f"Настроить {'Playerok' if destination == 'playerok' else 'FunPay'}",
+                    "connect_playerok" if destination == "playerok" else "connect_funpay",
+                )]]),
+            )
+            return
+        await db.set_active_marketplace(callback.from_user.id, destination)
+        await callback.answer("Площадка переключена")
+        await show_main(callback.message, callback.from_user.id)
+
+    @router.callback_query(F.data == "po_profile")
+    async def playerok_profile(callback: CallbackQuery) -> None:
+        await callback.answer("Загружаю…")
+        runtime = await require_playerok_runtime(callback.message, callback.from_user.id)
+        if not runtime:
+            return
+        try:
+            account = await asyncio.to_thread(runtime.account.get)
+            profile = account.profile
+        except Exception as exc:
+            logger.exception("Не удалось получить профиль Playerok")
+            await callback.message.answer(f"❌ Playerok не отдал профиль: {html.escape(clipped(exc, 400))}")
+            return
+        stats = getattr(profile, "stats", None)
+        item_stats = getattr(stats, "items", None)
+        deal_stats = getattr(stats, "deals", None)
+        outgoing = getattr(deal_stats, "outgoing", None)
+        await callback.message.answer(
+            "🔵 <b>Профиль Playerok</b>\n\n"
+            f"👤 Пользователь: <b>{html.escape(account.username or '—')}</b>\n"
+            f"🆔 ID: <code>{html.escape(str(account.id))}</code>\n"
+            f"⭐ Рейтинг: <b>{getattr(profile, 'rating', '—')}</b> · отзывов: <b>{getattr(profile, 'reviews_count', 0)}</b>\n"
+            f"📢 Объявлений: <b>{getattr(item_stats, 'total', 0)}</b> · завершено: <b>{getattr(item_stats, 'finished', 0)}</b>\n"
+            f"📦 Продаж: <b>{getattr(outgoing, 'total', 0)}</b> · завершено: <b>{getattr(outgoing, 'finished', 0)}</b>\n"
+            f"✅ Верификация: {bool_icon(bool(getattr(profile, 'is_verified', False)))}\n"
+            f"📢 Можно публиковать: {bool_icon(bool(account.can_publish_items))}\n"
+            f"🚫 Блокировка: {'❌ есть' if account.is_blocked else '✅ нет'}",
+            reply_markup=keyboard([[("🔄 Обновить", "po_profile"), ("⬅️ Меню", "menu")]]),
+        )
+
+    @router.callback_query(F.data == "po_balance")
+    async def playerok_balance(callback: CallbackQuery) -> None:
+        await callback.answer("Проверяю баланс…")
+        runtime = await require_playerok_runtime(callback.message, callback.from_user.id)
+        if not runtime:
+            return
+        try:
+            account = await asyncio.to_thread(runtime.account.get)
+            balance = account.profile.balance
+        except Exception as exc:
+            logger.exception("Не удалось получить баланс Playerok")
+            await callback.message.answer(f"❌ Баланс недоступен: {html.escape(clipped(exc, 400))}")
+            return
+        await callback.message.answer(
+            "🔵 <b>Баланс Playerok</b>\n\n"
+            f"💰 Всего: <b>{format_money(balance.value)} ₽</b>\n"
+            f"✅ Доступно: <b>{format_money(balance.available)} ₽</b>\n"
+            f"🏦 Можно вывести: <b>{format_money(balance.withdrawable)} ₽</b>\n"
+            f"🧊 Заморожено: <b>{format_money(balance.frozen)} ₽</b>\n"
+            f"⏳ Ожидаемый доход: <b>{format_money(balance.pending_income)} ₽</b>",
+            reply_markup=keyboard([[("🔄 Обновить", "po_balance"), ("⬅️ Меню", "menu")]]),
+        )
+
+    async def show_playerok_items(target: Message, user_id: int) -> None:
+        runtime = await require_playerok_runtime(target, user_id)
+        if not runtime or PlayerokItemStatuses is None:
+            return
+        row = await db.get_user(user_id)
+        try:
+            page = await asyncio.to_thread(
+                runtime.account.get_my_items,
+                statuses=list(PlayerokItemStatuses),
+                count=24,
+            )
+        except Exception as exc:
+            logger.exception("Не удалось получить объявления Playerok")
+            await target.answer(f"❌ Объявления недоступны: {html.escape(clipped(exc, 400))}")
+            return
+        items = list(getattr(page, "items", []) or [])
+        statuses = Counter(
+            getattr(getattr(item, "status", None), "name", "UNKNOWN") for item in items
+        )
+        preview = "\n".join(
+            f"• <b>{html.escape(clipped(item.name, 55))}</b> — {format_money(item.price)} ₽ "
+            f"(<code>{html.escape(getattr(item.status, 'name', '—'))}</code>)"
+            for item in items[:10]
+        ) or "Объявлений пока нет."
+        await target.answer(
+            "📢 <b>Объявления Playerok</b>\n\n"
+            f"Найдено на первой странице: <b>{len(items)}</b> из <b>{getattr(page, 'total_count', len(items))}</b>\n"
+            f"Черновиков: <b>{statuses.get('DRAFT', 0)}</b> · активных: <b>{statuses.get('APPROVED', 0)}</b>\n\n"
+            f"{preview}\n\n"
+            "Автовыставление каждые 5 минут публикует до 24 черновиков с бесплатным приоритетом. "
+            "Создавать универсальные объявления автоматически нельзя: обязательные поля различаются по категориям.",
+            reply_markup=keyboard([
+                [(f"{bool_icon(row['playerok_auto_publish_enabled'])} Автовыставление", "po_auto_publish_toggle")],
+                [("📤 Выставить черновики сейчас", "po_publish_drafts")],
+                [("🔄 Обновить", "po_items"), ("⬅️ Меню", "menu")],
+            ]),
+        )
+
+    @router.callback_query(F.data == "po_items")
+    async def playerok_items(callback: CallbackQuery) -> None:
+        await callback.answer("Загружаю…")
+        await show_playerok_items(callback.message, callback.from_user.id)
+
+    @router.callback_query(F.data == "po_auto_publish_toggle")
+    async def playerok_auto_publish_toggle(callback: CallbackQuery) -> None:
+        row = await db.get_user(callback.from_user.id)
+        if not row or not row["playerok_active"]:
+            await callback.answer("Playerok не подключён", show_alert=True)
+            return
+        enabled = not row["playerok_auto_publish_enabled"]
+        await db.set_flag(callback.from_user.id, "playerok_auto_publish_enabled", enabled)
+        runtime = manager.get_playerok(callback.from_user.id)
+        if runtime and enabled:
+            runtime.next_auto_publish_at = 0
+        await callback.answer("Автовыставление включено" if enabled else "Автовыставление выключено")
+        await show_playerok_items(callback.message, callback.from_user.id)
+
+    @router.callback_query(F.data == "po_publish_drafts")
+    async def playerok_publish_drafts(callback: CallbackQuery) -> None:
+        await callback.answer("Публикую…")
+        try:
+            published, total, errors = await manager.publish_playerok_drafts(callback.from_user.id)
+        except Exception as exc:  # noqa: BLE001 - API raises heterogeneous network errors.
+            await callback.message.answer(f"❌ Публикация не выполнена: {html.escape(clipped(exc, 500))}")
+            return
+        error_text = "\n".join(f"• {html.escape(error)}" for error in errors[:8])
+        await callback.message.answer(
+            f"✅ Опубликовано черновиков: <b>{published}/{total}</b>"
+            + (f"\n\nОшибки:\n{error_text}" if errors else ""),
+            reply_markup=keyboard([[('⬅️ Объявления', 'po_items')]]),
+        )
+
+    async def show_playerok_notifications(target: Message, user_id: int) -> None:
+        row = await db.get_user(user_id)
+        await target.answer(
+            "🔵 <b>Уведомления Playerok</b>\n\n"
+            "Проверка выполняется каждые 20 секунд; все сообщения помечаются площадкой.",
+            reply_markup=keyboard([
+                [(f"{bool_icon(row['playerok_notify_messages'])} Сообщения", "po_toggle:playerok_notify_messages")],
+                [(f"{bool_icon(row['playerok_notify_deals'])} Сделки и статусы", "po_toggle:playerok_notify_deals")],
+                [(f"{bool_icon(row['playerok_notify_reviews'])} Отзывы", "po_toggle:playerok_notify_reviews")],
+                [(f"{bool_icon(row['playerok_notify_system'])} Ошибки подключения", "po_toggle:playerok_notify_system")],
+                [("⬅️ Меню", "menu")],
+            ]),
+        )
+
+    @router.callback_query(F.data == "po_notifications")
+    async def playerok_notifications(callback: CallbackQuery) -> None:
+        await callback.answer()
+        await show_playerok_notifications(callback.message, callback.from_user.id)
+
+    @router.callback_query(F.data.startswith("po_toggle:"))
+    async def playerok_toggle(callback: CallbackQuery) -> None:
+        column = callback.data.split(":", 1)[1]
+        allowed = {
+            "playerok_notify_messages",
+            "playerok_notify_deals",
+            "playerok_notify_reviews",
+            "playerok_notify_system",
+        }
+        row = await db.get_user(callback.from_user.id)
+        if not row or column not in allowed:
+            await callback.answer("Неизвестная настройка", show_alert=True)
+            return
+        await db.set_flag(callback.from_user.id, column, not row[column])
+        await callback.answer("Сохранено")
+        await show_playerok_notifications(callback.message, callback.from_user.id)
+
+    async def show_playerok_account(target: Message, user_id: int) -> None:
+        row = await db.get_user(user_id)
+        if not row or not row["playerok_active"]:
+            await target.answer(
+                "Playerok не подключён.",
+                reply_markup=keyboard([[("🔵 Подключить", "connect_playerok")]]),
+            )
+            return
+        try:
+            proxy = proxy_label(secrets.decrypt(row["playerok_proxy_enc"]))
+        except (InvalidToken, ValueError, TypeError):
+            proxy = "не удалось расшифровать"
+        status = "🟢 работает" if manager.get_playerok(user_id) else "🔴 остановлен"
+        await target.answer(
+            "⚙️ <b>Аккаунт Playerok</b>\n\n"
+            f"Пользователь: <b>{html.escape(row['playerok_username'] or '—')}</b>\n"
+            f"ID: <code>{html.escape(str(row['playerok_id'] or '—'))}</code>\n"
+            f"Прокси: <code>{html.escape(proxy)}</code>\n"
+            f"Слежение: {status}",
+            reply_markup=keyboard([
+                [("🔄 Переподключить", "po_reconnect"), ("🍪 Изменить cookie", "connect_playerok")],
+                [("🗑 Отключить Playerok", "po_disconnect_ask")],
+                [("⬅️ Меню", "menu")],
+            ]),
+        )
+
+    @router.callback_query(F.data == "po_account")
+    async def playerok_account(callback: CallbackQuery) -> None:
+        await callback.answer()
+        await show_playerok_account(callback.message, callback.from_user.id)
+
+    @router.callback_query(F.data == "po_reconnect")
+    async def playerok_reconnect(callback: CallbackQuery) -> None:
+        await callback.answer("Переподключаю…")
+        try:
+            await manager.start_playerok(callback.from_user.id)
+        except Exception as exc:
+            logger.exception("Переподключение Playerok не удалось")
+            await callback.message.answer(f"❌ Не удалось: {html.escape(clipped(exc, 500))}")
+            return
+        await show_playerok_account(callback.message, callback.from_user.id)
+
+    @router.callback_query(F.data == "po_disconnect_ask")
+    async def playerok_disconnect_ask(callback: CallbackQuery) -> None:
+        await callback.answer()
+        await callback.message.answer(
+            "Удалить сохранённые cookie и прокси Playerok и остановить уведомления?",
+            reply_markup=keyboard([[("Да, отключить", "po_disconnect"), ("Нет", "po_account")]]),
+        )
+
+    @router.callback_query(F.data == "po_disconnect")
+    async def playerok_disconnect(callback: CallbackQuery, state: FSMContext) -> None:
+        await callback.answer()
+        await manager.stop_playerok(callback.from_user.id)
+        await db.disconnect_playerok_account(callback.from_user.id)
+        await state.clear()
+        await callback.message.answer("Playerok отключён, cookie и прокси удалены.")
+        await show_main(callback.message, callback.from_user.id)
 
     @router.callback_query(F.data == "menu")
     async def menu_callback(callback: CallbackQuery) -> None:

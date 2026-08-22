@@ -1,8 +1,10 @@
 aiogram==3.30.0
 asyncpg==0.31.0
 beautifulsoup4>=4.13,<5
+certifi>=2024.8
 cryptography==50.0.0
 lxml>=5.3,<7
 PySocks>=1.7,<2
 requests>=2.32,<3
 requests-toolbelt>=1.0,<2
+playerokapi @ https://github.com/alleexxeeyy/PlayerokAPI/archive/1df7e806abd8319b3106a0bf8daeae079ef0a8c9.zip

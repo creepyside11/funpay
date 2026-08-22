@@ -1,9 +1,11 @@
+import asyncio
 import threading
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
 
+import bot as bot_module
 from bot import (
     PLUGIN_CATALOG_DESCRIPTION_MAX,
     PLUGIN_CATALOG_DESCRIPTION_MIN,
@@ -12,6 +14,7 @@ from bot import (
     SecretBox,
     apply_bulk_lot_action,
     conversation_actions_keyboard,
+    create_playerok_account,
     format_chat_history,
     format_money,
     format_order,
@@ -22,6 +25,7 @@ from bot import (
     main_keyboard,
     normalize_proxy,
     normalize_review_reply,
+    playerok_proxy_value,
     plugin_settings_callback_data,
     proxy_dict,
     proxy_label,
@@ -233,6 +237,73 @@ def test_main_menu_has_no_direct_message_or_image_buttons():
     assert "send_message" not in callbacks
     assert "images" not in callbacks
     assert "plugins" in callbacks
+    assert "marketplace_switch" in callbacks
+
+
+def test_playerok_menu_and_independent_account_adapter(monkeypatch):
+    callbacks = {
+        button.callback_data
+        for row in main_keyboard("playerok").inline_keyboard
+        for button in row
+    }
+    assert {"marketplace_switch", "po_profile", "po_balance", "po_items"} <= callbacks
+    assert playerok_proxy_value("http://user:pass@127.0.0.1:8080") == (
+        "user:pass@127.0.0.1:8080"
+    )
+    with pytest.raises(ValueError):
+        playerok_proxy_value("socks5://127.0.0.1:1080")
+
+    class FakePlayerokAccount:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    monkeypatch.setattr(bot_module, "PlayerokAccount", FakePlayerokAccount)
+    first = create_playerok_account("token-one-123456", "http://127.0.0.1:8080")
+    second = create_playerok_account("token-two-123456", "http://127.0.0.1:8080")
+    assert first is not second
+    assert first.kwargs["token"] == "token-one-123456"
+    assert second.kwargs["token"] == "token-two-123456"
+
+    class MissingCertificateAccount:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            raise FileNotFoundError("cacert.pem")
+
+        def _refresh_clients(self):
+            self.refreshed = True
+
+    monkeypatch.setattr(bot_module, "PlayerokAccount", MissingCertificateAccount)
+    recovered = create_playerok_account("token-three-123", "http://127.0.0.1:8080")
+    assert recovered.refreshed is True
+    assert recovered._tmp_cert_path == bot_module.certifi.where()
+
+
+def test_playerok_draft_publication_uses_free_priority(monkeypatch):
+    monkeypatch.setattr(
+        bot_module, "PlayerokItemStatuses", SimpleNamespace(DRAFT="DRAFT")
+    )
+    draft = SimpleNamespace(id="item-1", name="Draft", price=150)
+    published = []
+
+    class Account:
+        def get_my_items(self, **kwargs):
+            assert kwargs["statuses"] == ["DRAFT"]
+            return SimpleNamespace(items=[draft])
+
+        def get_item_priority_statuses(self, item_id, price):
+            assert (item_id, price) == ("item-1", 150)
+            return [SimpleNamespace(id="free", price=0)]
+
+        def publish_item(self, item_id, priority_id):
+            published.append((item_id, priority_id))
+
+    manager = bot_module.RuntimeManager(
+        SimpleNamespace(), SimpleNamespace(), SimpleNamespace()
+    )
+    manager.playerok_runtimes[1] = bot_module.PlayerokRuntime(1, Account())
+    changed, total, errors = asyncio.run(manager.publish_playerok_drafts(1))
+    assert (changed, total, errors) == (1, 1, [])
+    assert published == [("item-1", "free")]
 
 
 def test_conversation_actions_do_not_force_main_menu():
