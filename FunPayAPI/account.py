@@ -219,18 +219,18 @@ class Account:
                   "timeout": self.requests_timeout,
                   "proxies": self.proxy or {},
                   "cookies": cookies}
-        i = 0
         response = None
-        while i < 10 or response.status_code == 429:
-            i += 1
+        for attempt in range(1, 11):
             with self._request_lock:
                 response = self.session.request(url=link, data=payload, allow_redirects=False, **kwargs)
                 self.__update_cookies(response)
             if response.status_code == 429:
                 self.last_429_err_time = time.time()
-                wait = min(2 ** i, 30)
+                if attempt == 10:
+                    break
+                wait = min(2 ** attempt, 30)
                 logger.warning(f"Получен код $YELLOW429 (Too Many Requests)$RESET от FunPay "
-                               f"($YELLOW{link}$RESET). Попытка $YELLOW{i}$RESET, жду $YELLOW{wait}$RESET сек.")
+                               f"($YELLOW{link}$RESET). Попытка $YELLOW{attempt}$RESET, жду $YELLOW{wait}$RESET сек.")
                 time.sleep(wait)
                 continue
             elif not (300 <= response.status_code < 400) or 'Location' not in response.headers:

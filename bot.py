@@ -88,6 +88,8 @@ PLUGIN_CATALOG_DESCRIPTION_MIN = 40
 PLUGIN_CATALOG_DESCRIPTION_MAX = 2000
 PLAYEROK_POLL_SECONDS = 20
 PLAYEROK_AUTO_PUBLISH_SECONDS = 300
+PLUGIN_STOP_TIMEOUT = 10
+PLUGIN_LOAD_TIMEOUT = 20
 
 
 @dataclass(frozen=True, slots=True)
@@ -2631,6 +2633,48 @@ class RuntimeManager:
         self.plugins = PluginManager(db, bot)
         self.playerok_plugins = PlayerokPluginManager(db, bot)
 
+    async def _reload_funpay_plugins(
+        self, telegram_id: int, runtime: AccountRuntime
+    ) -> None:
+        """Перезапускает плагины, не позволяя их хукам блокировать подключение аккаунта."""
+        if telegram_id in self.plugins.runtimes:
+            try:
+                await asyncio.wait_for(
+                    self.plugins.stop_runtime(telegram_id),
+                    timeout=PLUGIN_STOP_TIMEOUT,
+                )
+            except TimeoutError:
+                logger.warning(
+                    "Остановка FunPay-плагинов пользователя %s превысила тайм-аут",
+                    telegram_id,
+                )
+                self.plugins.runtimes.pop(telegram_id, None)
+            except Exception:
+                logger.exception(
+                    "Не удалось остановить FunPay-плагины пользователя %s",
+                    telegram_id,
+                )
+                self.plugins.runtimes.pop(telegram_id, None)
+        try:
+            await asyncio.wait_for(
+                self.plugins.load_runtime(telegram_id, runtime),
+                timeout=PLUGIN_LOAD_TIMEOUT,
+            )
+        except TimeoutError:
+            logger.warning(
+                "Запуск FunPay-плагинов пользователя %s превысил тайм-аут; "
+                "основной runtime продолжит работу без них",
+                telegram_id,
+            )
+            self.plugins.runtimes.pop(telegram_id, None)
+        except Exception:
+            logger.exception(
+                "Не удалось запустить FunPay-плагины пользователя %s; "
+                "основной runtime продолжит работу без них",
+                telegram_id,
+            )
+            self.plugins.runtimes.pop(telegram_id, None)
+
     async def start_saved(self) -> None:
         self.loop = asyncio.get_running_loop()
         for row in await self.db.active_users():
@@ -3155,10 +3199,8 @@ class RuntimeManager:
         )
         self.funpay_account_runtimes[account_key] = runtime
         if make_active or telegram_id not in self.runtimes:
-            if telegram_id in self.plugins.runtimes:
-                await self.plugins.stop_runtime(telegram_id)
             self.runtimes[telegram_id] = runtime
-            await self.plugins.load_runtime(telegram_id, runtime)
+            await self._reload_funpay_plugins(telegram_id, runtime)
         runtime.tasks = [
             asyncio.create_task(asyncio.to_thread(runner.loop, runtime.stop_event)),
             asyncio.create_task(asyncio.to_thread(self._listen, runtime)),
@@ -3357,10 +3399,8 @@ class RuntimeManager:
                 runtime = await self.start(
                     telegram_id, row=account_row, make_active=False
                 )
-            if telegram_id in self.plugins.runtimes:
-                await self.plugins.stop_runtime(telegram_id)
             self.runtimes[telegram_id] = runtime
-            await self.plugins.load_runtime(telegram_id, runtime)
+            await self._reload_funpay_plugins(telegram_id, runtime)
             return runtime
         runtime = self.playerok_account_runtimes.get(account_id)
         if not runtime:
@@ -4250,12 +4290,21 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
                 "Отправьте golden_key повторно либо начните заново через /cancel и /start."
             )
             return
-        account_row = await db.save_account(
-            message.from_user.id,
-            secrets.encrypt(proxy),
-            secrets.encrypt(golden_key),
-            account,
-        )
+        try:
+            account_row = await db.save_account(
+                message.from_user.id,
+                secrets.encrypt(proxy),
+                secrets.encrypt(golden_key),
+                account,
+            )
+        except Exception:
+            logger.exception("FunPay-аккаунт проверен, но не сохранён")
+            await state.clear()
+            await wait_message.edit_text(
+                "❌ Авторизация FunPay прошла, но сохранить аккаунт не удалось. "
+                "Попробуйте подключить его ещё раз через /start."
+            )
+            return
         try:
             await manager.start(
                 message.from_user.id, row=account_row, account=account

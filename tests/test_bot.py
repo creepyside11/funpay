@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
+import requests
 
 import bot as bot_module
 from bot import (
@@ -37,7 +38,8 @@ from bot import (
     validate_catalog_description,
     within_work_hours,
 )
-from FunPayAPI import Runner, types
+import FunPayAPI.account as funpay_account_module
+from FunPayAPI import Account, Runner, exceptions as fp_exceptions, types
 from playerok_plugin_system import (
     PLAYEROK_READY_PLUGINS,
     PlayerokPluginManager,
@@ -70,6 +72,34 @@ def test_normalize_proxy_rejects_invalid_values(value):
 
 def test_proxy_label_hides_credentials():
     assert proxy_label("http://secret:password@example.org:8080") == "http://example.org:8080"
+
+
+def test_funpay_429_retries_are_bounded(monkeypatch):
+    calls = []
+    response = requests.Response()
+    response.status_code = 429
+    response._content = b"rate limited"
+    response.request = requests.Request("GET", "https://funpay.com/").prepare()
+
+    account = Account("golden-key-value")
+
+    def request(**kwargs):
+        calls.append(kwargs)
+        return response
+
+    monkeypatch.setattr(account.session, "request", request)
+    monkeypatch.setattr(funpay_account_module.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(fp_exceptions.RequestFailedError):
+        account.method(
+            "get",
+            "https://funpay.com/",
+            {},
+            {},
+            raise_not_200=True,
+        )
+
+    assert len(calls) == 10
 
 
 def test_secret_box_round_trip_and_no_plaintext():
@@ -273,6 +303,89 @@ def test_additional_notification_copies_do_not_include_owner_buttons():
     assert sent[0][2]["reply_markup"] is markup
     assert sent[1][0] == -10020
     assert "reply_markup" not in sent[1][2]
+
+
+def test_funpay_plugin_timeout_does_not_block_runtime(monkeypatch):
+    class HangingPlugins:
+        def __init__(self):
+            self.runtimes = {}
+            self.started = False
+
+        async def load_runtime(self, _telegram_id, _runtime):
+            self.started = True
+            await asyncio.Event().wait()
+
+    manager = bot_module.RuntimeManager(
+        SimpleNamespace(), SimpleNamespace(), SimpleNamespace()
+    )
+    plugins = HangingPlugins()
+    manager.plugins = plugins
+    monkeypatch.setattr(bot_module, "PLUGIN_LOAD_TIMEOUT", 0.01)
+
+    runtime = SimpleNamespace()
+    asyncio.run(manager._reload_funpay_plugins(10, runtime))
+
+    assert plugins.started is True
+    assert plugins.runtimes == {}
+
+
+def test_funpay_save_error_finishes_connection_dialog(monkeypatch):
+    edits = []
+
+    class FakeAccount:
+        id = 50
+        username = "Seller"
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def get(self):
+            return self
+
+    class FakeDatabase:
+        async def save_account(self, *_args):
+            raise RuntimeError("database unavailable")
+
+    class FakeState:
+        cleared = False
+
+        async def get_data(self):
+            return {"proxy": "http://127.0.0.1:8080"}
+
+        async def clear(self):
+            self.cleared = True
+
+    class WaitMessage:
+        async def edit_text(self, text):
+            edits.append(text)
+
+    class FakeMessage:
+        text = "golden-key-value-123456"
+        from_user = SimpleNamespace(id=10)
+
+        async def delete(self):
+            pass
+
+        async def answer(self, _text):
+            return WaitMessage()
+
+    monkeypatch.setattr(bot_module, "Account", FakeAccount)
+    router = bot_module.build_router(
+        FakeDatabase(),
+        SimpleNamespace(),
+        SimpleNamespace(encrypt=lambda value: f"encrypted:{value}"),
+    )
+    handler = next(
+        item.callback
+        for item in router.message.handlers
+        if item.callback.__name__ == "accept_golden_key"
+    )
+    state = FakeState()
+
+    asyncio.run(handler(FakeMessage(), state))
+
+    assert state.cleared is True
+    assert edits and "сохранить аккаунт не удалось" in edits[-1]
 
 
 def test_cardinal_command_reply_matches_exact_message():
