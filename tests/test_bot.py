@@ -102,6 +102,21 @@ def test_funpay_429_retries_are_bounded(monkeypatch):
     assert len(calls) == 10
 
 
+def test_funpay_407_has_actionable_proxy_message():
+    response = requests.Response()
+    response.status_code = 407
+    response._content = b"proxy authentication required"
+    response.request = requests.Request("GET", "https://funpay.com/").prepare()
+
+    message = bot_module.funpay_connection_error_message(
+        fp_exceptions.RequestFailedError(response)
+    )
+
+    assert "407" in message
+    assert "логин" in message
+    assert "пароль" in message
+
+
 def test_secret_box_round_trip_and_no_plaintext():
     box = SecretBox("test-secret")
     encrypted = box.encrypt("golden-key-value")
@@ -327,6 +342,101 @@ def test_funpay_plugin_timeout_does_not_block_runtime(monkeypatch):
 
     assert plugins.started is True
     assert plugins.runtimes == {}
+
+
+def test_saved_accounts_start_in_background():
+    started = asyncio.Event()
+    row = {
+        "id": 7,
+        "telegram_id": 10,
+        "label": "Seller",
+        "external_id": "50",
+    }
+
+    class FakeDatabase:
+        async def active_users(self):
+            return [row]
+
+        async def active_playerok_users(self):
+            return []
+
+        async def get_user(self, _telegram_id):
+            return {
+                "active_funpay_account_id": 7,
+                "notify_system": False,
+            }
+
+    manager = bot_module.RuntimeManager(
+        SimpleNamespace(), FakeDatabase(), SimpleNamespace()
+    )
+
+    async def hanging_start(*_args, **_kwargs):
+        started.set()
+        await asyncio.Event().wait()
+
+    manager.start = hanging_start
+
+    async def scenario():
+        await asyncio.wait_for(manager.start_saved(), timeout=0.2)
+        await asyncio.wait_for(started.wait(), timeout=0.2)
+        assert manager.connection_tasks
+        await manager.close()
+
+    asyncio.run(scenario())
+
+
+def test_start_command_answers_before_reconnecting_accounts():
+    events = []
+    account = {"id": 7, "label": "Seller"}
+
+    class FakeDatabase:
+        async def ensure_user(self, _telegram_id):
+            pass
+
+        async def get_user(self, _telegram_id):
+            return {"active_marketplace": "funpay"}
+
+        async def list_marketplace_accounts(self, _telegram_id, marketplace):
+            return [account] if marketplace == "funpay" else []
+
+        async def get_active_marketplace_account(self, _telegram_id, marketplace):
+            return account if marketplace == "funpay" else None
+
+    class FakeManager:
+        funpay_account_runtimes = {}
+        playerok_account_runtimes = {}
+
+        def get(self, _telegram_id):
+            return None
+
+        def get_playerok(self, _telegram_id):
+            return None
+
+        def start_account_in_background(self, *_args):
+            events.append("connect")
+
+    class FakeState:
+        async def clear(self):
+            pass
+
+    class FakeMessage:
+        from_user = SimpleNamespace(id=10)
+
+        async def answer(self, _text, **_kwargs):
+            events.append("answer")
+
+    router = bot_module.build_router(
+        FakeDatabase(), FakeManager(), SimpleNamespace()
+    )
+    handler = next(
+        item.callback
+        for item in router.message.handlers
+        if item.callback.__name__ == "start"
+    )
+
+    asyncio.run(handler(FakeMessage(), FakeState()))
+
+    assert events == ["answer", "connect"]
 
 
 def test_funpay_save_error_finishes_connection_dialog(monkeypatch):

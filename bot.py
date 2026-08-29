@@ -1979,6 +1979,16 @@ def proxy_label(proxy: str) -> str:
     return f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"
 
 
+def funpay_connection_error_message(exc: BaseException) -> str:
+    """Возвращает безопасную подсказку без вывода прокси-логина и пароля."""
+    if getattr(exc, "status_code", None) == 407 or "407" in str(exc):
+        return (
+            "Прокси отклонил авторизацию (ошибка 407). Проверьте логин, пароль, "
+            "тип прокси и разрешённый IP у провайдера."
+        )
+    return "FunPay не принял данные. Проверьте доступность прокси и актуальность golden_key."
+
+
 def playerok_proxy_value(proxy: str) -> str:
     parsed = urlsplit(proxy)
     if parsed.scheme.lower() not in {"http", "https"}:
@@ -2632,6 +2642,7 @@ class RuntimeManager:
         self.loop: asyncio.AbstractEventLoop | None = None
         self.plugins = PluginManager(db, bot)
         self.playerok_plugins = PlayerokPluginManager(db, bot)
+        self.connection_tasks: dict[tuple[str, int], asyncio.Task[Any]] = {}
 
     async def _reload_funpay_plugins(
         self, telegram_id: int, runtime: AccountRuntime
@@ -2675,65 +2686,110 @@ class RuntimeManager:
             )
             self.plugins.runtimes.pop(telegram_id, None)
 
+    def start_account_in_background(
+        self,
+        telegram_id: int,
+        marketplace: str,
+        row: Any,
+        *,
+        notify: bool = False,
+    ) -> asyncio.Task[Any]:
+        """Запускает сохранённый аккаунт без блокировки Telegram polling и /start."""
+        account_key = int(row["id"])
+        key = (marketplace, account_key)
+        current = self.connection_tasks.get(key)
+        if current and not current.done():
+            return current
+
+        async def connect() -> None:
+            settings = None
+            try:
+                settings = await self.db.get_user(telegram_id)
+                if marketplace == "funpay":
+                    runtime = await self.start(
+                        telegram_id,
+                        row=row,
+                        make_active=bool(
+                            settings
+                            and int(settings["active_funpay_account_id"] or 0)
+                            == account_key
+                        ),
+                    )
+                    enabled = bool(settings and settings["notify_system"])
+                    success_text = "🟢 FunPay Runner восстановлен после запуска бота."
+                else:
+                    runtime = await self.start_playerok(
+                        telegram_id,
+                        row=row,
+                        make_active=bool(
+                            settings
+                            and int(settings["active_playerok_account_id"] or 0)
+                            == account_key
+                        ),
+                    )
+                    enabled = bool(settings and settings["playerok_notify_system"])
+                    success_text = "🟢 Слежение за аккаунтом восстановлено после запуска бота."
+                if notify and enabled:
+                    await self.safe_notify(
+                        telegram_id,
+                        success_text,
+                        marketplace=marketplace,
+                        account_runtime=runtime,
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.exception(
+                    "Не удалось запустить %s-аккаунт пользователя %s",
+                    marketplace,
+                    telegram_id,
+                )
+                enabled = bool(
+                    settings
+                    and settings[
+                        "notify_system"
+                        if marketplace == "funpay"
+                        else "playerok_notify_system"
+                    ]
+                )
+                if notify and enabled:
+                    if marketplace == "funpay":
+                        error_text = funpay_connection_error_message(exc)
+                    else:
+                        error_text = "Playerok не принял cookie или прокси."
+                    await self.safe_notify(
+                        telegram_id,
+                        f"⚠️ {error_text} Обновите данные аккаунта.",
+                        marketplace=marketplace,
+                        account_name=row["label"],
+                        account_external_id=row["external_id"],
+                    )
+
+        task = asyncio.create_task(
+            connect(), name=f"connect-{marketplace}-{account_key}"
+        )
+        self.connection_tasks[key] = task
+
+        def discard(done: asyncio.Task[Any]) -> None:
+            if self.connection_tasks.get(key) is done:
+                self.connection_tasks.pop(key, None)
+
+        task.add_done_callback(discard)
+        return task
+
     async def start_saved(self) -> None:
         self.loop = asyncio.get_running_loop()
-        for row in await self.db.active_users():
-            user_id = int(row["telegram_id"])
-            settings = await self.db.get_user(user_id)
-            try:
-                runtime = await self.start(
-                    user_id,
-                    row=row,
-                    make_active=bool(
-                        settings
-                        and int(settings["active_funpay_account_id"] or 0) == int(row["id"])
-                    ),
+        funpay_rows, playerok_rows = await asyncio.gather(
+            self.db.active_users(), self.db.active_playerok_users()
+        )
+        for marketplace, rows in (
+            ("funpay", funpay_rows),
+            ("playerok", playerok_rows),
+        ):
+            for row in rows:
+                self.start_account_in_background(
+                    int(row["telegram_id"]), marketplace, row, notify=True
                 )
-                if settings and settings["notify_system"]:
-                    await self.safe_notify(
-                        user_id,
-                        "🟢 FunPay Runner восстановлен после запуска бота.",
-                        account_runtime=runtime,
-                    )
-            except Exception:
-                logger.exception("Не удалось запустить FunPay-аккаунт пользователя %s", user_id)
-                if settings and settings["notify_system"]:
-                    await self.safe_notify(
-                        user_id,
-                        "⚠️ Не удалось восстановить подключение к FunPay. "
-                        "Нажмите «Переподключить» или обновите данные.",
-                        account_name=row["label"],
-                        account_external_id=row["external_id"],
-                    )
-        for row in await self.db.active_playerok_users():
-            user_id = int(row["telegram_id"])
-            settings = await self.db.get_user(user_id)
-            try:
-                runtime = await self.start_playerok(
-                    user_id,
-                    row=row,
-                    make_active=bool(
-                        settings
-                        and int(settings["active_playerok_account_id"] or 0) == int(row["id"])
-                    ),
-                )
-                if settings and settings["playerok_notify_system"]:
-                    await self.safe_notify(
-                        user_id,
-                        "🟢 Слежение за аккаунтом восстановлено после запуска бота.",
-                        marketplace="playerok",
-                        account_runtime=runtime,
-                    )
-            except Exception:
-                logger.exception("Не удалось запустить Playerok-аккаунт пользователя %s", user_id)
-                if settings and settings["playerok_notify_system"]:
-                    await self.safe_notify(
-                        user_id,
-                        "⚠️ Не удалось восстановить Playerok. Обновите cookie или прокси.",
-                        marketplace="playerok",
-                        account_name=row["label"],
-                        account_external_id=row["external_id"],
-                    )
 
     async def start_playerok(
         self,
@@ -3185,7 +3241,7 @@ class RuntimeManager:
                 proxy=proxy_dict(proxy),
                 locale="ru",
             )
-            await asyncio.to_thread(account.get)
+            await asyncio.wait_for(asyncio.to_thread(account.get), timeout=45)
         settings = await self.db.get_user(telegram_id)
         runner = Runner(account)
         runtime = AccountRuntime(
@@ -3382,6 +3438,12 @@ class RuntimeManager:
             await asyncio.gather(runtime.task, return_exceptions=True)
 
     async def close(self) -> None:
+        connection_tasks = list(self.connection_tasks.values())
+        for task in connection_tasks:
+            task.cancel()
+        if connection_tasks:
+            await asyncio.gather(*connection_tasks, return_exceptions=True)
+        self.connection_tasks.clear()
         for account_key in list(self.funpay_account_runtimes):
             await self.stop_funpay_account(account_key)
         for account_key in list(self.playerok_account_runtimes):
@@ -4195,19 +4257,19 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
     async def start(message: Message, state: FSMContext) -> None:
         await state.clear()
         await db.ensure_user(message.from_user.id)
-        for marketplace, runtimes, starter in (
-            ("funpay", manager.funpay_account_runtimes, manager.start),
-            ("playerok", manager.playerok_account_runtimes, manager.start_playerok),
-        ):
-            active = await db.get_active_marketplace_account(
-                message.from_user.id, marketplace
-            )
-            if active and int(active["id"]) not in runtimes:
-                try:
-                    await starter(message.from_user.id, row=active)
-                except Exception:
-                    logger.exception("Ручной запуск %s не удался", marketplace)
+        active_accounts = await asyncio.gather(
+            db.get_active_marketplace_account(message.from_user.id, "funpay"),
+            db.get_active_marketplace_account(message.from_user.id, "playerok"),
+        )
         await show_main(message, message.from_user.id)
+        for marketplace, runtimes, active in (
+            ("funpay", manager.funpay_account_runtimes, active_accounts[0]),
+            ("playerok", manager.playerok_account_runtimes, active_accounts[1]),
+        ):
+            if active and int(active["id"]) not in runtimes:
+                manager.start_account_in_background(
+                    message.from_user.id, marketplace, active
+                )
 
     @router.message(Command("cancel"))
     async def cancel(message: Message, state: FSMContext) -> None:
@@ -4286,7 +4348,7 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
         except Exception as exc:  # noqa: BLE001 - FunPay/requests raises several unrelated network exceptions.
             logger.warning("Проверка аккаунта не пройдена: %s", type(exc).__name__)
             await wait_message.edit_text(
-                "❌ FunPay не принял данные. Проверьте доступность прокси и актуальность golden_key.\n"
+                f"❌ {funpay_connection_error_message(exc)}\n"
                 "Отправьте golden_key повторно либо начните заново через /cancel и /start."
             )
             return
@@ -9007,9 +9069,11 @@ BIND_TO_NEW_MESSAGE = [on_message]
             if not account_row:
                 raise RuntimeError("аккаунт не найден")
             await manager.start(callback.from_user.id, row=account_row)
-        except Exception:
+        except Exception as exc:
             logger.exception("Переподключение не удалось")
-            await callback.message.answer("❌ Переподключиться не удалось. Проверьте прокси и golden_key.")
+            await callback.message.answer(
+                f"❌ Переподключиться не удалось. {funpay_connection_error_message(exc)}"
+            )
             return
         await callback.message.answer("✅ Подключение восстановлено.")
         await show_main(callback.message, callback.from_user.id)
