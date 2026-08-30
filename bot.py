@@ -31,6 +31,7 @@ from aiogram.types import (
     BotCommand,
     BufferedInputFile,
     CallbackQuery,
+    ErrorEvent,
     FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -2841,13 +2842,22 @@ class RuntimeManager:
                         error_text = funpay_connection_error_message(exc)
                     else:
                         error_text = "Playerok не принял cookie или прокси."
-                    await self.safe_notify(
-                        telegram_id,
-                        f"⚠️ {error_text} Обновите данные аккаунта.",
-                        marketplace=marketplace,
-                        account_name=row["label"],
-                        account_external_id=row["external_id"],
-                    )
+                    try:
+                        await self.safe_notify(
+                            telegram_id,
+                            f"⚠️ {error_text} Обновите данные аккаунта.",
+                            marketplace=marketplace,
+                            account_name=row["label"],
+                            account_external_id=row["external_id"],
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.exception(
+                            "Не удалось сообщить об ошибке подключения %s пользователю %s",
+                            marketplace,
+                            telegram_id,
+                        )
 
         task = asyncio.create_task(
             connect(), name=f"connect-{marketplace}-{account_key}"
@@ -2855,6 +2865,17 @@ class RuntimeManager:
         self.connection_tasks[key] = task
 
         def discard(done: asyncio.Task[Any]) -> None:
+            try:
+                error = done.exception()
+            except asyncio.CancelledError:
+                error = None
+            if error is not None:
+                logger.error(
+                    "Необработанная ошибка фонового подключения %s аккаунта %s",
+                    marketplace,
+                    account_key,
+                    exc_info=(type(error), error, error.__traceback__),
+                )
             if self.connection_tasks.get(key) is done:
                 self.connection_tasks.pop(key, None)
 
@@ -2863,17 +2884,41 @@ class RuntimeManager:
 
     async def start_saved(self) -> None:
         self.loop = asyncio.get_running_loop()
+
+        async def load_rows(marketplace: str) -> list[Any]:
+            try:
+                if marketplace == "funpay":
+                    return list(await self.db.active_users())
+                return list(await self.db.active_playerok_users())
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "Не удалось получить сохранённые %s-аккаунты; бот продолжит запуск",
+                    marketplace,
+                )
+                return []
+
         funpay_rows, playerok_rows = await asyncio.gather(
-            self.db.active_users(), self.db.active_playerok_users()
+            load_rows("funpay"), load_rows("playerok")
         )
         for marketplace, rows in (
             ("funpay", funpay_rows),
             ("playerok", playerok_rows),
         ):
             for row in rows:
-                self.start_account_in_background(
-                    int(row["telegram_id"]), marketplace, row, notify=True
-                )
+                try:
+                    self.start_account_in_background(
+                        int(row["telegram_id"]), marketplace, row, notify=True
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception(
+                        "Не удалось запланировать восстановление %s-аккаунта; "
+                        "остальные аккаунты продолжат запуск",
+                        marketplace,
+                    )
 
     async def start_playerok(
         self,
@@ -3285,13 +3330,22 @@ class RuntimeManager:
                 runtime.poll_failures += 1
                 logger.exception("Ошибка Playerok polling для %s", runtime.telegram_id)
                 if runtime.poll_failures in {1, 15}:
-                    row = await self.db.get_user(runtime.telegram_id)
-                    if row and row["playerok_notify_system"]:
-                        await self.safe_notify(
+                    try:
+                        row = await self.db.get_user(runtime.telegram_id)
+                        if row and row["playerok_notify_system"]:
+                            await self.safe_notify(
+                                runtime.telegram_id,
+                                f"⚠️ Ошибка проверки Playerok: {html.escape(clipped(exc, 400))}",
+                                marketplace="playerok",
+                                account_runtime=runtime,
+                            )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.exception(
+                            "Не удалось обработать ошибку Playerok polling для %s; "
+                            "цикл продолжит работу",
                             runtime.telegram_id,
-                            f"⚠️ Ошибка проверки Playerok: {html.escape(clipped(exc, 400))}",
-                            marketplace="playerok",
-                            account_runtime=runtime,
                         )
             try:
                 await asyncio.wait_for(
@@ -4259,6 +4313,34 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
     router.message.filter(F.chat.type == ChatType.PRIVATE)
     router.callback_query.filter(F.message.chat.type == ChatType.PRIVATE)
 
+    @router.errors()
+    async def isolate_update_error(event: ErrorEvent) -> bool:
+        """Не позволяет ошибке отдельного входа или callback остановить polling бота."""
+        exc = event.exception
+        logger.error(
+            "Необработанная ошибка Telegram update",
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+        callback = event.update.callback_query
+        target = event.update.message or (callback.message if callback else None)
+        if callback:
+            try:
+                await callback.answer()
+            except Exception:
+                pass
+        if target and hasattr(target, "answer"):
+            try:
+                await target.answer(
+                    "❌ Операция завершилась с ошибкой, но бот продолжает работать. "
+                    "Проверьте данные и попробуйте ещё раз."
+                )
+            except Exception:
+                logger.warning(
+                    "Не удалось отправить пользователю сообщение об ошибке update",
+                    exc_info=True,
+                )
+        return True
+
     async def show_main(target: Message, user_id: int, text: str = "Выберите действие:") -> None:
         row = await db.get_user(user_id)
         funpay_accounts = await db.list_marketplace_accounts(user_id, "funpay")
@@ -4530,20 +4612,21 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
                 f"и защита не запросила новую __ddg5_.\n\nОшибка: <code>{html.escape(clipped(exc, 500))}</code>"
             )
             return
-        account_row = await db.save_playerok_account(
-            message.from_user.id,
-            secrets.encrypt(proxy),
-            secrets.encrypt(cookie),
-            account,
-        )
         try:
+            account_row = await db.save_playerok_account(
+                message.from_user.id,
+                secrets.encrypt(proxy),
+                secrets.encrypt(cookie),
+                account,
+            )
             await manager.start_playerok(
                 message.from_user.id, row=account_row, account=account
             )
         except Exception:
-            logger.exception("Playerok сохранён, но polling не запустился")
+            logger.exception("Подключение Playerok не завершено")
             await wait_message.edit_text(
-                "⚠️ Playerok сохранён, но слежение не запустилось. Попробуйте переподключить."
+                "❌ Подключить Playerok не удалось, но бот продолжает работать. "
+                "Проверьте данные и попробуйте ещё раз."
             )
             await state.clear()
             return
@@ -4632,21 +4715,22 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
                 f"Ошибка: <code>{html.escape(clipped(exc, 450))}</code>"
             )
             return
-        account_row = await db.save_playerok_account(
-            message.from_user.id,
-            secrets.encrypt(proxy),
-            secrets.encrypt(cookie),
-            account,
-            auth_method="email",
-        )
         try:
+            account_row = await db.save_playerok_account(
+                message.from_user.id,
+                secrets.encrypt(proxy),
+                secrets.encrypt(cookie),
+                account,
+                auth_method="email",
+            )
             await manager.start_playerok(
                 message.from_user.id, row=account_row, account=account
             )
         except Exception:
-            logger.exception("Playerok email-аккаунт сохранён, но polling не запустился")
+            logger.exception("Подключение Playerok по email не завершено")
             await wait_message.edit_text(
-                "⚠️ Аккаунт сохранён, но слежение не запустилось. Попробуйте переподключить."
+                "❌ Подключить Playerok не удалось, но бот продолжает работать. "
+                "Проверьте данные и попробуйте ещё раз."
             )
             await state.clear()
             return
@@ -9571,8 +9655,16 @@ async def main() -> None:
         BotCommand(command="start", description="Открыть меню"),
         BotCommand(command="cancel", description="Отменить текущее действие"),
     ])
-    await manager.start_saved()
     try:
+        try:
+            await manager.start_saved()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "Восстановление сохранённых аккаунтов завершилось с ошибкой; "
+                "Telegram polling всё равно будет запущен"
+            )
         await dispatcher.start_polling(bot, allowed_updates=dispatcher.resolve_used_update_types())
     finally:
         await manager.close()

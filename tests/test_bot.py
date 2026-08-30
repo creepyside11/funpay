@@ -386,6 +386,198 @@ def test_saved_accounts_start_in_background():
     asyncio.run(scenario())
 
 
+def test_failed_saved_playerok_login_does_not_escape_background_task():
+    row = {
+        "id": 8,
+        "telegram_id": 10,
+        "label": "Broken Playerok",
+        "external_id": "playerok-50",
+    }
+
+    class FakeDatabase:
+        async def active_users(self):
+            return []
+
+        async def active_playerok_users(self):
+            return [row]
+
+        async def get_user(self, _telegram_id):
+            return {
+                "active_playerok_account_id": 8,
+                "playerok_notify_system": True,
+            }
+
+    manager = bot_module.RuntimeManager(
+        SimpleNamespace(), FakeDatabase(), SimpleNamespace()
+    )
+
+    async def failed_login(*_args, **_kwargs):
+        raise RuntimeError("invalid Playerok cookie")
+
+    async def failed_notification(*_args, **_kwargs):
+        raise RuntimeError("Telegram unavailable")
+
+    manager.start_playerok = failed_login
+    manager.safe_notify = failed_notification
+
+    async def scenario():
+        await manager.start_saved()
+        tasks = list(manager.connection_tasks.values())
+        assert len(tasks) == 1
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.sleep(0)
+        return results
+
+    results = asyncio.run(scenario())
+
+    assert results == [None]
+    assert manager.connection_tasks == {}
+
+
+def test_saved_playerok_query_failure_does_not_block_startup():
+    class FakeDatabase:
+        async def active_users(self):
+            return []
+
+        async def active_playerok_users(self):
+            raise RuntimeError("playerok query failed")
+
+    manager = bot_module.RuntimeManager(
+        SimpleNamespace(), FakeDatabase(), SimpleNamespace()
+    )
+
+    asyncio.run(manager.start_saved())
+
+    assert manager.connection_tasks == {}
+
+
+def test_playerok_polling_survives_failure_in_error_reporting(monkeypatch):
+    database_calls = 0
+    snapshot_calls = 0
+
+    class FakeDatabase:
+        async def get_user(self, _telegram_id):
+            nonlocal database_calls
+            database_calls += 1
+            if database_calls % 2 == 0:
+                raise RuntimeError("database unavailable while reporting")
+            return {
+                "playerok_active": True,
+                "playerok_notify_system": True,
+            }
+
+    manager = bot_module.RuntimeManager(
+        SimpleNamespace(), FakeDatabase(), SimpleNamespace()
+    )
+    runtime = bot_module.PlayerokRuntime(
+        10,
+        SimpleNamespace(id="playerok-50", username="Seller"),
+    )
+
+    async def failed_snapshot(_runtime):
+        nonlocal snapshot_calls
+        snapshot_calls += 1
+        if snapshot_calls == 2:
+            runtime.stop_event.set()
+        raise RuntimeError("Playerok unavailable")
+
+    manager._playerok_snapshot = failed_snapshot
+    monkeypatch.setattr(bot_module, "PLAYEROK_POLL_SECONDS", 0.01)
+
+    asyncio.run(asyncio.wait_for(manager._playerok_poll_loop(runtime), timeout=0.2))
+
+    assert snapshot_calls == 2
+    assert runtime.poll_failures == 2
+
+
+def test_router_error_boundary_keeps_update_handled():
+    replies = []
+
+    class FakeMessage:
+        async def answer(self, text):
+            replies.append(text)
+
+    router = bot_module.build_router(
+        SimpleNamespace(), SimpleNamespace(), SimpleNamespace()
+    )
+    handler = router.error.handlers[0].callback
+    exc = RuntimeError("Playerok login failed")
+    event = SimpleNamespace(
+        exception=exc,
+        update=SimpleNamespace(message=FakeMessage(), callback_query=None),
+    )
+
+    handled = asyncio.run(handler(event))
+
+    assert handled is True
+    assert replies and "бот продолжает работать" in replies[-1]
+
+
+def test_main_starts_polling_when_saved_account_restore_crashes(monkeypatch):
+    events = []
+
+    class FakeDatabase:
+        async def connect(self):
+            events.append("database-connect")
+
+        async def close(self):
+            events.append("database-close")
+
+    class FakeSession:
+        async def close(self):
+            events.append("bot-close")
+
+    class FakeBot:
+        def __init__(self, *_args, **_kwargs):
+            self.session = FakeSession()
+
+        async def set_my_commands(self, _commands):
+            events.append("commands")
+
+    class FakeManager:
+        def __init__(self, *_args):
+            pass
+
+        async def start_saved(self):
+            events.append("restore")
+            raise RuntimeError("invalid saved Playerok account")
+
+        async def close(self):
+            events.append("manager-close")
+
+    class FakeDispatcher:
+        def include_router(self, _router):
+            pass
+
+        @staticmethod
+        def resolve_used_update_types():
+            return []
+
+        async def start_polling(self, _bot, **_kwargs):
+            events.append("polling")
+
+    monkeypatch.setattr(
+        bot_module.Config,
+        "from_env",
+        staticmethod(
+            lambda: SimpleNamespace(
+                database_url="postgresql://test",
+                bot_token="test-token",
+                app_secret="test-secret",
+            )
+        ),
+    )
+    monkeypatch.setattr(bot_module, "Database", lambda _url: FakeDatabase())
+    monkeypatch.setattr(bot_module, "Bot", FakeBot)
+    monkeypatch.setattr(bot_module, "RuntimeManager", FakeManager)
+    monkeypatch.setattr(bot_module, "Dispatcher", FakeDispatcher)
+
+    asyncio.run(bot_module.main())
+
+    assert events.index("restore") < events.index("polling")
+    assert events[-3:] == ["manager-close", "database-close", "bot-close"]
+
+
 def test_start_command_answers_before_reconnecting_accounts():
     events = []
     account = {"id": 7, "label": "Seller"}
@@ -497,6 +689,68 @@ def test_funpay_save_error_finishes_connection_dialog(monkeypatch):
 
     assert state.cleared is True
     assert edits and "сохранить аккаунт не удалось" in edits[-1]
+
+
+def test_playerok_save_error_isolated_from_bot(monkeypatch):
+    edits = []
+
+    class FakeAccount:
+        id = "playerok-50"
+        username = "Seller"
+
+        def get(self):
+            return self
+
+    class FakeDatabase:
+        async def save_playerok_account(self, *_args, **_kwargs):
+            raise RuntimeError("database unavailable")
+
+    class FakeManager:
+        async def start_playerok(self, *_args, **_kwargs):
+            raise AssertionError("runtime не должен запускаться без сохранённого аккаунта")
+
+    class FakeState:
+        cleared = False
+
+        async def get_data(self):
+            return {"playerok_proxy": "http://127.0.0.1:8080"}
+
+        async def clear(self):
+            self.cleared = True
+
+    class WaitMessage:
+        async def edit_text(self, text):
+            edits.append(text)
+
+    class FakeMessage:
+        text = "token=playerok-cookie-value"
+        from_user = SimpleNamespace(id=10)
+
+        async def delete(self):
+            pass
+
+        async def answer(self, _text):
+            return WaitMessage()
+
+    monkeypatch.setattr(
+        bot_module, "create_playerok_account", lambda *_args: FakeAccount()
+    )
+    router = bot_module.build_router(
+        FakeDatabase(),
+        FakeManager(),
+        SimpleNamespace(encrypt=lambda value: f"encrypted:{value}"),
+    )
+    handler = next(
+        item.callback
+        for item in router.message.handlers
+        if item.callback.__name__ == "accept_playerok_cookie"
+    )
+    state = FakeState()
+
+    asyncio.run(handler(FakeMessage(), state))
+
+    assert state.cleared is True
+    assert edits and "бот продолжает работать" in edits[-1]
 
 
 def test_cardinal_command_reply_matches_exact_message():
