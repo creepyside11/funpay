@@ -194,6 +194,7 @@ BIND_TO_NEW_MESSAGE = [on_message]
 | `DESCRIPTION` | `str` | краткое описание |
 | `CREDITS` | `str` | автор или источник |
 | `SETTINGS_PAGE` | `bool` | показывать постоянную кнопку собственной страницы настроек |
+| `TELETHON` | `bool` | опционально: включить встроенную авторизацию Telegram-аккаунта для плагина |
 | `UUID` | `str` | уникальный канонический UUID4 |
 | `BIND_TO_DELETE` | функция / `None` | очистка данных при удалении |
 
@@ -215,11 +216,42 @@ Telegram callback-handler для стандартного Cardinal callback `47:
 - заказы: `BIND_TO_INIT_ORDER`, `BIND_TO_NEW_ORDER`, `BIND_TO_ORDERS_LIST_CHANGED`,
   `BIND_TO_ORDER_STATUS_CHANGED`;
 - операции: `BIND_TO_PRE_DELIVERY`, `BIND_TO_POST_DELIVERY`,
-  `BIND_TO_PRE_LOTS_RAISE`, `BIND_TO_POST_LOTS_RAISE`.
+  `BIND_TO_PRE_LOTS_RAISE`, `BIND_TO_POST_LOTS_RAISE`;
+- Telethon: `BIND_TO_TELETHON_READY`, `BIND_TO_TELETHON_DISCONNECTED`.
 
 Событийная функция получает `(cardinal, event)`. Обработчики жизненного цикла получают объект
 `cardinal`, а `BIND_TO_DELETE` — `(cardinal, callback)`. Доступны `cardinal.account`,
-`cardinal.runner`, `cardinal.telegram`, `cardinal.plugins` и `cardinal.MAIN_CFG`.
+`cardinal.runner`, `cardinal.telegram`, `cardinal.telethon`, `cardinal.plugins` и `cardinal.MAIN_CFG`.
+
+### Telethon в FunPay-плагинах
+
+Пакет `Telethon==1.44.0` включён в образ. Плагин, которому нужен пользовательский Telegram-аккаунт,
+объявляет `TELETHON = True`. В его карточке появится раздел «Telegram / Telethon» с пошаговым входом:
+
+1. номер телефона в международном формате;
+2. код входа от Telegram;
+3. пароль 2FA, только если он включён на аккаунте.
+
+Код и пароль 2FA удаляются из чата и не записываются в PostgreSQL. Номер и `StringSession`
+шифруются через `APP_SECRET`; отдельная сессия создаётся для каждого пользователя и UUID плагина.
+Поля для ручного ввода `StringSession` нет: бот создаёт её сам после успешного входа.
+После авторизации плагин получает обычный `telethon.TelegramClient`:
+
+```python
+TELETHON = True
+
+
+def telethon_ready(cardinal, client):
+    me = cardinal.telethon.run(client.get_me())
+    cardinal.telegram.send_notification(f"Telethon подключён: {me.id}")
+
+
+BIND_TO_TELETHON_READY = [telethon_ready]
+```
+
+Для любых async-методов используйте `cardinal.telethon.run(client.some_method(...))` из синхронного
+хука. Полный пример событий, отправки сообщений и правила lifecycle находятся в
+`PLUGIN_DEVELOPMENT.md`.
 
 ### Telegram-совместимость
 
@@ -229,8 +261,8 @@ Telegram callback-handler для стандартного Cardinal callback `47:
 фильтры `commands`, `content_types`, `func`, а также базовые `InlineKeyboardButton` и
 `InlineKeyboardMarkup` из `telebot.types`.
 
-Бот поддерживает однофайловый контракт, все 18 имён хуков Cardinal, импорты `cardinal`,
-`FunPayAPI` и базовые `telebot.types`. Плагины, которым нужны дополнительные сторонние
+Бот поддерживает однофайловый контракт, 18 хуков Cardinal и два Telethon lifecycle-хука, импорты `cardinal`,
+`FunPayAPI`, официальный пакет `telethon` и базовые `telebot.types`. Плагины, которым нужны дополнительные сторонние
 Python-пакеты или нестандартные внутренние модули конкретной сборки Cardinal, потребуют добавить
 эти зависимости в образ хостинга.
 
@@ -248,6 +280,8 @@ Python-пакеты или нестандартные внутренние мо�
 | `BOT_TOKEN` | да | токен Telegram-бота от BotFather |
 | `DATABASE_URL` | да | URL PostgreSQL вида `postgresql://user:password@host:5432/db` |
 | `APP_SECRET` | рекомендуется | постоянный секрет для шифрования данных; задайте до первого запуска и не меняйте |
+| `TELETHON_API_ID` | для Telethon | API ID приложения с `my.telegram.org` |
+| `TELETHON_API_HASH` | для Telethon | API hash того же приложения; храните как секрет |
 | `LOG_LEVEL` | нет | уровень логов, по умолчанию `INFO` |
 
 Если `APP_SECRET` не задан, ключ шифрования выводится из `BOT_TOKEN`. После смены токена старые данные подключения тогда перестанут расшифровываться, поэтому на продакшене задайте отдельный длинный `APP_SECRET`.
@@ -292,6 +326,7 @@ python bot.py
 - `bot.py` — aiogram, PostgreSQL, интерфейс, настройки и менеджер фоновых аккаунтов;
 - `PLUGIN_DEVELOPMENT.md` — скачиваемый точный контракт и руководство для создания плагинов человеком или нейросетью;
 - `plugin_system.py`, `cardinal.py`, `telebot/`, `tg_bot/` — совместимый загрузчик и адаптеры плагинов Cardinal;
+- `telethon_plugin.py` — менеджер зашифрованных Telethon-сессий и мост официального клиента в плагины;
 - `PLAYEROK_PLUGIN_DEVELOPMENT.md` — скачиваемый машинно-читаемый контракт Playerok Plugin SDK;
 - `playerok_plugin_system.py` — загрузчик, валидация, хуки, настройки и два официальных Playerok-плагина;
 - `FunPayAPI/` — API и Runner, взятые из FunPayCardinal и адаптированные для управляемой остановки на хостинге;
@@ -301,7 +336,7 @@ python bot.py
 
 ```bash
 pip install -r requirements-dev.txt
-python -m compileall bot.py plugin_system.py cardinal.py telebot tg_bot FunPayAPI
+python -m compileall bot.py plugin_system.py telethon_plugin.py cardinal.py telebot tg_bot FunPayAPI
 pytest -q
 ```
 

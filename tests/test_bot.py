@@ -48,6 +48,7 @@ from playerok_plugin_system import (
     playerok_setting_label,
 )
 from plugin_system import CardinalBotFacade, PluginManager, PluginValidationError
+from telethon_plugin import PluginTelethonService
 from tg_bot import CBT
 
 
@@ -925,6 +926,8 @@ def test_downloadable_plugin_documentation_is_ai_readable():
     assert "Короткая инструкция для нейросети" in text
     assert "BIND_TO_NEW_MESSAGE" in text
     assert "автоответ на отзыв" in text.casefold()
+    assert "номер → код Telegram → пароль 2FA" in text
+    assert "TELETHON = True" in text
     assert "Финальный чек-лист" in text
 
 
@@ -1027,9 +1030,134 @@ BIND_TO_NEW_MESSAGE = [on_message]
     manager.root = tmp_path
     plugin = manager._load_module(1, "test.py", source, True)
     assert plugin.name == "Test"
+    assert plugin.telethon_enabled is False
     assert len(plugin.hooks["BIND_TO_NEW_MESSAGE"]) == 1
     with pytest.raises(PluginValidationError):
         manager._load_module(1, "bad.txt", source, True)
+
+
+def test_cardinal_plugin_can_request_telethon(tmp_path):
+    source = '''
+NAME = "Telethon Test"
+VERSION = "1.0"
+DESCRIPTION = "Plugin"
+CREDITS = "Tester"
+SETTINGS_PAGE = False
+TELETHON = True
+UUID = "12345678-1234-4234-9234-123456789abc"
+BIND_TO_DELETE = None
+BIND_TO_TELETHON_READY = []
+BIND_TO_TELETHON_DISCONNECTED = []
+'''
+    manager = PluginManager(SimpleNamespace(), SimpleNamespace())
+    manager.root = tmp_path
+
+    plugin = manager._load_module(1, "telethon_test.py", source, True)
+
+    assert plugin.telethon_enabled is True
+    assert "BIND_TO_TELETHON_READY" in plugin.hooks
+
+
+def test_telethon_service_encrypts_session_and_bridge_runs_awaitables():
+    saved = {}
+
+    class FakeDatabase:
+        async def save_plugin_telethon_session(self, *args):
+            saved["args"] = args
+
+        async def delete_plugin_telethon_session(self, telegram_id, uuid):
+            saved["deleted"] = (telegram_id, uuid)
+
+    class FakeSecrets:
+        @staticmethod
+        def encrypt(value):
+            return f"encrypted:{value}"
+
+    class FakeSession:
+        @staticmethod
+        def save():
+            return "session-secret"
+
+    class FakeClient:
+        session = FakeSession()
+        disconnected = False
+
+        async def is_user_authorized(self):
+            return True
+
+        async def get_me(self):
+            return SimpleNamespace(id=77, username="tester")
+
+        async def disconnect(self):
+            self.disconnected = True
+
+    async def exercise():
+        service = PluginTelethonService(FakeDatabase(), FakeSecrets())
+        client = FakeClient()
+        me = await service.activate(10, "plugin-uuid", "+79991234567", client)
+        result = await asyncio.to_thread(
+            service.bridge(10).run,
+            asyncio.sleep(0, result="bridge-ok"),
+        )
+        await service.stop_plugin(10, "plugin-uuid", delete_session=True)
+        return me, result, client
+
+    me, result, client = asyncio.run(exercise())
+
+    assert me.id == 77
+    assert result == "bridge-ok"
+    assert saved["args"] == (
+        10,
+        "plugin-uuid",
+        "encrypted:+79991234567",
+        "encrypted:session-secret",
+        77,
+        "tester",
+    )
+    assert saved["deleted"] == (10, "plugin-uuid")
+    assert client.disconnected is True
+
+
+def test_disabling_telethon_plugin_dispatches_before_client_stop():
+    events = []
+    client = object()
+
+    class FakeDatabase:
+        async def set_plugin_enabled(self, telegram_id, uuid, enabled):
+            events.append(("database", telegram_id, uuid, enabled))
+
+    class FakeTelethonService:
+        @staticmethod
+        def get_client(_telegram_id, _uuid):
+            return client
+
+        async def stop_plugin(self, telegram_id, uuid):
+            events.append(("stop", telegram_id, uuid))
+
+    plugin = SimpleNamespace(enabled=True, telethon_enabled=True)
+    manager = PluginManager(
+        FakeDatabase(), SimpleNamespace(), FakeTelethonService()
+    )
+    manager.runtimes[10] = SimpleNamespace(
+        plugins={"plugin-uuid": plugin},
+        adapter=SimpleNamespace(),
+    )
+
+    async def fake_dispatch(telegram_id, hook, *_args, **_kwargs):
+        events.append(("dispatch", hook, plugin.enabled, telegram_id))
+
+    manager.dispatch = fake_dispatch
+
+    enabled = asyncio.run(manager.toggle(10, "plugin-uuid"))
+
+    assert enabled is False
+    assert events[0] == (
+        "dispatch",
+        "BIND_TO_TELETHON_DISCONNECTED",
+        True,
+        10,
+    )
+    assert events[-1] == ("stop", 10, "plugin-uuid")
 
 
 def test_ready_plugins_have_valid_cardinal_sources(tmp_path):

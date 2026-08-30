@@ -54,6 +54,8 @@ HOOK_NAMES = (
     "BIND_TO_POST_DELIVERY",
     "BIND_TO_PRE_LOTS_RAISE",
     "BIND_TO_POST_LOTS_RAISE",
+    "BIND_TO_TELETHON_READY",
+    "BIND_TO_TELETHON_DISCONNECTED",
 )
 
 EVENT_HOOKS = {
@@ -84,6 +86,7 @@ class PluginData:
     settings_page: bool
     delete_handler: Callable[..., Any] | None
     enabled: bool = True
+    telethon_enabled: bool = False
     commands: dict[str, str] = field(default_factory=dict)
     hooks: dict[str, list[Callable[..., Any]]] = field(default_factory=dict)
 
@@ -302,6 +305,11 @@ class CardinalAdapter:
         self.runner = runtime.runner
         self.telegram = telegram
         self.plugin_manager = plugin_manager
+        self.telethon = (
+            plugin_manager.telethon_service.bridge(runtime.telegram_id)
+            if plugin_manager.telethon_service
+            else None
+        )
         self.plugins: dict[str, PluginData] = {}
         self.profile = None
         self.curr_profile = None
@@ -391,9 +399,10 @@ class PluginRuntime:
 class PluginManager:
     """Загрузчик одиночных Python-плагинов формата FunPayCardinal."""
 
-    def __init__(self, db: Any, bot: Any):
+    def __init__(self, db: Any, bot: Any, telethon_service: Any | None = None):
         self.db = db
         self.bot = bot
+        self.telethon_service = telethon_service
         self.runtimes: dict[int, PluginRuntime] = {}
         self.root = Path("plugins_runtime")
 
@@ -514,16 +523,17 @@ class PluginManager:
                     "BIND_TO_DELETE должен быть функцией или None"
                 )
             return PluginData(
-                str(module.NAME),
-                str(module.VERSION),
-                str(module.DESCRIPTION),
-                str(module.CREDITS),
-                uuid,
-                filename,
-                module,
-                bool(module.SETTINGS_PAGE),
-                delete_handler,
-                enabled,
+                name=str(module.NAME),
+                version=str(module.VERSION),
+                description=str(module.DESCRIPTION),
+                credits=str(module.CREDITS),
+                uuid=uuid,
+                filename=filename,
+                module=module,
+                settings_page=bool(module.SETTINGS_PAGE),
+                delete_handler=delete_handler,
+                enabled=enabled,
+                telethon_enabled=bool(getattr(module, "TELETHON", False)),
                 hooks=hooks,
             )
         except PluginValidationError:
@@ -573,10 +583,33 @@ class PluginManager:
                 continue
             plugin_runtime.plugins[plugin.uuid] = plugin
         adapter.plugins = plugin_runtime.plugins
+        if self.telethon_service:
+            for plugin in plugin_runtime.plugins.values():
+                if plugin.enabled and plugin.telethon_enabled:
+                    try:
+                        await self.telethon_service.start_plugin(
+                            telegram_id, plugin.uuid
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Не удалось восстановить Telethon для плагина %s",
+                            plugin.uuid,
+                        )
         await self.dispatch(telegram_id, "BIND_TO_PRE_INIT", adapter)
         await self.dispatch(telegram_id, "BIND_TO_POST_INIT", adapter)
         await self.dispatch(telegram_id, "BIND_TO_PRE_START", adapter)
         await self.dispatch(telegram_id, "BIND_TO_POST_START", adapter)
+        if self.telethon_service:
+            for plugin in plugin_runtime.plugins.values():
+                client = self.telethon_service.get_client(telegram_id, plugin.uuid)
+                if plugin.enabled and plugin.telethon_enabled and client:
+                    await self.dispatch(
+                        telegram_id,
+                        "BIND_TO_TELETHON_READY",
+                        adapter,
+                        client,
+                        only=plugin.uuid,
+                    )
         return plugin_runtime
 
     async def install(
@@ -596,11 +629,29 @@ class PluginManager:
         )
         await self.db.upsert_plugin(telegram_id, plugin, source)
         old = plugin_runtime.plugins.get(plugin.uuid)
+        if (
+            self.telethon_service
+            and old
+            and old.telethon_enabled
+            and not plugin.telethon_enabled
+        ):
+            old_client = self.telethon_service.get_client(telegram_id, plugin.uuid)
+            if old_client:
+                await self.dispatch(
+                    telegram_id,
+                    "BIND_TO_TELETHON_DISCONNECTED",
+                    plugin_runtime.adapter,
+                    old_client,
+                    only=plugin.uuid,
+                )
+            await self.telethon_service.stop_plugin(telegram_id, plugin.uuid)
         if old:
             plugin_runtime.adapter.telegram.bot.unregister_plugin(plugin.uuid)
             sys.modules.pop(old.module.__name__, None)
         plugin_runtime.plugins[plugin.uuid] = plugin
         plugin_runtime.adapter.plugins = plugin_runtime.plugins
+        if self.telethon_service and plugin.telethon_enabled:
+            await self.telethon_service.start_plugin(telegram_id, plugin.uuid)
         if plugin_runtime.adapter.profile is None:
             try:
                 await asyncio.to_thread(
@@ -612,6 +663,16 @@ class PluginManager:
         await self.dispatch(telegram_id, "BIND_TO_POST_INIT", plugin_runtime.adapter, only=plugin.uuid)
         await self.dispatch(telegram_id, "BIND_TO_PRE_START", plugin_runtime.adapter, only=plugin.uuid)
         await self.dispatch(telegram_id, "BIND_TO_POST_START", plugin_runtime.adapter, only=plugin.uuid)
+        if self.telethon_service and plugin.telethon_enabled:
+            client = self.telethon_service.get_client(telegram_id, plugin.uuid)
+            if client:
+                await self.dispatch(
+                    telegram_id,
+                    "BIND_TO_TELETHON_READY",
+                    plugin_runtime.adapter,
+                    client,
+                    only=plugin.uuid,
+                )
         return plugin
 
     async def dispatch(
@@ -677,8 +738,33 @@ class PluginManager:
 
     async def toggle(self, telegram_id: int, uuid: str) -> bool:
         plugin = self.runtimes[telegram_id].plugins[uuid]
-        plugin.enabled = not plugin.enabled
+        next_enabled = not plugin.enabled
+        adapter = self.runtimes[telegram_id].adapter
+        if self.telethon_service and plugin.telethon_enabled and not next_enabled:
+            client = self.telethon_service.get_client(telegram_id, uuid)
+            if client:
+                await self.dispatch(
+                    telegram_id,
+                    "BIND_TO_TELETHON_DISCONNECTED",
+                    adapter,
+                    client,
+                    only=uuid,
+                )
+        plugin.enabled = next_enabled
         await self.db.set_plugin_enabled(telegram_id, uuid, plugin.enabled)
+        if self.telethon_service and plugin.telethon_enabled:
+            if plugin.enabled:
+                client = await self.telethon_service.start_plugin(telegram_id, uuid)
+                if client:
+                    await self.dispatch(
+                        telegram_id,
+                        "BIND_TO_TELETHON_READY",
+                        adapter,
+                        client,
+                        only=uuid,
+                    )
+            else:
+                await self.telethon_service.stop_plugin(telegram_id, uuid)
         return plugin.enabled
 
     async def delete(self, telegram_id: int, uuid: str, callback: Any = None) -> None:
@@ -691,6 +777,19 @@ class PluginManager:
                 )
             except Exception:
                 logger.exception("Ошибка BIND_TO_DELETE плагина %s", plugin.name)
+        if self.telethon_service and plugin and plugin.telethon_enabled:
+            client = self.telethon_service.get_client(telegram_id, uuid)
+            if client and plugin.enabled:
+                await self.dispatch(
+                    telegram_id,
+                    "BIND_TO_TELETHON_DISCONNECTED",
+                    plugin_runtime.adapter,
+                    client,
+                    only=uuid,
+                )
+            await self.telethon_service.stop_plugin(
+                telegram_id, uuid, delete_session=True
+            )
         if plugin_runtime and plugin:
             plugin_runtime.adapter.telegram.bot.unregister_plugin(uuid)
             plugin_runtime.plugins.pop(uuid, None)
@@ -709,4 +808,16 @@ class PluginManager:
         await self.dispatch(
             telegram_id, "BIND_TO_POST_STOP", plugin_runtime.adapter
         )
+        if self.telethon_service:
+            for uuid, plugin in plugin_runtime.plugins.items():
+                client = self.telethon_service.get_client(telegram_id, uuid)
+                if plugin.enabled and plugin.telethon_enabled and client:
+                    await self.dispatch(
+                        telegram_id,
+                        "BIND_TO_TELETHON_DISCONNECTED",
+                        plugin_runtime.adapter,
+                        client,
+                        only=uuid,
+                    )
+            await self.telethon_service.stop_user(telegram_id)
         self.runtimes.pop(telegram_id, None)

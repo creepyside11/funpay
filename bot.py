@@ -37,6 +37,14 @@ from aiogram.types import (
     Message,
 )
 from cryptography.fernet import Fernet, InvalidToken
+from telethon.errors import (
+    FloodWaitError,
+    PasswordHashInvalidError,
+    PhoneCodeExpiredError,
+    PhoneCodeInvalidError,
+    PhoneNumberInvalidError,
+    SessionPasswordNeededError,
+)
 
 from FunPayAPI import Account, Runner, events, types
 from FunPayAPI import exceptions as fp_exceptions
@@ -50,6 +58,7 @@ from playerok_plugin_system import (
     playerok_setting_label,
 )
 from plugin_system import PluginData, PluginManager, PluginValidationError
+from telethon_plugin import PluginTelethonService, TelethonConfigurationError
 
 PLAYEROK_IMPORT_ERROR: ImportError | None = None
 try:
@@ -367,6 +376,19 @@ class Database:
                 setting_value TEXT NOT NULL,
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 PRIMARY KEY (telegram_id, plugin_uuid, setting_key),
+                FOREIGN KEY (telegram_id, plugin_uuid)
+                    REFERENCES funpay_plugins(telegram_id, uuid) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS funpay_plugin_telethon_sessions (
+                telegram_id BIGINT NOT NULL,
+                plugin_uuid TEXT NOT NULL,
+                phone_enc TEXT NOT NULL,
+                session_enc TEXT NOT NULL,
+                telegram_user_id BIGINT NOT NULL,
+                telegram_username TEXT,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (telegram_id, plugin_uuid),
                 FOREIGN KEY (telegram_id, plugin_uuid)
                     REFERENCES funpay_plugins(telegram_id, uuid) ON DELETE CASCADE
             );
@@ -1150,6 +1172,60 @@ class Database:
             uuid,
             key,
             value,
+        )
+
+    async def get_plugin_telethon_session(
+        self, telegram_id: int, uuid: str
+    ) -> asyncpg.Record | None:
+        return await self.fetchrow(
+            """
+            SELECT * FROM funpay_plugin_telethon_sessions
+             WHERE telegram_id=$1 AND plugin_uuid=$2
+            """,
+            telegram_id,
+            uuid,
+        )
+
+    async def save_plugin_telethon_session(
+        self,
+        telegram_id: int,
+        uuid: str,
+        phone_enc: str,
+        session_enc: str,
+        telegram_user_id: int,
+        telegram_username: str | None,
+    ) -> None:
+        await self.execute(
+            """
+            INSERT INTO funpay_plugin_telethon_sessions
+                (telegram_id, plugin_uuid, phone_enc, session_enc,
+                 telegram_user_id, telegram_username, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, NOW())
+            ON CONFLICT (telegram_id, plugin_uuid) DO UPDATE
+                SET phone_enc=EXCLUDED.phone_enc,
+                    session_enc=EXCLUDED.session_enc,
+                    telegram_user_id=EXCLUDED.telegram_user_id,
+                    telegram_username=EXCLUDED.telegram_username,
+                    updated_at=NOW()
+            """,
+            telegram_id,
+            uuid,
+            phone_enc,
+            session_enc,
+            telegram_user_id,
+            telegram_username,
+        )
+
+    async def delete_plugin_telethon_session(
+        self, telegram_id: int, uuid: str
+    ) -> None:
+        await self.execute(
+            """
+            DELETE FROM funpay_plugin_telethon_sessions
+             WHERE telegram_id=$1 AND plugin_uuid=$2
+            """,
+            telegram_id,
+            uuid,
         )
 
     async def seed_official_playerok_plugins(self) -> None:
@@ -1979,6 +2055,13 @@ def proxy_label(proxy: str) -> str:
     return f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"
 
 
+def masked_phone(phone: str) -> str:
+    digits = re.sub(r"\D", "", phone)
+    if len(digits) < 5:
+        return "скрыт"
+    return f"+{digits[:2]}{'•' * max(3, len(digits) - 4)}{digits[-2:]}"
+
+
 def funpay_connection_error_message(exc: BaseException) -> str:
     """Возвращает безопасную подсказку без вывода прокси-логина и пароля."""
     if getattr(exc, "status_code", None) == 407 or "407" in str(exc):
@@ -2640,7 +2723,8 @@ class RuntimeManager:
         self.funpay_account_runtimes: dict[int, AccountRuntime] = {}
         self.playerok_account_runtimes: dict[int, PlayerokRuntime] = {}
         self.loop: asyncio.AbstractEventLoop | None = None
-        self.plugins = PluginManager(db, bot)
+        self.telethon = PluginTelethonService(db, secrets)
+        self.plugins = PluginManager(db, bot, self.telethon)
         self.playerok_plugins = PlayerokPluginManager(db, bot)
         self.connection_tasks: dict[tuple[str, int], asyncio.Task[Any]] = {}
 
@@ -3448,6 +3532,7 @@ class RuntimeManager:
             await self.stop_funpay_account(account_key)
         for account_key in list(self.playerok_account_runtimes):
             await self.stop_playerok_account(account_key)
+        await self.telethon.close()
 
     async def activate_account(
         self, telegram_id: int, marketplace: str, account_id: int
@@ -4090,6 +4175,12 @@ class OrderState(StatesGroup):
 
 class PluginState(StatesGroup):
     file = State()
+
+
+class PluginTelethonState(StatesGroup):
+    phone = State()
+    code = State()
+    password = State()
 
 
 class CatalogPublishState(StatesGroup):
@@ -7836,7 +7927,8 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
         await callback.message.answer(
             f"⚠️ <b>Установить {html.escape(item['name'])}?</b>\n\n"
             "Плагин получит доступ к FunPay-аккаунту, golden_key, сети, переменным окружения "
-            "и возможностям процесса бота. Каталог не гарантирует безопасность кода.",
+            "и возможностям процесса бота. После отдельной авторизации Telethon-плагин сможет "
+            "полностью управлять подключённым Telegram-аккаунтом. Каталог не гарантирует безопасность кода.",
             reply_markup=keyboard([
                 [("📥 Скачать и проверить", f"catalog_source:{uuid}")],
                 [("Я доверяю — установить", f"catalog_install_do:{uuid}")],
@@ -7896,6 +7988,7 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
                     InlineKeyboardButton(text="⚡ Хуки", callback_data="plugin_docs:hooks"),
                     InlineKeyboardButton(text="🤖 Telegram API", callback_data="plugin_docs:telegram"),
                 ],
+                [InlineKeyboardButton(text="📱 Telethon user-account", callback_data="plugin_docs:telethon")],
                 [InlineKeyboardButton(text="🧭 Публикация в каталоге", callback_data="plugin_docs:catalog")],
                 [InlineKeyboardButton(text="📥 Скачать полную документацию", callback_data="plugin_docs_download")],
                 [InlineKeyboardButton(text="🛡 Совместимость и безопасность", callback_data="plugin_docs:safety")],
@@ -7936,6 +8029,7 @@ VERSION = "1.0.0"
 DESCRIPTION = "Описание"
 CREDITS = "Автор"
 SETTINGS_PAGE = False
+TELETHON = False
 UUID = "создайте UUID версии 4"
 BIND_TO_DELETE = None
 
@@ -7973,6 +8067,7 @@ BIND_TO_NEW_MESSAGE = [on_message]
                 "<b>Сообщения:</b> INIT_MESSAGE, MESSAGES_LIST_CHANGED, LAST_CHAT_MESSAGE_CHANGED, NEW_MESSAGE.\n"
                 "<b>Заказы:</b> INIT_ORDER, NEW_ORDER, ORDERS_LIST_CHANGED, ORDER_STATUS_CHANGED.\n"
                 "<b>Операции:</b> PRE_DELIVERY, POST_DELIVERY, PRE_LOTS_RAISE, POST_LOTS_RAISE.\n\n"
+                "<b>Telethon:</b> TELETHON_READY, TELETHON_DISCONNECTED.\n\n"
                 "Перед каждым названием добавляется <code>BIND_TO_</code>. Событийный обработчик получает "
                 "<code>(cardinal, event)</code>; обработчики жизненного цикла — объект cardinal; обработчик удаления — "
                 "<code>(cardinal, callback)</code>. Ошибка одного обработчика записывается в лог и не останавливает остальные плагины."
@@ -7990,10 +8085,24 @@ BIND_TO_NEW_MESSAGE = [on_message]
                 "как <code>CBT.PLUGIN_SETTINGS</code> через <code>from tg_bot import CBT</code>.\n\n"
                 "FunPay доступен через <code>cardinal.account</code>, Runner — через <code>cardinal.runner</code>."
             ),
+            "telethon": (
+                "📱 <b>Telethon user-account</b>\n\n"
+                "Добавьте <code>TELETHON = True</code>. В карточке плагина появится встроенная "
+                "настройка: номер → код Telegram → пароль 2FA, если он включён. Плагин не должен "
+                "сам собирать эти значения. Код и 2FA не сохраняются; номер и StringSession "
+                "шифруются через APP_SECRET.\n\n"
+                "После входа хук <code>BIND_TO_TELETHON_READY</code> получает "
+                "<code>(cardinal, client)</code>, где client — настоящий "
+                "<code>telethon.TelegramClient</code>. Из синхронного хука вызывайте async API так: "
+                "<code>cardinal.telethon.run(client.send_message('me', 'test'))</code>.\n\n"
+                "Администратор должен задать TELETHON_API_ID и TELETHON_API_HASH от my.telegram.org. "
+                "Полные примеры событий и lifecycle есть в скачиваемом PLUGIN_DEVELOPMENT.md."
+            ),
             "safety": (
                 "🛡 <b>Совместимость и безопасность</b>\n\n"
-                "Поддерживается однофайловый контракт и 18 имён хуков FunPayCardinal, импорты <code>cardinal</code>, "
-                "<code>FunPayAPI</code>, <code>tg_bot.CBT</code> и базовый слой <code>telebot.types</code>. "
+                "Поддерживается однофайловый контракт, 18 хуков FunPayCardinal, два Telethon-хука, "
+                "импорты <code>cardinal</code>, <code>FunPayAPI</code>, официальный <code>telethon</code>, "
+                "<code>tg_bot.CBT</code> и базовый слой <code>telebot.types</code>. "
                 "Плагин, который импортирует дополнительные "
                 "пакеты или внутренние модули конкретной сборки Cardinal, потребует добавить их в Docker-образ.\n\n"
                 "⚠️ Python-плагин выполняется внутри процесса бота. Он может прочитать BOT_TOKEN, DATABASE_URL, "
@@ -8029,7 +8138,8 @@ BIND_TO_NEW_MESSAGE = [on_message]
         await callback.message.answer(
             "⚠️ <b>Внимание</b>\n"
             "Плагин выполняется с теми же правами, что и бот. Он может прочитать переменные окружения, "
-            "получить доступ к FunPay-аккаунту и базе данных. Продолжайте только если доверяете автору.",
+            "получить доступ к FunPay-аккаунту и базе данных. После отдельной авторизации Telethon-плагин "
+            "сможет полностью управлять подключённым Telegram-аккаунтом. Продолжайте только если доверяете автору.",
             reply_markup=keyboard([
                 [("Я понимаю риск", "plugin_upload_confirm")],
                 [("Отмена", "plugins")],
@@ -8105,6 +8215,13 @@ BIND_TO_NEW_MESSAGE = [on_message]
         settings_callback = plugin_settings_callback_data(plugin)
         if settings_callback:
             rows.append([("⚙️ Настройки", settings_callback)])
+        telethon_status = "не используется"
+        if plugin.telethon_enabled:
+            telethon_row = await db.get_plugin_telethon_session(
+                callback.from_user.id, uuid
+            )
+            telethon_status = "подключён" if telethon_row else "не авторизован"
+            rows.append([("📱 Telegram / Telethon", f"plugin_telethon:{uuid}")])
         publication_status = "Не опубликован"
         if publication:
             if publication["is_official"]:
@@ -8131,10 +8248,318 @@ BIND_TO_NEW_MESSAGE = [on_message]
             f"UUID: <code>{plugin.uuid}</code>\n"
             f"Хуков: <b>{hooks_count}</b>\n"
             f"Страница настроек Cardinal: {bool_icon(plugin.settings_page)}\n"
+            f"Telethon: <b>{html.escape(telethon_status)}</b>\n"
             f"Каталог: {html.escape(publication_status)}\n"
             f"Состояние: {bool_icon(plugin.enabled)}",
             reply_markup=keyboard(rows),
         )
+
+    def get_telethon_plugin(user_id: int, uuid: str) -> PluginData | None:
+        plugin_runtime = manager.plugins.runtimes.get(user_id)
+        plugin = plugin_runtime.plugins.get(uuid) if plugin_runtime else None
+        return plugin if plugin and plugin.telethon_enabled else None
+
+    async def show_plugin_telethon(target: Message, user_id: int, uuid: str) -> None:
+        plugin = get_telethon_plugin(user_id, uuid)
+        if not plugin:
+            await target.answer("Telethon для этого плагина не объявлен.")
+            return
+        row = await db.get_plugin_telethon_session(user_id, uuid)
+        client = manager.telethon.get_client(user_id, uuid)
+        if row:
+            try:
+                phone = masked_phone(secrets.decrypt(row["phone_enc"]))
+            except (InvalidToken, ValueError, TypeError):
+                phone = "скрыт"
+            username = (
+                f"@{row['telegram_username']}"
+                if row["telegram_username"]
+                else f"ID {row['telegram_user_id']}"
+            )
+            status = "🟢 клиент запущен" if client and client.is_connected() else "🟡 сессия сохранена"
+            text = (
+                f"📱 <b>Telethon · {html.escape(plugin.name)}</b>\n\n"
+                f"Аккаунт: <b>{html.escape(username)}</b>\n"
+                f"Телефон: <code>{html.escape(phone)}</code>\n"
+                f"Статус: {status}\n\n"
+                "Сессия зашифрована. Код входа и пароль 2FA не сохраняются."
+            )
+            rows = [
+                [("🔄 Авторизовать заново", f"plugin_telethon_start:{uuid}")],
+                [("🚪 Отключить и удалить сессию", f"plugin_telethon_disconnect_ask:{uuid}")],
+                [("⬅️ К плагину", f"plugin_info:{uuid}")],
+            ]
+        else:
+            configured = manager.telethon.configured
+            text = (
+                f"📱 <b>Telethon · {html.escape(plugin.name)}</b>\n\n"
+                "Telegram-аккаунт не авторизован. Мастер запросит номер телефона, "
+                "код входа и, если включено, пароль 2FA.\n\n"
+                "Код и пароль удаляются из чата и не записываются в базу. "
+                "После входа сохраняется только зашифрованная сессия."
+            )
+            if not configured:
+                text += (
+                    "\n\n⚠️ Администратор ещё не задал переменные "
+                    "<code>TELETHON_API_ID</code> и <code>TELETHON_API_HASH</code>."
+                )
+            rows = []
+            if configured and plugin.enabled:
+                rows.append([("📲 Начать авторизацию", f"plugin_telethon_start:{uuid}")])
+            elif configured:
+                text += "\n\nЧтобы начать авторизацию, сначала включите плагин."
+            rows.append([("⬅️ К плагину", f"plugin_info:{uuid}")])
+        await target.answer(text, reply_markup=keyboard(rows))
+
+    async def delete_sensitive_message(message: Message) -> None:
+        try:
+            await message.delete()
+        except TelegramBadRequest:
+            pass
+
+    async def finish_telethon_auth(
+        message: Message,
+        state: FSMContext,
+        uuid: str,
+        phone: str,
+        client: Any,
+    ) -> None:
+        try:
+            me = await manager.telethon.activate(
+                message.from_user.id, uuid, phone, client
+            )
+        except Exception:
+            await client.disconnect()
+            logger.exception("Не удалось сохранить авторизованную Telethon-сессию")
+            await state.clear()
+            await message.answer("❌ Вход выполнен, но сохранить Telethon-сессию не удалось.")
+            return
+        await state.clear()
+        identity = f"@{me.username}" if getattr(me, "username", None) else f"ID {me.id}"
+        await message.answer(
+            f"✅ Telegram-аккаунт <b>{html.escape(identity)}</b> подключён к плагину."
+        )
+        plugin_runtime = manager.plugins.runtimes.get(message.from_user.id)
+        plugin = get_telethon_plugin(message.from_user.id, uuid)
+        if plugin_runtime and plugin and plugin.enabled:
+            await manager.plugins.dispatch(
+                message.from_user.id,
+                "BIND_TO_TELETHON_READY",
+                plugin_runtime.adapter,
+                client,
+                only=uuid,
+            )
+        else:
+            await manager.telethon.stop_plugin(message.from_user.id, uuid)
+        await show_plugin_telethon(message, message.from_user.id, uuid)
+
+    @router.callback_query(F.data.startswith("plugin_telethon:"))
+    async def plugin_telethon(callback: CallbackQuery, state: FSMContext) -> None:
+        await callback.answer()
+        await state.clear()
+        await show_plugin_telethon(
+            callback.message, callback.from_user.id, callback.data.split(":", 1)[1]
+        )
+
+    @router.callback_query(F.data.startswith("plugin_telethon_start:"))
+    async def plugin_telethon_start(callback: CallbackQuery, state: FSMContext) -> None:
+        uuid = callback.data.split(":", 1)[1]
+        plugin = get_telethon_plugin(callback.from_user.id, uuid)
+        if not plugin:
+            await callback.answer("Telethon-плагин не найден", show_alert=True)
+            return
+        if not plugin.enabled:
+            await callback.answer("Сначала включите плагин", show_alert=True)
+            return
+        try:
+            manager.telethon.require_configured()
+        except TelethonConfigurationError as exc:
+            await callback.answer(str(exc), show_alert=True)
+            return
+        await callback.answer()
+        await state.clear()
+        await state.update_data(telethon_plugin_uuid=uuid)
+        await state.set_state(PluginTelethonState.phone)
+        await callback.message.answer(
+            "📱 <b>Шаг 1/3 · Номер телефона</b>\n\n"
+            "Отправьте номер Telegram в международном формате, например "
+            "<code>+79991234567</code>. Сообщение будет удалено. Для отмены: /cancel"
+        )
+
+    @router.message(PluginTelethonState.phone, F.text)
+    async def plugin_telethon_phone(message: Message, state: FSMContext) -> None:
+        phone = re.sub(r"[\s()\-]", "", message.text.strip())
+        await delete_sensitive_message(message)
+        if not re.fullmatch(r"\+\d{7,15}", phone):
+            await message.answer("❌ Нужен номер вида <code>+79991234567</code>.")
+            return
+        data = await state.get_data()
+        uuid = str(data.get("telethon_plugin_uuid") or "")
+        if not get_telethon_plugin(message.from_user.id, uuid):
+            await state.clear()
+            await message.answer("❌ Плагин больше не доступен.")
+            return
+        wait_message = await message.answer("⏳ Отправляю код входа через Telegram…")
+        client = None
+        try:
+            client = manager.telethon.create_client()
+            await asyncio.wait_for(client.connect(), timeout=30)
+            sent = await asyncio.wait_for(client.send_code_request(phone), timeout=45)
+            pending_session = client.session.save()
+        except PhoneNumberInvalidError:
+            await wait_message.edit_text("❌ Telegram не принял этот номер. Отправьте другой номер.")
+            return
+        except FloodWaitError as exc:
+            await wait_message.edit_text(
+                f"❌ Telegram ограничил повторные попытки. Подождите {exc.seconds} сек."
+            )
+            return
+        except Exception:
+            logger.exception("Не удалось запросить Telethon-код")
+            await wait_message.edit_text("❌ Не удалось отправить код входа. Попробуйте позже.")
+            return
+        finally:
+            if client:
+                await client.disconnect()
+        await state.update_data(
+            telethon_phone_enc=secrets.encrypt(phone),
+            telethon_pending_session_enc=secrets.encrypt(pending_session),
+            telethon_phone_code_hash=sent.phone_code_hash,
+        )
+        await state.set_state(PluginTelethonState.code)
+        await wait_message.edit_text(
+            "📩 <b>Шаг 2/3 · Код входа</b>\n\n"
+            "Отправьте код, полученный от Telegram. Можно писать с пробелами. "
+            "Сообщение будет удалено."
+        )
+
+    @router.message(PluginTelethonState.code, F.text)
+    async def plugin_telethon_code(message: Message, state: FSMContext) -> None:
+        code = re.sub(r"\D", "", message.text)
+        await delete_sensitive_message(message)
+        if not 4 <= len(code) <= 8:
+            await message.answer("❌ Код выглядит некорректно. Отправьте его ещё раз.")
+            return
+        data = await state.get_data()
+        uuid = str(data.get("telethon_plugin_uuid") or "")
+        try:
+            phone = secrets.decrypt(data["telethon_phone_enc"])
+            pending_session = secrets.decrypt(data["telethon_pending_session_enc"])
+            phone_code_hash = str(data["telethon_phone_code_hash"])
+        except (KeyError, InvalidToken, TypeError):
+            await state.clear()
+            await message.answer("❌ Сессия авторизации истекла. Начните заново.")
+            return
+        try:
+            client = manager.telethon.create_client(pending_session)
+        except TelethonConfigurationError as exc:
+            await state.clear()
+            await message.answer(f"❌ {html.escape(str(exc))}")
+            return
+        try:
+            await asyncio.wait_for(client.connect(), timeout=30)
+            await asyncio.wait_for(
+                client.sign_in(
+                    phone=phone,
+                    code=code,
+                    phone_code_hash=phone_code_hash,
+                ),
+                timeout=45,
+            )
+        except SessionPasswordNeededError:
+            await state.update_data(
+                telethon_pending_session_enc=secrets.encrypt(client.session.save())
+            )
+            await client.disconnect()
+            await state.set_state(PluginTelethonState.password)
+            await message.answer(
+                "🔐 <b>Шаг 3/3 · Пароль 2FA</b>\n\n"
+                "На аккаунте включена двухэтапная аутентификация. Отправьте пароль 2FA. "
+                "Он будет удалён и не сохранится."
+            )
+            return
+        except PhoneCodeInvalidError:
+            await client.disconnect()
+            await message.answer("❌ Неверный код. Отправьте код ещё раз.")
+            return
+        except PhoneCodeExpiredError:
+            await client.disconnect()
+            await state.clear()
+            await message.answer("❌ Код истёк. Откройте настройки плагина и начните заново.")
+            return
+        except Exception:
+            await client.disconnect()
+            logger.exception("Telethon-вход по коду не выполнен")
+            await state.clear()
+            await message.answer("❌ Войти по коду не удалось. Начните авторизацию заново.")
+            return
+        await finish_telethon_auth(message, state, uuid, phone, client)
+
+    @router.message(PluginTelethonState.password, F.text)
+    async def plugin_telethon_password(message: Message, state: FSMContext) -> None:
+        password = message.text
+        await delete_sensitive_message(message)
+        data = await state.get_data()
+        uuid = str(data.get("telethon_plugin_uuid") or "")
+        try:
+            phone = secrets.decrypt(data["telethon_phone_enc"])
+            pending_session = secrets.decrypt(data["telethon_pending_session_enc"])
+        except (KeyError, InvalidToken, TypeError):
+            await state.clear()
+            await message.answer("❌ Сессия авторизации истекла. Начните заново.")
+            return
+        try:
+            client = manager.telethon.create_client(pending_session)
+        except TelethonConfigurationError as exc:
+            await state.clear()
+            await message.answer(f"❌ {html.escape(str(exc))}")
+            return
+        try:
+            await asyncio.wait_for(client.connect(), timeout=30)
+            await asyncio.wait_for(client.sign_in(password=password), timeout=45)
+        except PasswordHashInvalidError:
+            await client.disconnect()
+            await message.answer("❌ Неверный пароль 2FA. Попробуйте ещё раз или /cancel.")
+            return
+        except Exception:
+            await client.disconnect()
+            logger.exception("Telethon-вход с 2FA не выполнен")
+            await state.clear()
+            await message.answer("❌ Вход с 2FA не выполнен. Начните авторизацию заново.")
+            return
+        await finish_telethon_auth(message, state, uuid, phone, client)
+
+    @router.callback_query(F.data.startswith("plugin_telethon_disconnect_ask:"))
+    async def plugin_telethon_disconnect_ask(callback: CallbackQuery) -> None:
+        uuid = callback.data.split(":", 1)[1]
+        await callback.answer()
+        await callback.message.answer(
+            "Удалить зашифрованную Telethon-сессию этого плагина? "
+            "Для повторной работы понадобится новый код входа.",
+            reply_markup=keyboard([
+                [("Да, отключить", f"plugin_telethon_disconnect_do:{uuid}")],
+                [("Отмена", f"plugin_telethon:{uuid}")],
+            ]),
+        )
+
+    @router.callback_query(F.data.startswith("plugin_telethon_disconnect_do:"))
+    async def plugin_telethon_disconnect_do(callback: CallbackQuery) -> None:
+        uuid = callback.data.split(":", 1)[1]
+        plugin_runtime = manager.plugins.runtimes.get(callback.from_user.id)
+        client = manager.telethon.get_client(callback.from_user.id, uuid)
+        if plugin_runtime and client:
+            await manager.plugins.dispatch(
+                callback.from_user.id,
+                "BIND_TO_TELETHON_DISCONNECTED",
+                plugin_runtime.adapter,
+                client,
+                only=uuid,
+            )
+        await manager.telethon.stop_plugin(
+            callback.from_user.id, uuid, delete_session=True
+        )
+        await callback.answer("Telethon отключён")
+        await show_plugin_telethon(callback.message, callback.from_user.id, uuid)
 
     @router.callback_query(F.data.startswith("catalog_publish_start:"))
     async def catalog_publish_start(callback: CallbackQuery, state: FSMContext) -> None:

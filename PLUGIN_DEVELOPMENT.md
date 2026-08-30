@@ -15,8 +15,9 @@
 При генерации плагина соблюдайте все правила:
 
 1. Создавайте ровно один UTF-8 файл с расширением `.py`, размером до 512 КБ.
-2. Используйте только Python standard library, `FunPayAPI`, `cardinal` и перечисленные ниже классы
-   `telebot.types`, если пользователь отдельно не подтвердил добавление внешней зависимости.
+2. Используйте только Python standard library, `FunPayAPI`, `cardinal`, официальный пакет
+   `telethon` и перечисленные ниже классы `telebot.types`, если пользователь отдельно не подтвердил
+   добавление другой внешней зависимости.
 3. Создайте новый канонический UUID версии 4 в нижнем регистре. Не копируйте UUID из примеров.
 4. Объявите все обязательные метаданные на уровне модуля.
 5. Обработчики должны быть обычными синхронными функциями `def`, не `async def`.
@@ -32,7 +33,9 @@
     Не отправляйте товар повторно из POST-хука: проверяйте `event.delivered` и `event.error`.
 14. `SETTINGS_PAGE=True` создаёт постоянную кнопку «⚙️ Настройки» рядом с выключением и удалением
     плагина. Плагин обязан зарегистрировать обработчик callback `47:<UUID>:<offset>`.
-15. После генерации проверьте раздел «Финальный чек-лист».
+15. Для Telegram user-account через Telethon объявите `TELETHON=True`. Не запрашивайте номер,
+    код или 2FA самостоятельно: встроенный мастер плагина делает это по шагам.
+16. После генерации проверьте раздел «Финальный чек-лист».
 
 ## 2. Установка и жизненный цикл
 
@@ -95,6 +98,10 @@
 | `UUID` | строка | Канонический UUID4 в нижнем регистре. |
 | `BIND_TO_DELETE` | callable или `None` | Обработчик удаления `(cardinal, callback)`. |
 
+Опциональное поле `TELETHON` имеет тип `bool`. При `TELETHON=True` карточка плагина получает
+встроенную страницу «Telegram / Telethon». Поле не заменяет `SETTINGS_PAGE` и не требует от плагина
+создавать собственную форму входа.
+
 Загрузчик преобразует текстовые метаданные через `str`, но нейросеть всё равно должна создавать
 их строками. UUID должен пройти обе проверки:
 
@@ -122,6 +129,8 @@ assert str(UUID(UUID_TEXT, version=4)) == UUID_TEXT
 | `BIND_TO_POST_START` | `(cardinal)` | после PRE_START |
 | `BIND_TO_PRE_STOP` | `(cardinal)` | перед остановкой runtime |
 | `BIND_TO_POST_STOP` | `(cardinal)` | после PRE_STOP |
+| `BIND_TO_TELETHON_READY` | `(cardinal, client)` | сохранённая сессия запущена или вход только что завершён |
+| `BIND_TO_TELETHON_DISCONNECTED` | `(cardinal, client)` | перед выключением или ручным удалением сессии |
 
 При первой загрузке нового плагина четыре стартовых хука вызываются только для него. При
 восстановлении runtime они вызываются для всех включённых плагинов.
@@ -318,6 +327,99 @@ markup.row(button1, button2)
 Не используйте ReplyKeyboardMarkup, ForceReply, InputMedia, WebApp и специфические классы
 pyTelegramBotAPI: их нет в локальном слое совместимости.
 
+### 6.4 Официальный Telethon и Telegram user-account
+
+В образ включён официальный пакет `Telethon==1.44.0`. Администратор экземпляра один раз создаёт
+Telegram API application на `my.telegram.org` и задаёт секреты окружения:
+
+```text
+TELETHON_API_ID=12345678
+TELETHON_API_HASH=0123456789abcdef0123456789abcdef
+```
+
+Плагин только объявляет:
+
+```python
+TELETHON = True
+```
+
+После установки пользователь открывает:
+
+`Плагины → Мои плагины → <плагин> → Telegram / Telethon`
+
+Встроенный мастер выполняет вход строго по шагам:
+
+`номер → код Telegram → пароль 2FA (если включён)`
+
+1. номер телефона в международном формате;
+2. одноразовый код Telegram;
+3. пароль 2FA, если Telegram запросил его.
+
+Плагин не получает номер, код или пароль 2FA. Сообщения с этими значениями бот удаляет по
+возможности; код и пароль никогда не записываются в PostgreSQL. После входа номер и Telethon
+`StringSession` шифруются тем же `APP_SECRET`, который защищает golden_key. Сессия изолирована по
+паре `(Telegram user ID владельца бота, UUID плагина)`. При удалении плагина или ручном отключении
+сессия удаляется каскадно.
+
+Пользователь не создаёт, не копирует и не вводит `StringSession`: это внутренний формат хранения,
+который бот генерирует только после успешных шагов с номером, кодом и 2FA.
+
+`BIND_TO_TELETHON_READY` получает настоящий `telethon.TelegramClient`. Хуки SDK синхронные и
+выполняются в worker thread, поэтому async-операции передаются в основной event loop методом
+`cardinal.telethon.run(...)`:
+
+```python
+from telethon import events
+
+TELETHON = True
+
+
+async def on_telegram_message(event):
+    # Это обычный async event Telethon; обработчик вызывается самим Telethon.
+    print(event.raw_text)
+
+
+def telethon_ready(cardinal, client):
+    async def setup():
+        client.add_event_handler(
+            on_telegram_message,
+            events.NewMessage(incoming=True),
+        )
+        me = await client.get_me()
+        await client.send_message("me", f"Плагин запущен для {me.id}")
+        dialogs = await client.get_dialogs(limit=10)
+        return len(dialogs)
+
+    count = cardinal.telethon.run(setup(), timeout=60)
+    cardinal.telegram.send_notification(
+        f"Telethon готов, загружено диалогов: {count}"
+    )
+
+
+def telethon_disconnected(cardinal, client):
+    # При необходимости удалите зарегистрированные event handlers до disconnect.
+    return None
+
+
+BIND_TO_TELETHON_READY = [telethon_ready]
+BIND_TO_TELETHON_DISCONNECTED = [telethon_disconnected]
+```
+
+Также можно получить активный клиент позже:
+
+```python
+client = cardinal.telethon.get_client(UUID)
+if client:
+    result = cardinal.telethon.run(client.send_message("me", "Проверка"))
+```
+
+Не вызывайте `client.run_until_disconnected()`: lifecycle соединения управляется основным ботом.
+Не вызывайте `client.disconnect()` самостоятельно. При повторном `BIND_TO_TELETHON_READY` не
+регистрируйте один и тот же event handler дважды. Любые массовые рассылки, вступления в группы,
+удаления сообщений и другие действия выполняются от имени реального Telegram-аккаунта; плагин
+обязан соблюдать лимиты Telegram, обрабатывать `FloodWaitError` и явно описывать такие действия
+пользователю до установки.
+
 ## 7. Полезные объекты FunPayAPI
 
 ### 7.1 Message
@@ -388,6 +490,7 @@ VERSION = "1.0.0"
 DESCRIPTION = "Безопасный автоответ на отзывы"
 CREDITS = "Your name"
 SETTINGS_PAGE = False
+TELETHON = False
 UUID = "СОЗДАЙТЕ-НОВЫЙ-КАНОНИЧЕСКИЙ-UUID4"
 BIND_TO_DELETE = None
 
@@ -528,6 +631,7 @@ VERSION = "1.0.0"
 DESCRIPTION = "Краткое описание"
 CREDITS = "Author"
 SETTINGS_PAGE = False
+TELETHON = False
 UUID = "СОЗДАЙТЕ-НОВЫЙ-КАНОНИЧЕСКИЙ-UUID4"
 
 
@@ -581,6 +685,8 @@ BIND_TO_PRE_DELIVERY = []
 BIND_TO_POST_DELIVERY = []
 BIND_TO_PRE_LOTS_RAISE = []
 BIND_TO_POST_LOTS_RAISE = []
+BIND_TO_TELETHON_READY = []
+BIND_TO_TELETHON_DISCONNECTED = []
 BIND_TO_DELETE = on_delete
 ```
 
@@ -597,6 +703,9 @@ BIND_TO_DELETE = on_delete
 - Блокирующий бесконечный цикл в PRE_START.
 - Импорт `telebot.TeleBot`: локальный shim предоставляет только `telebot.types`.
 - `SETTINGS_PAGE=True` без обработчика `47:<UUID>:<offset>`: кнопка появится, но открыть страницу не сможет.
+- Самодельный сбор номера, кода входа или 2FA вместо `TELETHON=True` и встроенного мастера.
+- Вызов async-метода Telethon без `cardinal.telethon.run(...)` из синхронного хука.
+- Самостоятельный `client.disconnect()` или `client.run_until_disconnected()`.
 - Повторная выдача товара из delivery POST-хука без проверки `event.delivered` и `event.error`.
 - Хранение состояния только в глобальной переменной без учёта перезапуска процесса.
 - Вставка пользовательского текста в Telegram HTML без `html.escape`.
@@ -618,6 +727,8 @@ BIND_TO_DELETE = on_delete
 - [ ] пользовательские данные экранируются для Telegram HTML;
 - [ ] callback_data уникальны и короче 64 байт;
 - [ ] при `SETTINGS_PAGE=True` зарегистрирован обработчик `47:<UUID>:<offset>`;
+- [ ] при работе с user-account объявлен `TELETHON=True`, а вход делается встроенным мастером;
+- [ ] Telethon async-операции из хуков передаются через `cardinal.telethon.run(...)`;
 - [ ] автоответ на отзыв не дублирует уже существующий `review.reply`;
 - [ ] исключения внешнего API обрабатываются там, где возможна безопасная деградация;
 - [ ] внешние зависимости перечислены отдельно и добавлены в Docker-образ;
