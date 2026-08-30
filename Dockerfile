@@ -13,6 +13,7 @@ COPY bot.py plugin_system.py playerok_plugin_system.py telethon_plugin.py cardin
     PLUGIN_DEVELOPMENT.md PLAYEROK_PLUGIN_DEVELOPMENT.md ./
 COPY FunPayAPI ./FunPayAPI
 COPY playerokapi ./playerokapi
+COPY ready_plugins ./ready_plugins
 COPY telebot ./telebot
 COPY tg_bot ./tg_bot
 

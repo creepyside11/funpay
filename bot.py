@@ -92,6 +92,7 @@ PLAYEROK_PLUGIN_DOCUMENTATION_PATH = Path(__file__).with_name(
 AUTO_LOTS_PLUGIN_UUID = "77b095e0-13a1-4e12-9c52-3a7b83a89b11"
 ADVANCED_STATS_PLUGIN_UUID = "c55a4072-eab8-4d87-8f17-b111e4b8bb22"
 STATUS_PLUGIN_UUID = "b19339bb-8f13-49cb-a4c1-0d3a55e1cc33"
+TELEGRAM_CHANNEL_BOOST_PLUGIN_UUID = "3f4874b9-0797-4d4a-aba6-c69aa63b2e08"
 PLUGIN_SETTINGS_CALLBACK_PREFIX = "47"
 PLUGIN_CATALOG_PAGE_SIZE = 6
 PLUGIN_CATALOG_DESCRIPTION_MIN = 40
@@ -110,6 +111,8 @@ class ReadyPluginSpec:
     version: str
     description: str
     details: str
+    source_file: str | None = None
+    builtin_settings: bool = True
 
 
 READY_PLUGINS = (
@@ -142,12 +145,28 @@ READY_PLUGINS = (
         "Позволяет задать собственный текст статуса. Покупатель отправляет в личном чате "
         "FunPay команду #status и мгновенно получает настроенный ответ.",
     ),
+    ReadyPluginSpec(
+        TELEGRAM_CHANNEL_BOOST_PLUGIN_UUID,
+        "TelegramChannelBoost.py",
+        "Telegram Channel Boost",
+        "1.0.0",
+        "Создание и передача Telegram-каналов после SMM-заказа",
+        "Создаёт публичный Telegram-канал через официальный Telethon, отправляет ссылку "
+        "в совместимый SMM API, одновременно проверяет статус SMM-заказа и реальное число "
+        "подписчиков, затем подтверждает username покупателя и безопасно передаёт ему владельца.",
+        source_file="TelegramChannelBoost.py",
+        builtin_settings=False,
+    ),
 )
 READY_PLUGIN_BY_UUID = {plugin.uuid: plugin for plugin in READY_PLUGINS}
 
 
 def ready_plugin_source(plugin: ReadyPluginSpec) -> str:
     """Возвращает валидный однофайловый модуль формата FunPayCardinal."""
+    if plugin.source_file:
+        return (
+            Path(__file__).with_name("ready_plugins") / plugin.source_file
+        ).read_text(encoding="utf-8")
     return (
         f"NAME = {plugin.name!r}\n"
         f"VERSION = {plugin.version!r}\n"
@@ -163,7 +182,8 @@ def plugin_settings_callback_data(plugin: PluginData) -> str | None:
     """Возвращает постоянный callback страницы настроек установленного плагина."""
     if not plugin.settings_page:
         return None
-    if plugin.uuid in READY_PLUGIN_BY_UUID:
+    ready_plugin = READY_PLUGIN_BY_UUID.get(plugin.uuid)
+    if ready_plugin and ready_plugin.builtin_settings:
         return f"builtin_open:{plugin.uuid}"
     return f"{PLUGIN_SETTINGS_CALLBACK_PREFIX}:{plugin.uuid}:0"
 

@@ -15,6 +15,7 @@ from bot import (
     PLUGIN_DOCUMENTATION_PATH,
     READY_PLUGINS,
     SecretBox,
+    TELEGRAM_CHANNEL_BOOST_PLUGIN_UUID,
     apply_bulk_lot_action,
     conversation_actions_keyboard,
     create_playerok_account,
@@ -1263,6 +1264,15 @@ def test_plugin_settings_button_uses_cardinal_callback_contract():
         f"builtin_open:{READY_PLUGINS[0].uuid}"
     )
 
+    channel_boost = SimpleNamespace(
+        uuid=TELEGRAM_CHANNEL_BOOST_PLUGIN_UUID,
+        enabled=True,
+        settings_page=True,
+    )
+    assert plugin_settings_callback_data(channel_boost) == (
+        f"47:{TELEGRAM_CHANNEL_BOOST_PLUGIN_UUID}:0"
+    )
+
 
 def test_cardinal_plugin_contract_is_loaded(tmp_path):
     source = '''
@@ -1423,6 +1433,13 @@ def test_ready_plugins_have_valid_cardinal_sources(tmp_path):
     ]
     assert [plugin.uuid for plugin in loaded] == [spec.uuid for spec in READY_PLUGINS]
     assert all(plugin.settings_page for plugin in loaded)
+    channel_boost = next(
+        plugin for plugin in loaded if plugin.uuid == TELEGRAM_CHANNEL_BOOST_PLUGIN_UUID
+    )
+    assert channel_boost.telethon_enabled is True
+    assert channel_boost.hooks["BIND_TO_TELETHON_READY"]
+    assert channel_boost.hooks["BIND_TO_NEW_ORDER"]
+    assert channel_boost.hooks["BIND_TO_NEW_MESSAGE"]
 
 
 def test_catalog_description_validation_and_publisher_name():
