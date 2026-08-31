@@ -12,7 +12,7 @@ from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 
 NAME = "AutoSmm"
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 DESCRIPTION = "Автоматические SMM-заказы для нескольких лотов FunPay"
 CREDITS = "FunPay aiogram bot"
 SETTINGS_PAGE = True
@@ -33,6 +33,7 @@ _lot_cache: dict[str, tuple[str, str]] = {}
 _futures: set[Future[Any]] = set()
 _running_job_ids: set[int] = set()
 _submitting_job_ids: set[int] = set()
+_refilling_job_ids: set[int] = set()
 
 
 def _markup(*rows: list[tuple[str, str]]) -> InlineKeyboardMarkup:
@@ -125,6 +126,7 @@ async def _ensure_schema() -> None:
             service_id BIGINT NOT NULL,
             quantity_per_unit INTEGER NOT NULL,
             enabled BOOLEAN NOT NULL DEFAULT TRUE,
+            refill_enabled BOOLEAN NOT NULL DEFAULT FALSE,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             UNIQUE (telegram_id, lot_id)
@@ -147,6 +149,9 @@ async def _ensure_schema() -> None:
             target_url TEXT,
             smm_order_id TEXT,
             smm_status TEXT,
+            refill_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+            refill_id TEXT,
+            refill_status TEXT,
             status TEXT NOT NULL DEFAULT 'awaiting_link',
             error_text TEXT,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -156,6 +161,18 @@ async def _ensure_schema() -> None:
 
         CREATE INDEX IF NOT EXISTS autosmm_jobs_status_idx
             ON autosmm_jobs (telegram_id, status, updated_at DESC);
+        """
+    )
+    await _db().execute(
+        """
+        ALTER TABLE autosmm_lot_rules
+            ADD COLUMN IF NOT EXISTS refill_enabled BOOLEAN NOT NULL DEFAULT FALSE;
+        ALTER TABLE autosmm_jobs
+            ADD COLUMN IF NOT EXISTS refill_enabled BOOLEAN NOT NULL DEFAULT FALSE;
+        ALTER TABLE autosmm_jobs
+            ADD COLUMN IF NOT EXISTS refill_id TEXT;
+        ALTER TABLE autosmm_jobs
+            ADD COLUMN IF NOT EXISTS refill_status TEXT;
         """
     )
     await _db().execute(
@@ -241,7 +258,12 @@ async def _upsert_rule(
 
 
 async def _update_rule(rule_id: int, column: str, value: Any) -> None:
-    if column not in {"service_id", "quantity_per_unit", "enabled"}:
+    if column not in {
+        "service_id",
+        "quantity_per_unit",
+        "enabled",
+        "refill_enabled",
+    }:
         raise ValueError("неизвестное поле привязки")
     await _db().execute(
         f"""
@@ -377,19 +399,27 @@ def _show_settings(chat_id: int) -> None:
         lines.extend(["", "<b>Лоты</b>"])
         for rule in rules[:12]:
             marker = "✅" if rule["enabled"] else "⏸"
+            refill = " · рефилл ♻️" if rule["refill_enabled"] else ""
             lines.append(
                 f"{marker} {html.escape(str(rule['lot_title'])[:70])}\n"
-                f"   услуга <code>{rule['service_id']}</code> · {rule['quantity_per_unit']} за 1 шт."
+                f"   услуга <code>{rule['service_id']}</code> · "
+                f"{rule['quantity_per_unit']} за 1 шт.{refill}"
             )
         if len(rules) > 12:
             lines.append(f"…ещё {len(rules) - 12}")
     if jobs:
         lines.extend(["", "<b>Последние задания</b>"])
         for job in jobs:
+            refill = (
+                f"; рефилл {html.escape(str(job['refill_status']))}"
+                if job["refill_status"]
+                else ""
+            )
             lines.append(
                 f"• <code>#{html.escape(str(job['order_id']))}</code> — "
                 f"{html.escape(_status_label(str(job['status'])))}; "
-                f"{job['total_quantity']} шт.; SMM {html.escape(str(job['smm_status'] or '—'))}"
+                f"{job['total_quantity']} шт.; "
+                f"SMM {html.escape(str(job['smm_status'] or '—'))}{refill}"
             )
     rows: list[list[tuple[str, str]]] = [
         [("🌐 Base URL API", f"{CALLBACK_PREFIX}set:base")],
@@ -432,16 +462,26 @@ def _show_rule(chat_id: int, rule_id: int) -> None:
     if not rule:
         raise RuntimeError("привязка не найдена")
     state = "включена" if rule["enabled"] else "выключена"
+    refill_state = "включён" if rule["refill_enabled"] else "выключен"
     text = (
         f"🛒 <b>{html.escape(str(rule['lot_title']))}</b>\n\n"
         f"ID лота: <code>{html.escape(str(rule['lot_id']))}</code>\n"
         f"ID услуги: <code>{rule['service_id']}</code>\n"
         f"Количество за 1 шт.: <b>{rule['quantity_per_unit']}</b>\n"
+        f"Команда #рефилл: <b>{refill_state}</b>\n"
         f"Статус: <b>{state}</b>"
     )
     rows = [
         [("🧩 Изменить ID услуги", f"{CALLBACK_PREFIX}rs:{rule_id}")],
         [("📦 Изменить количество", f"{CALLBACK_PREFIX}rq:{rule_id}")],
+        [
+            (
+                "🚫 Выключить #рефилл"
+                if rule["refill_enabled"]
+                else "♻️ Включить #рефилл",
+                f"{CALLBACK_PREFIX}rr:{rule_id}",
+            )
+        ],
         [
             (
                 "⏸ Выключить" if rule["enabled"] else "▶️ Включить",
@@ -541,6 +581,19 @@ def _on_callback(call: Any) -> None:
         elif data.startswith(f"{CALLBACK_PREFIX}rq:"):
             rule_id = int(data.rsplit(":", 1)[1])
             _prompt(chat_id, "edit_quantity", "Отправьте новое количество на одну купленную единицу.", rule_id)
+        elif data.startswith(f"{CALLBACK_PREFIX}rr:"):
+            rule_id = int(data.rsplit(":", 1)[1])
+            rule = _sync(_rule(rule_id))
+            if not rule:
+                raise RuntimeError("привязка не найдена")
+            _sync(
+                _update_rule(
+                    rule_id,
+                    "refill_enabled",
+                    not bool(rule["refill_enabled"]),
+                )
+            )
+            _show_rule(chat_id, rule_id)
         elif data.startswith(f"{CALLBACK_PREFIX}rt:"):
             rule_id = int(data.rsplit(":", 1)[1])
             rule = _sync(_rule(rule_id))
@@ -656,8 +709,8 @@ async def _insert_job(order: dict[str, Any], rule: Any) -> Any | None:
         INSERT INTO autosmm_jobs
             (telegram_id, order_id, chat_id, chat_name, buyer_id, rule_id,
              lot_title, service_id, quantity_per_unit, purchased_units,
-             total_quantity)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+             total_quantity, refill_enabled)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
         ON CONFLICT (telegram_id, order_id) DO NOTHING
         RETURNING *
         """,
@@ -672,6 +725,7 @@ async def _insert_job(order: dict[str, Any], rule: Any) -> Any | None:
         int(rule["quantity_per_unit"]),
         units,
         total,
+        bool(rule["refill_enabled"]),
     )
 
 
@@ -689,6 +743,8 @@ async def _update_job(job_id: int, **values: Any) -> None:
         "target_url",
         "smm_order_id",
         "smm_status",
+        "refill_id",
+        "refill_status",
         "status",
         "error_text",
     }
@@ -753,6 +809,125 @@ async def _active_buyer_job(
         await _update_job(int(job["id"]), chat_id=str(chat_id))
         return await _job(int(job["id"]))
     return job
+
+
+async def _active_refill_job(
+    chat_id: str,
+    buyer_id: int | None,
+    chat_name: str | None,
+    order_chat_id: str | None,
+) -> Any | None:
+    normalized_name = (chat_name or "").strip() or None
+    job = await _db().fetchrow(
+        """
+        SELECT * FROM autosmm_jobs
+         WHERE telegram_id=$1
+           AND (
+               chat_id=$2
+               OR ($3::BIGINT IS NOT NULL AND buyer_id=$3)
+               OR ($4::TEXT IS NOT NULL AND LOWER(chat_name)=LOWER($4))
+               OR ($5::TEXT IS NOT NULL AND chat_id=$5)
+           )
+           AND status='completed'
+           AND refill_enabled=TRUE
+           AND smm_order_id IS NOT NULL
+         ORDER BY created_at DESC LIMIT 1
+        """,
+        _telegram_id(),
+        str(chat_id),
+        buyer_id,
+        normalized_name,
+        order_chat_id,
+    )
+    if job and str(job["chat_id"]) != str(chat_id):
+        await _update_job(int(job["id"]), chat_id=str(chat_id))
+        return await _job(int(job["id"]))
+    return job
+
+
+def _completion_message(job: Any) -> str:
+    text = (
+        "✅ Накрутка завершена. Проверьте результат по ссылке:\n"
+        f"{job['target_url']}"
+    )
+    if job["refill_enabled"]:
+        text += (
+            "\n\n♻️ Для этого заказа доступен рефилл. Если после выполнения "
+            "часть накрутки спишется, отправьте команду #рефилл — бот запросит "
+            "у SMM-сервиса восстановление. Срок и возможность восстановления "
+            "зависят от условий выбранной услуги."
+        )
+    return text
+
+
+async def _request_refill(job_id: int) -> None:
+    if job_id in _refilling_job_ids:
+        return
+    _refilling_job_ids.add(job_id)
+    job: Any | None = None
+    try:
+        job = await _job(job_id)
+        if (
+            not job
+            or job["status"] != "completed"
+            or not job["refill_enabled"]
+            or not job["smm_order_id"]
+        ):
+            return
+        if job["refill_id"]:
+            await _funpay_send(
+                job,
+                "♻️ Рефилл для этого заказа уже был запрошен. Повторный запрос не требуется.",
+            )
+            return
+        settings = await _settings()
+        result = await asyncio.to_thread(
+            _smm_request,
+            settings,
+            action="refill",
+            order=job["smm_order_id"],
+        )
+        refill_id = result.get("refill")
+        if refill_id is None or str(refill_id).strip() == "":
+            raise RuntimeError("SMM API не вернул ID рефилла")
+        await _update_job(
+            job_id,
+            refill_id=str(refill_id),
+            refill_status="Requested",
+        )
+        job = await _job(job_id)
+        await _funpay_send(
+            job,
+            "♻️ Рефилл запрошен. SMM-сервис принял заявку на восстановление "
+            "списавшегося количества. Скорость и итог зависят от условий услуги.",
+        )
+        await _notify_owner(
+            "♻️ <b>AutoSmm запросил рефилл</b>\n\n"
+            f"FunPay: <code>#{html.escape(str(job['order_id']))}</code>\n"
+            f"SMM order: <code>{html.escape(str(job['smm_order_id']))}</code>\n"
+            f"Refill: <code>{html.escape(str(job['refill_id']))}</code>"
+        )
+    except Exception as exc:
+        logger.exception("AutoSmm не запросил рефилл для job %s", job_id)
+        try:
+            await _update_job(
+                job_id,
+                refill_status=f"Error: {str(exc)[:400]}",
+            )
+        except Exception:
+            logger.exception("Не удалось сохранить ошибку рефилла AutoSmm")
+        if job:
+            await _funpay_send(
+                job,
+                "❌ SMM-сервис не принял запрос рефилла. Продавец уже уведомлён.",
+            )
+            await _notify_owner(
+                "❌ <b>AutoSmm: ошибка рефилла</b>\n\n"
+                f"FunPay: <code>#{html.escape(str(job['order_id']))}</code>\n"
+                f"Ошибка: <code>{html.escape(str(exc)[:500])}</code>"
+            )
+    finally:
+        _refilling_job_ids.discard(job_id)
 
 
 async def _submit_job(job_id: int) -> None:
@@ -857,11 +1032,7 @@ async def _monitor_job(job_id: int) -> None:
                 if normalized in {"completed", "complete", "done"}:
                     await _update_job(job_id, status="completed", error_text=None)
                     job = await _job(job_id)
-                    await _funpay_send(
-                        job,
-                        "✅ Накрутка завершена. Проверьте результат по ссылке:\n"
-                        f"{job['target_url']}",
-                    )
+                    await _funpay_send(job, _completion_message(job))
                     await _notify_owner(
                         f"✅ AutoSmm-заказ <code>#{html.escape(str(job['order_id']))}</code> выполнен."
                     )
@@ -918,6 +1089,18 @@ async def _process_new_order(order: dict[str, Any]) -> None:
 
 
 async def _process_funpay_message(message: dict[str, Any]) -> None:
+    text = str(message.get("text") or "").strip()
+    lowered = text.casefold()
+    if lowered == "#рефилл":
+        refill_job = await _active_refill_job(
+            message["chat_id"],
+            message.get("buyer_id"),
+            message.get("chat_name"),
+            message.get("order_chat_id"),
+        )
+        if refill_job:
+            await _request_refill(int(refill_job["id"]))
+        return
     job = await _active_buyer_job(
         message["chat_id"],
         message.get("buyer_id"),
@@ -926,8 +1109,6 @@ async def _process_funpay_message(message: dict[str, Any]) -> None:
     )
     if not job:
         return
-    text = str(message.get("text") or "").strip()
-    lowered = text.casefold()
     if lowered == "#изменить":
         await _update_job(job["id"], status="awaiting_link", target_url=None)
         await _funpay_send(job, "Отправьте новую ссылку одним сообщением.")
@@ -976,7 +1157,7 @@ async def _process_order_status(order_id: str, status: str) -> None:
         """
         SELECT * FROM autosmm_jobs
          WHERE telegram_id=$1 AND order_id=$2
-           AND status NOT IN ('completed', 'failed', 'canceled')
+           AND status NOT IN ('failed', 'canceled')
         """,
         _telegram_id(),
         order_id,

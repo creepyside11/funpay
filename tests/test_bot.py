@@ -1494,6 +1494,13 @@ def test_official_plugin_seed_refreshes_already_installed_sources():
     )
     assert channel_boost[3] == "1.0.2"
     assert 'VERSION = "1.0.2"' in channel_boost[5]
+    auto_smm = next(
+        args
+        for _query, args in refreshes
+        if args[0] == AUTO_SMM_PLUGIN_UUID
+    )
+    assert auto_smm[3] == "1.1.0"
+    assert 'VERSION = "1.1.0"' in auto_smm[5]
 
 
 def test_catalog_description_validation_and_publisher_name():
