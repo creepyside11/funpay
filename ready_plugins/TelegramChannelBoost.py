@@ -32,7 +32,7 @@ from telethon.tl.types import ChatAdminRights, InputChannel
 
 
 NAME = "Telegram Channel Boost"
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 DESCRIPTION = "Создание, раскрутка и передача Telegram-каналов покупателям FunPay"
 CREDITS = "FunPay aiogram bot"
 SETTINGS_PAGE = True
@@ -144,6 +144,7 @@ async def _ensure_schema() -> None:
             order_id TEXT NOT NULL,
             chat_id TEXT NOT NULL,
             chat_name TEXT,
+            buyer_id BIGINT,
             lot_title TEXT NOT NULL,
             channel_id BIGINT,
             channel_access_hash BIGINT,
@@ -163,6 +164,12 @@ async def _ensure_schema() -> None:
 
         CREATE INDEX IF NOT EXISTS telegram_channel_boost_jobs_status_idx
             ON telegram_channel_boost_jobs (telegram_id, status, updated_at DESC);
+        """
+    )
+    await _db().execute(
+        """
+        ALTER TABLE telegram_channel_boost_jobs
+            ADD COLUMN IF NOT EXISTS buyer_id BIGINT
         """
     )
     await _db().execute(
@@ -487,8 +494,9 @@ async def _insert_job(order: dict[str, Any], settings: Any) -> Any | None:
     return await _db().fetchrow(
         """
         INSERT INTO telegram_channel_boost_jobs
-            (telegram_id, order_id, chat_id, chat_name, lot_title, target_members)
-        VALUES ($1, $2, $3, $4, $5, $6)
+            (telegram_id, order_id, chat_id, chat_name, buyer_id,
+             lot_title, target_members)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
         ON CONFLICT (telegram_id, order_id) DO NOTHING
         RETURNING *
         """,
@@ -496,6 +504,7 @@ async def _insert_job(order: dict[str, Any], settings: Any) -> Any | None:
         order["id"],
         str(order["chat_id"]),
         order["chat_name"],
+        order["buyer_id"],
         order["description"],
         int(settings["target_members"]),
     )
@@ -515,6 +524,7 @@ async def _job(job_id: int) -> Any | None:
 async def _update_job(job_id: int, **values: Any) -> None:
     allowed = {
         "channel_id",
+        "chat_id",
         "channel_access_hash",
         "channel_username",
         "channel_url",
@@ -814,11 +824,23 @@ async def _resume_transfers() -> None:
     )
 
 
-async def _active_buyer_job(chat_id: str) -> Any | None:
-    return await _db().fetchrow(
+async def _active_buyer_job(
+    chat_id: str,
+    buyer_id: int | None,
+    chat_name: str | None,
+    order_chat_id: str | None,
+) -> Any | None:
+    normalized_name = (chat_name or "").strip() or None
+    job = await _db().fetchrow(
         """
         SELECT * FROM telegram_channel_boost_jobs
-         WHERE telegram_id=$1 AND chat_id=$2
+         WHERE telegram_id=$1
+           AND (
+               chat_id=$2
+               OR ($3::BIGINT IS NOT NULL AND buyer_id=$3)
+               OR ($4::TEXT IS NOT NULL AND LOWER(chat_name)=LOWER($4))
+               OR ($5::TEXT IS NOT NULL AND chat_id=$5)
+           )
            AND status IN (
                'awaiting_username', 'username_confirmation',
                'awaiting_join', 'awaiting_owner_2fa'
@@ -827,7 +849,14 @@ async def _active_buyer_job(chat_id: str) -> Any | None:
         """,
         _telegram_id(),
         str(chat_id),
+        buyer_id,
+        normalized_name,
+        order_chat_id,
     )
+    if job and str(job["chat_id"]) != str(chat_id):
+        await _update_job(int(job["id"]), chat_id=str(chat_id))
+        return await _job(int(job["id"]))
+    return job
 
 
 async def _verify_buyer(job: Any) -> None:
@@ -874,7 +903,12 @@ async def _verify_buyer(job: Any) -> None:
 
 
 async def _process_funpay_message(message: dict[str, Any]) -> None:
-    job = await _active_buyer_job(message["chat_id"])
+    job = await _active_buyer_job(
+        message["chat_id"],
+        message.get("buyer_id"),
+        message.get("chat_name"),
+        message.get("order_chat_id"),
+    )
     if not job or job["status"] == "awaiting_owner_2fa":
         return
     text = str(message["text"] or "").strip()
@@ -1054,6 +1088,7 @@ def new_order(cardinal: Any, event: Any) -> None:
         "id": str(order.id),
         "chat_id": str(order.chat_id),
         "chat_name": str(order.buyer_username or "Покупатель"),
+        "buyer_id": int(order.buyer_id) if getattr(order, "buyer_id", None) else None,
         "description": str(order.description or ""),
     }
     _spawn(_process_new_order(payload))
@@ -1067,10 +1102,22 @@ def new_message(cardinal: Any, event: Any) -> None:
         or getattr(message, "by_vertex", False)
     ):
         return
+    buyer_id = (
+        int(message.interlocutor_id)
+        if getattr(message, "interlocutor_id", None)
+        else None
+    )
+    order_chat_id = None
+    if buyer_id:
+        first_id, second_id = sorted((buyer_id, int(cardinal.account.id)))
+        order_chat_id = f"users-{first_id}-{second_id}"
     _spawn(
         _process_funpay_message(
             {
                 "chat_id": str(message.chat_id),
+                "chat_name": str(message.chat_name or ""),
+                "buyer_id": buyer_id,
+                "order_chat_id": order_chat_id,
                 "text": str(message.text or ""),
             }
         )

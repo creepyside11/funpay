@@ -218,5 +218,58 @@ def test_verified_buyer_is_transferred_automatically_with_saved_2fa(monkeypatch)
     )
 
 
+def test_username_message_matches_order_when_funpay_chat_ids_differ(monkeypatch):
+    sent = []
+    database_calls = []
+    original_job = {
+        "id": 12,
+        "chat_id": "users-100-200",
+        "status": "awaiting_username",
+    }
+    rebound_job = {
+        "id": 12,
+        "chat_id": "987654",
+        "status": "awaiting_username",
+    }
+
+    class FakeDatabase:
+        async def fetchrow(self, query, *args):
+            database_calls.append((query, args))
+            if "status IN" in query:
+                return original_job
+            return rebound_job
+
+        async def execute(self, query, *args):
+            database_calls.append((query, args))
+
+    async def funpay_send(_job, text):
+        sent.append(text)
+
+    fake_database = FakeDatabase()
+    monkeypatch.setattr(plugin, "_db", lambda: fake_database)
+    monkeypatch.setattr(plugin, "_telegram_id", lambda: 7)
+    monkeypatch.setattr(plugin, "_funpay_send", funpay_send)
+
+    asyncio.run(
+        plugin._process_funpay_message(
+            {
+                "chat_id": "987654",
+                "buyer_id": 100,
+                "chat_name": "BuyerName",
+                "order_chat_id": "users-100-200",
+                "text": "@buyer_name",
+            }
+        )
+    )
+
+    lookup_args = database_calls[0][1]
+    assert lookup_args == (7, "987654", 100, "BuyerName", "users-100-200")
+    assert any(
+        "SET chat_id=$3" in query and args[-1] == "987654"
+        for query, args in database_calls
+    )
+    assert sent and "#да" in sent[-1] and "#изменить" in sent[-1]
+
+
 async def _async_value(value):
     return value

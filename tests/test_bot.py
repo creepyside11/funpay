@@ -1485,8 +1485,8 @@ def test_official_plugin_seed_refreshes_already_installed_sources():
         for _query, args in refreshes
         if args[0] == TELEGRAM_CHANNEL_BOOST_PLUGIN_UUID
     )
-    assert channel_boost[3] == "1.0.1"
-    assert 'VERSION = "1.0.1"' in channel_boost[5]
+    assert channel_boost[3] == "1.0.2"
+    assert 'VERSION = "1.0.2"' in channel_boost[5]
 
 
 def test_catalog_description_validation_and_publisher_name():

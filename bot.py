@@ -151,7 +151,7 @@ READY_PLUGINS = (
         TELEGRAM_CHANNEL_BOOST_PLUGIN_UUID,
         "TelegramChannelBoost.py",
         "Telegram Channel Boost",
-        "1.0.1",
+        "1.0.2",
         "Создание и передача Telegram-каналов после SMM-заказа",
         "Создаёт публичный Telegram-канал через официальный Telethon, отправляет ссылку "
         "в совместимый SMM API, одновременно проверяет статус SMM-заказа и реальное число "
