@@ -49,6 +49,16 @@ from telethon.errors import (
 
 from FunPayAPI import Account, Runner, events, types
 from FunPayAPI import exceptions as fp_exceptions
+from ai_plugin_builder import (
+    DEFAULT_API_BASE_URL as AI_BUILDER_DEFAULT_API_BASE_URL,
+    AIPluginBuilderError,
+    AnthropicPluginBuilder,
+    generated_filename,
+    inspect_generated_source,
+    validate_api_base_url as validate_ai_builder_api_base_url,
+    validate_model_id as validate_ai_builder_model_id,
+    validate_plugin_request,
+)
 from playerok_plugin_system import (
     PLAYEROK_READY_PLUGIN_BY_UUID,
     PLAYEROK_READY_PLUGINS,
@@ -101,6 +111,7 @@ PLUGIN_TELETHON_DISCONNECT_DO_PREFIX = "pt_disc_do:"
 PLUGIN_CATALOG_PAGE_SIZE = 6
 PLUGIN_CATALOG_DESCRIPTION_MIN = 40
 PLUGIN_CATALOG_DESCRIPTION_MAX = 2000
+AI_BUILDER_TOKEN_MASK = "••••••••"
 PLAYEROK_POLL_SECONDS = 20
 PLAYEROK_AUTO_PUBLISH_SECONDS = 300
 PLUGIN_STOP_TIMEOUT = 10
@@ -415,9 +426,22 @@ class Database:
                 settings_page BOOLEAN NOT NULL DEFAULT FALSE,
                 source TEXT NOT NULL,
                 enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                ai_generated BOOLEAN NOT NULL DEFAULT FALSE,
+                ai_prompt TEXT,
+                ai_summary TEXT,
+                ai_revision INTEGER NOT NULL DEFAULT 0,
+                ai_updated_at TIMESTAMPTZ,
                 uploaded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 PRIMARY KEY (telegram_id, uuid)
             );
+
+            ALTER TABLE funpay_plugins
+                ADD COLUMN IF NOT EXISTS ai_generated BOOLEAN NOT NULL DEFAULT FALSE;
+            ALTER TABLE funpay_plugins ADD COLUMN IF NOT EXISTS ai_prompt TEXT;
+            ALTER TABLE funpay_plugins ADD COLUMN IF NOT EXISTS ai_summary TEXT;
+            ALTER TABLE funpay_plugins
+                ADD COLUMN IF NOT EXISTS ai_revision INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE funpay_plugins ADD COLUMN IF NOT EXISTS ai_updated_at TIMESTAMPTZ;
 
             CREATE TABLE IF NOT EXISTS funpay_plugin_settings (
                 telegram_id BIGINT NOT NULL,
@@ -459,8 +483,21 @@ class Database:
                 credits TEXT NOT NULL,
                 source TEXT NOT NULL,
                 is_official BOOLEAN NOT NULL DEFAULT FALSE,
+                ai_generated BOOLEAN NOT NULL DEFAULT FALSE,
                 install_count BIGINT NOT NULL DEFAULT 0,
                 published_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+
+            ALTER TABLE funpay_plugin_catalog
+                ADD COLUMN IF NOT EXISTS ai_generated BOOLEAN NOT NULL DEFAULT FALSE;
+
+            CREATE TABLE IF NOT EXISTS funpay_plugin_builder_settings (
+                telegram_id BIGINT PRIMARY KEY
+                    REFERENCES funpay_users(telegram_id) ON DELETE CASCADE,
+                api_base_url TEXT NOT NULL DEFAULT 'https://api.anthropic.com',
+                api_token_enc TEXT,
+                model_id TEXT,
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
 
@@ -1058,6 +1095,66 @@ class Database:
             uuid,
         )
 
+    async def get_plugin_builder_settings(self, telegram_id: int) -> asyncpg.Record:
+        await self.execute(
+            """
+            INSERT INTO funpay_plugin_builder_settings (telegram_id)
+            VALUES ($1)
+            ON CONFLICT (telegram_id) DO NOTHING
+            """,
+            telegram_id,
+        )
+        row = await self.fetchrow(
+            "SELECT * FROM funpay_plugin_builder_settings WHERE telegram_id=$1",
+            telegram_id,
+        )
+        if row is None:
+            raise RuntimeError("не удалось загрузить настройки AI-конструктора")
+        return row
+
+    async def set_plugin_builder_setting(
+        self, telegram_id: int, key: str, value: str | None
+    ) -> None:
+        if key not in {"api_base_url", "api_token_enc", "model_id"}:
+            raise ValueError("неизвестная настройка AI-конструктора")
+        await self.execute(
+            """
+            INSERT INTO funpay_plugin_builder_settings (telegram_id)
+            VALUES ($1)
+            ON CONFLICT (telegram_id) DO NOTHING
+            """,
+            telegram_id,
+        )
+        await self.execute(
+            f"""
+            UPDATE funpay_plugin_builder_settings
+               SET {key}=$2, updated_at=NOW()
+             WHERE telegram_id=$1
+            """,
+            telegram_id,
+            value,
+        )
+
+    async def mark_plugin_ai_generated(
+        self,
+        telegram_id: int,
+        uuid: str,
+        prompt: str,
+        summary: str,
+    ) -> None:
+        await self.execute(
+            """
+            UPDATE funpay_plugins
+               SET ai_generated=TRUE, ai_prompt=$3, ai_summary=$4,
+                   ai_revision=ai_revision+1, ai_updated_at=NOW()
+             WHERE telegram_id=$1 AND uuid=$2
+            """,
+            telegram_id,
+            uuid,
+            prompt,
+            summary,
+        )
+
     async def seed_official_plugins(self) -> None:
         for plugin in READY_PLUGINS:
             source = ready_plugin_source(plugin)
@@ -1133,9 +1230,9 @@ class Database:
             INSERT INTO funpay_plugin_catalog
                 (uuid, owner_telegram_id, publisher_name, filename, name, version,
                  short_description, description, credits, source, is_official,
-                 published_at, updated_at)
+                 ai_generated, published_at, updated_at)
             SELECT uuid, telegram_id, $3, filename, name, version, description, $4,
-                   credits, source, FALSE, NOW(), NOW()
+                   credits, source, FALSE, ai_generated, NOW(), NOW()
               FROM funpay_plugins
              WHERE telegram_id=$1 AND uuid=$2
             ON CONFLICT (uuid) DO UPDATE
@@ -1144,7 +1241,8 @@ class Database:
                     version=EXCLUDED.version,
                     short_description=EXCLUDED.short_description,
                     description=EXCLUDED.description, credits=EXCLUDED.credits,
-                    source=EXCLUDED.source, updated_at=NOW()
+                    source=EXCLUDED.source, ai_generated=EXCLUDED.ai_generated,
+                    updated_at=NOW()
               WHERE funpay_plugin_catalog.owner_telegram_id=$1
                 AND funpay_plugin_catalog.is_official=FALSE
             RETURNING uuid
@@ -4302,6 +4400,14 @@ class PluginState(StatesGroup):
     file = State()
 
 
+class AIPluginBuilderState(StatesGroup):
+    request = State()
+    edit_request = State()
+    api_base_url = State()
+    api_token = State()
+    model_id = State()
+
+
 class PluginTelethonState(StatesGroup):
     phone = State()
     code = State()
@@ -4380,6 +4486,7 @@ def bool_icon(value: bool) -> str:
 
 def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> Router:
     router = Router()
+    ai_builder_jobs: set[int] = set()
     # Учетные данные принимаются только в личной переписке с ботом.
     router.message.filter(F.chat.type == ChatType.PRIVATE)
     router.callback_query.filter(F.message.chat.type == ChatType.PRIVATE)
@@ -7907,6 +8014,206 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
         await callback.answer("Публикация удалена" if removed else "Публикация не найдена")
         await show_playerok_plugin_info(callback.message, callback.from_user.id, uuid)
 
+    async def show_ai_plugin_builder(target: Message, user_id: int) -> None:
+        settings = await db.get_plugin_builder_settings(user_id)
+        configured = bool(settings["api_token_enc"] and settings["model_id"])
+        running = user_id in ai_builder_jobs
+        await target.answer(
+            "✨ <b>AI-конструктор плагинов</b>\n\n"
+            "Опишите нужный FunPay-плагин обычным текстом. Бот передаст модели полную "
+            "документацию, создаст исходник, затем отдельным этапом проверит синтаксис и "
+            "соответствие контракту. Успешный результат автоматически появится в «Мои плагины».\n\n"
+            "⚠️ Сгенерированный Python-код выполняется с правами процесса бота. Конструктор "
+            "блокирует несколько особо опасных конструкций, но перед публикацией всё равно "
+            "рекомендуется проверить исходник.\n\n"
+            f"Настройки API: {'✅ готовы' if configured else '❌ не заполнены'}\n"
+            f"Задача: {'🤖 выполняется' if running else 'свободен'}",
+            reply_markup=keyboard([
+                [("✨ Перейти к созданию", "ai_builder_create")],
+                [("⚙️ Настройки", "ai_builder_settings")],
+                [("⬅️ Плагины", "plugins")],
+            ]),
+        )
+
+    async def show_ai_plugin_builder_settings(target: Message, user_id: int) -> None:
+        settings = await db.get_plugin_builder_settings(user_id)
+        await target.answer(
+            "⚙️ <b>Настройки AI-конструктора</b>\n\n"
+            f"Base URL: <code>{html.escape(str(settings['api_base_url']))}</code>\n"
+            f"API-токен: <code>{AI_BUILDER_TOKEN_MASK if settings['api_token_enc'] else 'не задан'}</code>\n"
+            f"ID модели: <code>{html.escape(str(settings['model_id'] or 'не задан'))}</code>\n\n"
+            "Используется официальный Anthropic SDK. Для совместимого прокси укажите его HTTPS Base URL.",
+            reply_markup=keyboard([
+                [("🌐 Изменить Base URL", "ai_builder_set:base")],
+                [("🔑 Изменить API-токен", "ai_builder_set:token")],
+                [("🧠 Изменить ID модели", "ai_builder_set:model")],
+                [("⬅️ Конструктор", "ai_builder")],
+            ]),
+        )
+
+    async def ai_generation_timer(
+        status_message: Message,
+        phase: dict[str, str],
+        stop_event: asyncio.Event,
+    ) -> None:
+        started = asyncio.get_running_loop().time()
+        while not stop_event.is_set():
+            elapsed = int(asyncio.get_running_loop().time() - started)
+            try:
+                await status_message.edit_text(
+                    "🤖 <b>Думаю…</b>\n"
+                    f"⏱ Прошло: <b>{elapsed} сек.</b>\n"
+                    f"{phase['label']}"
+                )
+            except TelegramBadRequest as exc:
+                if "message is not modified" not in str(exc).casefold():
+                    logger.warning("Не обновлён таймер AI-конструктора: %s", exc)
+            except Exception:
+                logger.warning("Не обновлён таймер AI-конструктора", exc_info=True)
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=1)
+            except TimeoutError:
+                pass
+
+    async def run_ai_plugin_generation(
+        message: Message,
+        request: str,
+        *,
+        edit_uuid: str | None = None,
+    ) -> None:
+        user_id = message.from_user.id
+        if user_id in ai_builder_jobs:
+            await message.answer("⏳ Предыдущий плагин ещё создаётся. Дождитесь результата.")
+            return
+        runtime = await require_runtime(message, user_id)
+        if not runtime:
+            return
+        settings = await db.get_plugin_builder_settings(user_id)
+        if not settings["api_token_enc"] or not settings["model_id"]:
+            await message.answer(
+                "❌ Сначала задайте API-токен и ID модели.",
+                reply_markup=keyboard([[('⚙️ Открыть настройки', 'ai_builder_settings')]]),
+            )
+            return
+        try:
+            api_token = secrets.decrypt(settings["api_token_enc"])
+        except (InvalidToken, ValueError) as exc:
+            logger.warning("Не расшифрован токен AI-конструктора для %s", user_id)
+            await message.answer(
+                "❌ Сохранённый API-токен не удалось прочитать. Введите его заново в настройках."
+            )
+            return
+
+        existing = await db.get_plugin(user_id, edit_uuid) if edit_uuid else None
+        if edit_uuid and (not existing or not existing["ai_generated"]):
+            await message.answer("❌ Редактировать через ИИ можно только созданный им плагин.")
+            return
+        publication = await db.get_catalog_plugin(edit_uuid) if edit_uuid else None
+        ai_builder_jobs.add(user_id)
+        phase = {"label": "1/2 · Создание исходника"}
+        stop_event = asyncio.Event()
+        status_message = await message.answer(
+            "🤖 <b>Думаю…</b>\n⏱ Прошло: <b>0 сек.</b>\n1/2 · Создание исходника"
+        )
+        timer_task = asyncio.create_task(
+            ai_generation_timer(status_message, phase, stop_event)
+        )
+        try:
+            documentation = await asyncio.to_thread(
+                PLUGIN_DOCUMENTATION_PATH.read_text, encoding="utf-8"
+            )
+            builder = AnthropicPluginBuilder(
+                api_token,
+                str(settings["api_base_url"] or AI_BUILDER_DEFAULT_API_BASE_URL),
+                str(settings["model_id"]),
+            )
+            if existing:
+                draft = await builder.edit_draft(
+                    request,
+                    documentation,
+                    str(existing["source"]),
+                    str(existing["uuid"]),
+                )
+            else:
+                draft = await builder.create_draft(request, documentation)
+
+            phase["label"] = "2/2 · Проверка синтаксиса и документации"
+            expected_uuid = str(existing["uuid"]) if existing else None
+            reviewed = await builder.review_draft(
+                request,
+                documentation,
+                draft,
+                expected_uuid=expected_uuid,
+            )
+            metadata = inspect_generated_source(
+                reviewed.source, expected_uuid=expected_uuid
+            )
+            filename = (
+                str(existing["filename"])
+                if existing
+                else generated_filename(str(metadata["NAME"]), str(metadata["UUID"]))
+            )
+            plugin = await manager.plugins.install(
+                user_id,
+                filename,
+                reviewed.source,
+                runtime,
+            )
+            await db.mark_plugin_ai_generated(
+                user_id,
+                plugin.uuid,
+                request,
+                reviewed.summary,
+            )
+            catalog_updated = False
+            if (
+                publication
+                and publication["owner_telegram_id"] == user_id
+                and not publication["is_official"]
+            ):
+                catalog_updated = await db.publish_catalog_plugin(
+                    user_id,
+                    plugin.uuid,
+                    str(publication["publisher_name"]),
+                    str(publication["description"]),
+                )
+        except (AIPluginBuilderError, PluginValidationError, ValueError) as exc:
+            logger.warning("AI-конструктор отклонил результат для %s: %s", user_id, exc)
+            await status_message.edit_text(
+                "❌ <b>Плагин не создан</b>\n\n"
+                f"{html.escape(clipped(exc, 1200))}\n\n"
+                "Исправьте описание или настройки модели и попробуйте ещё раз.",
+                reply_markup=keyboard([[('⬅️ AI-конструктор', 'ai_builder')]]),
+            )
+            return
+        except Exception as exc:
+            logger.exception("Ошибка AI-конструктора для %s", user_id)
+            await status_message.edit_text(
+                "❌ <b>Создание завершилось ошибкой</b>\n\n"
+                f"{html.escape(clipped(exc, 1200))}",
+                reply_markup=keyboard([[('⬅️ AI-конструктор', 'ai_builder')]]),
+            )
+            return
+        finally:
+            stop_event.set()
+            await timer_task
+            ai_builder_jobs.discard(user_id)
+
+        action = "обновлён" if existing else "создан и установлен"
+        catalog_note = "\n🌐 Опубликованная версия также обновлена." if catalog_updated else ""
+        await status_message.edit_text(
+            f"✅ <b>Плагин {action}</b>\n\n"
+            f"🤖 <b>СГЕНЕРИРОВАНО ИИ</b>\n"
+            f"<b>{html.escape(plugin.name)}</b> v{html.escape(plugin.version)}\n\n"
+            f"{html.escape(clipped(reviewed.summary, 2200))}"
+            f"{catalog_note}",
+            reply_markup=keyboard([
+                [("🧩 Открыть плагин", f"plugin_info:{plugin.uuid}")],
+                [("✨ Редактировать через ИИ", f"ai_builder_edit:{plugin.uuid}")],
+                [("⬅️ Мои плагины", "my_plugins")],
+            ]),
+        )
+
     async def show_plugins(target: Message, user_id: int) -> None:
         runtime = await require_runtime(target, user_id)
         if not runtime:
@@ -7916,6 +8223,7 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
         rows = [
             [("🧭 Каталог плагинов", "plugin_catalog:0")],
             [(f"🧩 Мои плагины ({len(plugins)})", "my_plugins")],
+            [("✨ Создать плагин", "ai_builder")],
             [("➕ Загрузить плагин", "plugin_upload_warning")],
             [("📚 Документация", "plugin_docs")],
             [("⬅️ Меню", "menu")],
@@ -7923,7 +8231,7 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
         await target.answer(
             "🧩 <b>Плагины FunPayCardinal</b>\n"
             f"Установлено: <b>{len(plugins)}</b>\n\n"
-            "Откройте общий каталог, установите опубликованное расширение или загрузите "
+            "Откройте общий каталог, создайте расширение через ИИ или загрузите "
             "собственный однофайловый .py-плагин.",
             reply_markup=keyboard(rows),
         )
@@ -7933,14 +8241,167 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
         await callback.answer()
         await show_plugins(callback.message, callback.from_user.id)
 
+    @router.callback_query(F.data == "ai_builder")
+    async def ai_builder_menu(callback: CallbackQuery, state: FSMContext) -> None:
+        await callback.answer()
+        await state.clear()
+        await show_ai_plugin_builder(callback.message, callback.from_user.id)
+
+    @router.callback_query(F.data == "ai_builder_settings")
+    async def ai_builder_settings(callback: CallbackQuery, state: FSMContext) -> None:
+        await callback.answer()
+        await state.clear()
+        await show_ai_plugin_builder_settings(callback.message, callback.from_user.id)
+
+    @router.callback_query(F.data.startswith("ai_builder_set:"))
+    async def ai_builder_setting_start(
+        callback: CallbackQuery, state: FSMContext
+    ) -> None:
+        field = callback.data.split(":", 1)[1]
+        prompts = {
+            "base": (
+                AIPluginBuilderState.api_base_url,
+                "Отправьте HTTPS Base URL Anthropic API или совместимого сервиса.\n"
+                f"Официальный адрес: <code>{AI_BUILDER_DEFAULT_API_BASE_URL}</code>",
+            ),
+            "token": (
+                AIPluginBuilderState.api_token,
+                "Отправьте API-токен одним сообщением. Сообщение будет удалено, а токен сохранён зашифрованным.",
+            ),
+            "model": (
+                AIPluginBuilderState.model_id,
+                "Отправьте точный ID модели, доступной у вашего API-провайдера.",
+            ),
+        }
+        prompt = prompts.get(field)
+        if not prompt:
+            await callback.answer("Неизвестная настройка", show_alert=True)
+            return
+        await callback.answer()
+        await state.clear()
+        await state.set_state(prompt[0])
+        await callback.message.answer(f"{prompt[1]}\n\nДля отмены: /cancel")
+
+    @router.message(AIPluginBuilderState.api_base_url, F.text)
+    async def ai_builder_base_url_value(message: Message, state: FSMContext) -> None:
+        try:
+            value = validate_ai_builder_api_base_url(message.text or "")
+        except ValueError as exc:
+            await message.answer(f"❌ {html.escape(str(exc))}")
+            return
+        await db.set_plugin_builder_setting(message.from_user.id, "api_base_url", value)
+        await state.clear()
+        await message.answer("✅ Base URL сохранён.")
+        await show_ai_plugin_builder_settings(message, message.from_user.id)
+
+    @router.message(AIPluginBuilderState.api_token, F.text)
+    async def ai_builder_api_token_value(message: Message, state: FSMContext) -> None:
+        token = (message.text or "").strip()
+        try:
+            await message.delete()
+        except Exception:
+            logger.warning("Не удалось удалить сообщение с API-токеном", exc_info=True)
+        if not 8 <= len(token) <= 1000:
+            await message.answer("❌ API-токен должен содержать от 8 до 1000 символов.")
+            return
+        await db.set_plugin_builder_setting(
+            message.from_user.id, "api_token_enc", secrets.encrypt(token)
+        )
+        await state.clear()
+        await message.answer("✅ API-токен сохранён в зашифрованном виде.")
+        await show_ai_plugin_builder_settings(message, message.from_user.id)
+
+    @router.message(AIPluginBuilderState.model_id, F.text)
+    async def ai_builder_model_value(message: Message, state: FSMContext) -> None:
+        try:
+            value = validate_ai_builder_model_id(message.text or "")
+        except ValueError as exc:
+            await message.answer(f"❌ {html.escape(str(exc))}")
+            return
+        await db.set_plugin_builder_setting(message.from_user.id, "model_id", value)
+        await state.clear()
+        await message.answer("✅ ID модели сохранён.")
+        await show_ai_plugin_builder_settings(message, message.from_user.id)
+
+    @router.callback_query(F.data == "ai_builder_create")
+    async def ai_builder_create(callback: CallbackQuery, state: FSMContext) -> None:
+        if callback.from_user.id in ai_builder_jobs:
+            await callback.answer("Предыдущая задача ещё выполняется", show_alert=True)
+            return
+        settings = await db.get_plugin_builder_settings(callback.from_user.id)
+        if not settings["api_token_enc"] or not settings["model_id"]:
+            await callback.answer("Сначала заполните настройки API", show_alert=True)
+            await show_ai_plugin_builder_settings(callback.message, callback.from_user.id)
+            return
+        await callback.answer()
+        await state.clear()
+        await state.set_state(AIPluginBuilderState.request)
+        await callback.message.answer(
+            "✨ <b>Новый AI-плагин</b>\n\n"
+            "Подробно опишите, что он должен делать: события FunPay, команды, настройки, внешние API, "
+            "сообщения покупателю и поведение при ошибках. После отправки начнутся два этапа создания.\n\n"
+            "Для отмены: /cancel"
+        )
+
+    @router.message(AIPluginBuilderState.request, F.text)
+    async def ai_builder_create_request(message: Message, state: FSMContext) -> None:
+        try:
+            request = validate_plugin_request(message.text or "")
+        except ValueError as exc:
+            await message.answer(f"❌ {html.escape(str(exc))}")
+            return
+        await state.clear()
+        await run_ai_plugin_generation(message, request)
+
+    @router.callback_query(F.data.startswith("ai_builder_edit:"))
+    async def ai_builder_edit(callback: CallbackQuery, state: FSMContext) -> None:
+        uuid = callback.data.split(":", 1)[1]
+        row = await db.get_plugin(callback.from_user.id, uuid)
+        if not row or not row["ai_generated"]:
+            await callback.answer("Это не AI-плагин", show_alert=True)
+            return
+        if callback.from_user.id in ai_builder_jobs:
+            await callback.answer("Предыдущая задача ещё выполняется", show_alert=True)
+            return
+        await callback.answer()
+        await state.clear()
+        await state.set_state(AIPluginBuilderState.edit_request)
+        await state.update_data(ai_builder_edit_uuid=uuid)
+        await callback.message.answer(
+            f"✨ <b>Редактирование {html.escape(row['name'])}</b>\n\n"
+            "Опишите, что исправить или добавить. Модель получит текущий исходник и документацию, "
+            "сохранит UUID, увеличит версию и после проверки заменит установленный плагин. "
+            "Редактировать можно неограниченное число раз.\n\n"
+            "Для отмены: /cancel"
+        )
+
+    @router.message(AIPluginBuilderState.edit_request, F.text)
+    async def ai_builder_edit_request(message: Message, state: FSMContext) -> None:
+        try:
+            request = validate_plugin_request(message.text or "")
+        except ValueError as exc:
+            await message.answer(f"❌ {html.escape(str(exc))}")
+            return
+        uuid = (await state.get_data()).get("ai_builder_edit_uuid")
+        await state.clear()
+        if not uuid:
+            await message.answer("❌ Сессия редактирования истекла.")
+            return
+        await run_ai_plugin_generation(message, request, edit_uuid=str(uuid))
+
     async def show_my_plugins(target: Message, user_id: int) -> None:
         if not await require_runtime(target, user_id):
             return
         plugin_runtime = manager.plugins.runtimes.get(user_id)
         plugins = list(plugin_runtime.plugins.values()) if plugin_runtime else []
+        stored_plugins = {
+            str(row["uuid"]): row for row in await db.list_plugins(user_id)
+        }
         rows = [
             [(
-                f"{'✅' if plugin.enabled else '❌'} {clipped(plugin.name, 27)} v{clipped(plugin.version, 10)}",
+                f"{'✅' if plugin.enabled else '❌'} "
+                f"{'🤖 ' if stored_plugins.get(plugin.uuid) and stored_plugins[plugin.uuid]['ai_generated'] else ''}"
+                f"{clipped(plugin.name, 25)} v{clipped(plugin.version, 10)}",
                 f"plugin_info:{plugin.uuid}",
             )]
             for plugin in plugins
@@ -7948,7 +8409,8 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
         rows.append([("⬅️ Плагины", "plugins")])
         text = (
             "🧩 <b>Мои плагины</b>\n\n"
-            "Нажмите на плагин, чтобы открыть настройки, выключить или удалить его."
+            "Нажмите на плагин, чтобы открыть настройки, выключить или удалить его.\n"
+            "🤖 — создан AI-конструктором."
             if plugins
             else "🧩 <b>Мои плагины</b>\n\nПока ничего не установлено."
         )
@@ -7979,7 +8441,7 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
         rows = [
             [(
                 (
-                    f"{'✅' if plugin['uuid'] in installed else ('🛡' if plugin['is_official'] else '🧩')} "
+                    f"{'✅' if plugin['uuid'] in installed else ('🛡' if plugin['is_official'] else ('🤖' if plugin['ai_generated'] else '🧩'))} "
                     f"{clipped(plugin['name'], 27)} v{clipped(plugin['version'], 8)}"
                 ),
                 f"catalog_view:{plugin['uuid']}:{page}",
@@ -7997,7 +8459,7 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
         await target.answer(
             "🧭 <b>Каталог плагинов</b>\n\n"
             f"Опубликовано: <b>{total}</b> · страница <b>{page + 1}/{total_pages}</b>\n"
-            "🛡 — официальный · 🧩 — от сообщества · ✅ — уже установлен.\n\n"
+            "🛡 — официальный · 🧩 — от сообщества · 🤖 — сгенерирован ИИ · ✅ — уже установлен.\n\n"
             "Чтобы опубликовать свой плагин, откройте его в разделе «Мои плагины». "
             "⚠️ Каталог не модерируется: изучайте описание и скачивайте исходник перед установкой.",
             reply_markup=keyboard(rows),
@@ -8040,7 +8502,15 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
             rows.append([("⬇️ Установить", f"catalog_install_ask:{uuid}")])
         rows.append([("📥 Скачать исходник", f"catalog_source:{uuid}")])
         rows.append([("⬅️ Каталог", f"plugin_catalog:{page}")])
-        badge = "🛡 <b>Официальный плагин</b>" if item["is_official"] else "🧩 Плагин сообщества"
+        badge = (
+            "🛡 <b>Официальный плагин</b>"
+            if item["is_official"]
+            else (
+                "🤖 <b>СГЕНЕРИРОВАНО ИИ</b>\n🧩 Плагин сообщества"
+                if item["ai_generated"]
+                else "🧩 Плагин сообщества"
+            )
+        )
         await callback.message.answer(
             f"{badge}\n"
             f"<b>{html.escape(clipped(item['name'], 100))}</b> "
@@ -8067,7 +8537,8 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
             BufferedInputFile(item["source"].encode("utf-8"), filename=item["filename"]),
             caption=(
                 f"📄 Исходник <b>{html.escape(item['name'])}</b> v{html.escape(item['version'])}.\n"
-                "Проверьте код перед установкой: плагины выполняются с правами процесса бота."
+                + ("🤖 <b>СГЕНЕРИРОВАНО ИИ</b>\n" if item["ai_generated"] else "")
+                + "Проверьте код перед установкой: плагины выполняются с правами процесса бота."
             ),
         )
 
@@ -8106,12 +8577,19 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
             return
         await callback.answer("Устанавливаю…")
         try:
-            await manager.plugins.install(
+            installed_plugin = await manager.plugins.install(
                 callback.from_user.id,
                 item["filename"],
                 item["source"],
                 runtime,
             )
+            if item["ai_generated"]:
+                await db.mark_plugin_ai_generated(
+                    callback.from_user.id,
+                    installed_plugin.uuid,
+                    "Установлен из общего каталога",
+                    f"Копия AI-плагина автора {item['publisher_name']}",
+                )
         except Exception as exc:
             logger.exception("Не удалось установить плагин из каталога %s", uuid)
             await callback.message.answer(
@@ -8139,6 +8617,7 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
                     InlineKeyboardButton(text="🚀 Быстрый старт", callback_data="plugin_docs:start"),
                     InlineKeyboardButton(text="🧱 Структура", callback_data="plugin_docs:structure"),
                 ],
+                [InlineKeyboardButton(text="✨ AI-конструктор", callback_data="plugin_docs:builder")],
                 [
                     InlineKeyboardButton(text="⚡ Хуки", callback_data="plugin_docs:hooks"),
                     InlineKeyboardButton(text="🤖 Telegram API", callback_data="plugin_docs:telegram"),
@@ -8216,6 +8695,18 @@ BIND_TO_NEW_MESSAGE = [on_message]
                 "BIND_TO_DELETE — функция или None. "
                 "Неиспользуемые BIND_TO_* можно не объявлять: загрузчик считает их пустыми списками."
             ),
+            "builder": (
+                "✨ <b>AI-конструктор плагинов</b>\n\n"
+                "1. Откройте «Плагины → Создать плагин → Настройки» и задайте HTTPS Base URL, "
+                "API-токен и ID модели Anthropic.\n"
+                "2. Нажмите «Перейти к созданию» и подробно опишите поведение плагина.\n"
+                "3. На первом этапе модель получает запрос и полный PLUGIN_DEVELOPMENT.md; на втором "
+                "проверяет черновик по документации и исправляет синтаксис.\n"
+                "4. После локальной проверки плагин устанавливается автоматически.\n\n"
+                "В карточке AI-плагина есть неограниченное редактирование новым запросом. UUID сохраняется, "
+                "версия увеличивается. В каталоге и исходнике всегда показывается «СГЕНЕРИРОВАНО ИИ». "
+                "API-токен хранится зашифрованным. Проверяйте код: AI-пометка не гарантирует безопасность."
+            ),
             "hooks": (
                 "⚡ <b>Поддерживаемые хуки</b>\n\n"
                 "<b>Жизненный цикл:</b> PRE_INIT, POST_INIT, PRE_START, POST_START, PRE_STOP, POST_STOP.\n"
@@ -8274,7 +8765,8 @@ BIND_TO_NEW_MESSAGE = [on_message]
                 "При обновлении бот заново копирует метаданные и исходник текущей установленной версии. "
                 "Чужой или официальный UUID перезаписать нельзя. Публикацию можно убрать; уже установленные "
                 "копии у других пользователей сохранятся. Каталог сообщества не модерируется, поэтому "
-                "перед установкой скачивайте и проверяйте исходный файл."
+                "перед установкой скачивайте и проверяйте исходный файл. Созданные встроенным "
+                "конструктором расширения всегда публикуются с пометкой «СГЕНЕРИРОВАНО ИИ»."
             ),
         }
         text = pages.get(page)
@@ -8364,12 +8856,16 @@ BIND_TO_NEW_MESSAGE = [on_message]
         if not plugin:
             await callback.message.answer("Плагин не найден.")
             return
+        stored_plugin = await db.get_plugin(callback.from_user.id, uuid)
+        ai_generated = bool(stored_plugin and stored_plugin["ai_generated"])
         hooks_count = sum(len(value) for value in plugin.hooks.values())
         publication = await db.get_catalog_plugin(uuid)
         rows = []
         settings_callback = plugin_settings_callback_data(plugin)
         if settings_callback:
             rows.append([("⚙️ Настройки", settings_callback)])
+        if ai_generated:
+            rows.append([("✨ Редактировать через ИИ", f"ai_builder_edit:{uuid}")])
         telethon_status = "не используется"
         if plugin.telethon_enabled:
             telethon_row = await db.get_plugin_telethon_session(
@@ -8397,7 +8893,8 @@ BIND_TO_NEW_MESSAGE = [on_message]
             [("⬅️ Мои плагины", "my_plugins")],
         ])
         await callback.message.answer(
-            f"🧩 <b>{html.escape(plugin.name)}</b> v{html.escape(plugin.version)}\n"
+            ("🤖 <b>СГЕНЕРИРОВАНО ИИ</b>\n" if ai_generated else "")
+            + f"🧩 <b>{html.escape(plugin.name)}</b> v{html.escape(plugin.version)}\n"
             f"{html.escape(plugin.description)}\n\n"
             f"Автор: {html.escape(plugin.credits)}\n"
             f"UUID: <code>{plugin.uuid}</code>\n"
@@ -8782,8 +9279,10 @@ BIND_TO_NEW_MESSAGE = [on_message]
             await message.answer("❌ Плагин больше не установлен.")
             return
         await state.update_data(catalog_description=description)
+        ai_badge = "🤖 <b>СГЕНЕРИРОВАНО ИИ</b>\n" if plugin["ai_generated"] else ""
         await message.answer(
             "🔎 <b>Предпросмотр публикации</b>\n\n"
+            f"{ai_badge}"
             f"<b>{html.escape(clipped(plugin['name'], 100))}</b> "
             f"v{html.escape(clipped(plugin['version'], 30))}\n"
             f"<i>{html.escape(clipped(plugin['description'], 500))}</i>\n\n"
@@ -8817,8 +9316,14 @@ BIND_TO_NEW_MESSAGE = [on_message]
             )
             return
         await callback.answer("Опубликовано")
+        published_plugin = await db.get_plugin(callback.from_user.id, uuid)
         await callback.message.answer(
-            "✅ Плагин опубликован в общем каталоге. Описание и исходник теперь видны другим пользователям.",
+            "✅ Плагин опубликован в общем каталоге. Описание и исходник теперь видны другим пользователям."
+            + (
+                "\n🤖 В карточке каталога добавлена обязательная пометка «СГЕНЕРИРОВАНО ИИ»."
+                if published_plugin and published_plugin["ai_generated"]
+                else ""
+            ),
             reply_markup=keyboard([[('🧭 Открыть публикацию', f"catalog_view:{uuid}:0")]]),
         )
 
