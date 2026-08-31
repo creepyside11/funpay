@@ -9,6 +9,7 @@ import requests
 
 import bot as bot_module
 from bot import (
+    AUTO_SMM_PLUGIN_UUID,
     PLAYEROK_PLUGIN_DOCUMENTATION_PATH,
     PLUGIN_CATALOG_DESCRIPTION_MAX,
     PLUGIN_CATALOG_DESCRIPTION_MIN,
@@ -1467,6 +1468,12 @@ def test_ready_plugins_have_valid_cardinal_sources(tmp_path):
     assert channel_boost.hooks["BIND_TO_TELETHON_READY"]
     assert channel_boost.hooks["BIND_TO_NEW_ORDER"]
     assert channel_boost.hooks["BIND_TO_NEW_MESSAGE"]
+    auto_smm = next(
+        plugin for plugin in loaded if plugin.uuid == AUTO_SMM_PLUGIN_UUID
+    )
+    assert auto_smm.telethon_enabled is False
+    assert auto_smm.hooks["BIND_TO_NEW_ORDER"]
+    assert auto_smm.hooks["BIND_TO_NEW_MESSAGE"]
 
 
 def test_official_plugin_seed_refreshes_already_installed_sources():

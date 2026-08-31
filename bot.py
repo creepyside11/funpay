@@ -93,6 +93,7 @@ AUTO_LOTS_PLUGIN_UUID = "77b095e0-13a1-4e12-9c52-3a7b83a89b11"
 ADVANCED_STATS_PLUGIN_UUID = "c55a4072-eab8-4d87-8f17-b111e4b8bb22"
 STATUS_PLUGIN_UUID = "b19339bb-8f13-49cb-a4c1-0d3a55e1cc33"
 TELEGRAM_CHANNEL_BOOST_PLUGIN_UUID = "3f4874b9-0797-4d4a-aba6-c69aa63b2e08"
+AUTO_SMM_PLUGIN_UUID = "6a76248a-f44d-4fc3-98d5-d40c0a2663b7"
 PLUGIN_SETTINGS_CALLBACK_PREFIX = "47"
 PLUGIN_TELETHON_DISCONNECT_ASK_PREFIX = "pt_disc_ask:"
 PLUGIN_TELETHON_DISCONNECT_DO_PREFIX = "pt_disc_do:"
@@ -157,6 +158,18 @@ READY_PLUGINS = (
         "в совместимый SMM API, одновременно проверяет статус SMM-заказа и реальное число "
         "подписчиков, затем подтверждает username покупателя и безопасно передаёт ему владельца.",
         source_file="TelegramChannelBoost.py",
+        builtin_settings=False,
+    ),
+    ReadyPluginSpec(
+        AUTO_SMM_PLUGIN_UUID,
+        "AutoSmm.py",
+        "AutoSmm",
+        "1.0.0",
+        "Автоматические SMM-заказы для нескольких лотов",
+        "Позволяет привязать несколько лотов FunPay к разным услугам совместимого SMM API. "
+        "Для каждой привязки задаются ID услуги и количество на одну купленную единицу; "
+        "плагин запрашивает у покупателя ссылку, подтверждает её, создаёт заказ и отслеживает статус.",
+        source_file="AutoSmm.py",
         builtin_settings=False,
     ),
 )
