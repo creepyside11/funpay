@@ -32,7 +32,7 @@ from telethon.tl.types import ChatAdminRights, InputChannel
 
 
 NAME = "Telegram Channel Boost"
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 DESCRIPTION = "Создание, раскрутка и передача Telegram-каналов покупателям FunPay"
 CREDITS = "FunPay aiogram bot"
 SETTINGS_PAGE = True
@@ -53,6 +53,7 @@ _pending_input: tuple[str, int | None] | None = None
 _lot_cache: dict[str, str] = {}
 _futures: set[Future[Any]] = set()
 _running_job_ids: set[int] = set()
+_running_transfer_ids: set[int] = set()
 
 
 def _markup(*rows: list[tuple[str, str]]) -> InlineKeyboardMarkup:
@@ -260,7 +261,7 @@ def _status_label(status: str) -> str:
         "awaiting_username": "ожидается @username",
         "username_confirmation": "ожидается подтверждение username",
         "awaiting_join": "ожидается вступление покупателя",
-        "awaiting_owner_2fa": "ожидается 2FA владельца",
+        "awaiting_owner_2fa": "автоматическая передача владельца",
         "completed": "владелец передан",
         "canceled": "заказ отменён",
         "failed": "ошибка",
@@ -288,7 +289,7 @@ def _show_settings(chat_id: int) -> None:
         "",
         f"Готовность: <b>{'✅ настроено' if _settings_ready(settings) and telethon_ready else '⚠️ требуется настройка'}</b>",
         "",
-        "Пароль 2FA не хранится. Для передачи владельца бот запросит его у вас один раз и удалит сообщение.",
+        "Пароль 2FA хранится только зашифрованно в Telethon-сессии и используется для автоматической передачи владельца.",
     ]
     if jobs:
         lines.extend(["", "<b>Последние задания</b>"])
@@ -308,14 +309,6 @@ def _show_settings(chat_id: int) -> None:
         [("🛒 Выбрать Telegram-лот", f"{CALLBACK_PREFIX}lots")],
         [("🧪 Проверить API", f"{CALLBACK_PREFIX}api_test")],
     ]
-    waiting_2fa = [job for job in jobs if job["status"] == "awaiting_owner_2fa"]
-    for job in waiting_2fa:
-        rows.append(
-            [(
-                f"🔐 Передать владельца #{job['order_id']}",
-                f"{CALLBACK_PREFIX}2fa:{job['id']}",
-            )]
-        )
     rows.append([("🔄 Обновить", SETTINGS_CALLBACK)])
     _bot().send_message(chat_id, "\n".join(lines), reply_markup=_markup(*rows))
 
@@ -413,7 +406,7 @@ async def _api_test(chat_id: int) -> None:
     except Exception as exc:
         logger.exception("Проверка SMM API не выполнена")
         text = f"❌ SMM API не отвечает: <code>{html.escape(str(exc)[:500])}</code>"
-    _bot().send_message(chat_id, text)
+    await asyncio.to_thread(_bot().send_message, chat_id, text)
 
 
 def _on_callback(call: Any) -> None:
@@ -446,15 +439,6 @@ def _on_callback(call: Any) -> None:
             _show_settings(chat_id)
         elif data == f"{CALLBACK_PREFIX}api_test":
             _spawn(_api_test(chat_id))
-        elif data.startswith(f"{CALLBACK_PREFIX}2fa:"):
-            job_id = int(data.rsplit(":", 1)[1])
-            _prompt(
-                chat_id,
-                "ownership_2fa",
-                "🔐 Отправьте тот же пароль 2FA, который используется в подключённом Telegram-аккаунте. "
-                "Он нужен только для передачи владельца, будет удалён и не сохранится.",
-                job_id,
-            )
     except Exception as exc:
         logger.exception("Ошибка callback Telegram Channel Boost")
         _bot().send_message(chat_id, f"❌ {html.escape(str(exc)[:500])}")
@@ -469,7 +453,7 @@ def _on_setting_message(message: Any) -> None:
     value = str(message.text or "").strip()
     chat_id = int(message.chat.id)
     try:
-        if key in {"token", "ownership_2fa"}:
+        if key == "token":
             try:
                 _bot().delete_message(chat_id, message.message_id)
             except Exception:
@@ -492,12 +476,6 @@ def _on_setting_message(message: Any) -> None:
                 "target": "target_members",
             }[key]
             _sync(_set_setting(column, number))
-        elif key == "ownership_2fa":
-            if not value or job_id is None:
-                raise ValueError("пароль 2FA не указан")
-            _spawn(_transfer_owner(job_id, value, chat_id))
-            _bot().send_message(chat_id, "⏳ Проверяю 2FA и передаю владельца…")
-            return
         _bot().send_message(chat_id, "✅ Настройка сохранена.")
         _show_settings(chat_id)
     except Exception as exc:
@@ -580,6 +558,13 @@ async def _notify_owner(text: str, reply_markup: Any | None = None) -> None:
         text,
         reply_markup=reply_markup,
     )
+
+
+async def _stored_2fa_password() -> str | None:
+    service = getattr(_cardinal.plugin_manager, "telethon_service", None)
+    if service is None:
+        return None
+    return await service.get_2fa_password(_telegram_id(), UUID)
 
 
 async def _create_public_channel(order_id: str) -> tuple[Any, str]:
@@ -811,6 +796,24 @@ async def _resume_jobs() -> None:
     )
 
 
+async def _resume_transfers() -> None:
+    password = await _stored_2fa_password()
+    if not password:
+        return
+    rows = await _db().fetch(
+        """
+        SELECT id FROM telegram_channel_boost_jobs
+         WHERE telegram_id=$1 AND status='awaiting_owner_2fa'
+         ORDER BY created_at
+        """,
+        _telegram_id(),
+    )
+    await asyncio.gather(
+        *[_transfer_owner(int(row["id"]), password) for row in rows],
+        return_exceptions=True,
+    )
+
+
 async def _active_buyer_job(chat_id: str) -> Any | None:
     return await _db().fetchrow(
         """
@@ -856,20 +859,18 @@ async def _verify_buyer(job: Any) -> None:
     await _update_job(job["id"], status="awaiting_owner_2fa")
     await _funpay_send(
         job,
-        f"✅ {username} найден в канале. Продавцу отправлен безопасный запрос 2FA для передачи владельца.",
+        f"✅ {username} найден в канале. Автоматически передаю вам права владельца.",
     )
-    await _notify_owner(
-        "🔐 <b>Покупатель готов получить канал</b>\n\n"
-        f"Заказ: <code>#{html.escape(job['order_id'])}</code>\n"
-        f"Покупатель: <b>{html.escape(username)}</b>\n\n"
-        "Нажмите кнопку и введите пароль 2FA. Он не будет сохранён.",
-        reply_markup=_markup(
-            [(
-                "🔐 Ввести 2FA и передать владельца",
-                f"{CALLBACK_PREFIX}2fa:{job['id']}",
-            )]
-        ),
-    )
+    password = await _stored_2fa_password()
+    if not password:
+        await _notify_owner(
+            "⚠️ <b>Нельзя автоматически передать Telegram-канал</b>\n\n"
+            f"Заказ: <code>#{html.escape(job['order_id'])}</code>\n"
+            "В сохранённой Telethon-сессии нет пароля 2FA. Авторизуйте Telegram-аккаунт "
+            "заново через номер, код и 2FA — после входа передача продолжится автоматически."
+        )
+        return
+    await _transfer_owner(int(job["id"]), password)
 
 
 async def _process_funpay_message(message: dict[str, Any]) -> None:
@@ -903,18 +904,21 @@ async def _process_funpay_message(message: dict[str, Any]) -> None:
         )
 
 
-async def _transfer_owner(job_id: int, password: str, owner_chat_id: int) -> None:
-    job = await _job(job_id)
-    if not job or job["status"] != "awaiting_owner_2fa":
-        _bot().send_message(owner_chat_id, "❌ Это задание уже не ожидает передачи владельца.")
+async def _transfer_owner(job_id: int, password: str) -> None:
+    if job_id in _running_transfer_ids:
         return
-    if _client is None or not _client.is_connected():
-        _bot().send_message(owner_chat_id, "❌ Telethon не подключён.")
-        return
+    _running_transfer_ids.add(job_id)
+    job: Any | None = None
     channel: InputChannel | None = None
     user: Any | None = None
     promoted = False
     try:
+        job = await _job(job_id)
+        if not job or job["status"] != "awaiting_owner_2fa":
+            return
+        if _client is None or not _client.is_connected():
+            await _notify_owner("❌ Telethon не подключён; автоматическая передача канала отложена.")
+            return
         user = await _client.get_entity(job["buyer_username"])
         channel = _input_channel(job)
         await _client(GetParticipantRequest(channel, user))
@@ -947,34 +951,40 @@ async def _transfer_owner(job_id: int, password: str, owner_chat_id: int) -> Non
     except PasswordHashInvalidError:
         if promoted and channel is not None and user is not None:
             await _revoke_admin(channel, user)
-        _bot().send_message(owner_chat_id, "❌ Неверный пароль 2FA. Нажмите кнопку задания и попробуйте ещё раз.")
+        await _notify_owner(
+            "❌ Сохранённый пароль 2FA больше не подходит. Авторизуйте Telegram-аккаунт "
+            "плагина заново; передача продолжится автоматически."
+        )
         return
     except UserNotParticipantError:
         await _update_job(job_id, status="awaiting_join")
-        await _funpay_send(job, "Вы покинули канал. Вступите снова и отправьте #проверить.")
-        _bot().send_message(owner_chat_id, "❌ Покупатель больше не состоит в канале.")
+        if job:
+            await _funpay_send(job, "Вы покинули канал. Вступите снова и отправьте #проверить.")
+        await _notify_owner("❌ Покупатель больше не состоит в канале.")
         return
     except Exception as exc:
         if promoted and channel is not None and user is not None:
             await _revoke_admin(channel, user)
         logger.exception("Не удалось передать владельца Telegram-канала")
-        _bot().send_message(
-            owner_chat_id,
+        await _notify_owner(
             "❌ Telegram не передал владельца. Проверьте, что 2FA включена более 7 дней, "
             "текущая сессия активна более 24 часов и на аккаунте нет ограничения публичных каналов.\n\n"
             f"Ошибка: <code>{html.escape(str(exc)[:500])}</code>",
         )
         return
-    await _update_job(job_id, status="completed", error_text=None)
-    await _funpay_send(
-        job,
-        f"✅ Права владельца канала {job['channel_url']} переданы пользователю {job['buyer_username']}. "
-        "Заказ выполнен; подтвердите выполнение на FunPay после проверки.",
-    )
-    _bot().send_message(
-        owner_chat_id,
-        f"✅ Владелец канала по заказу <code>#{html.escape(job['order_id'])}</code> успешно передан.",
-    )
+    else:
+        await _update_job(job_id, status="completed", error_text=None)
+        await _funpay_send(
+            job,
+            f"✅ Права владельца канала {job['channel_url']} переданы пользователю {job['buyer_username']}. "
+            "Заказ выполнен; подтвердите выполнение на FunPay после проверки.",
+        )
+        await _notify_owner(
+            f"✅ Владелец канала по заказу <code>#{html.escape(job['order_id'])}</code> "
+            f"автоматически передан пользователю <b>{html.escape(job['buyer_username'])}</b>."
+        )
+    finally:
+        _running_transfer_ids.discard(job_id)
 
 
 async def _revoke_admin(channel: InputChannel, user: Any) -> None:
@@ -1026,6 +1036,7 @@ def telethon_ready(cardinal: Any, client: Any) -> None:
     _cardinal = cardinal
     _client = client
     _spawn(_resume_jobs())
+    _spawn(_resume_transfers())
 
 
 def telethon_disconnected(cardinal: Any, client: Any) -> None:

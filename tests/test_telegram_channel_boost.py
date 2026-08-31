@@ -76,7 +76,7 @@ def test_smm_request_uses_standard_post_contract_without_redirects(monkeypatch):
 
 def test_wrong_2fa_is_checked_before_buyer_gets_admin_rights(monkeypatch):
     calls = []
-    messages = []
+    notifications = []
     job = {
         "id": 8,
         "status": "awaiting_owner_2fa",
@@ -109,19 +109,16 @@ def test_wrong_2fa_is_checked_before_buyer_gets_admin_rights(monkeypatch):
     monkeypatch.setattr(plugin, "_client", fake_client)
     monkeypatch.setattr(plugin, "_job", lambda _job_id: _async_value(job))
     monkeypatch.setattr(plugin, "compute_check", lambda _state, _password: object())
-    monkeypatch.setattr(
-        plugin,
-        "_bot",
-        lambda: SimpleNamespace(
-            send_message=lambda chat_id, text: messages.append((chat_id, text))
-        ),
-    )
+    async def notify(text, **_kwargs):
+        notifications.append(text)
 
-    asyncio.run(plugin._transfer_owner(8, "wrong-password", 42))
+    monkeypatch.setattr(plugin, "_notify_owner", notify)
+
+    asyncio.run(plugin._transfer_owner(8, "wrong-password"))
 
     assert "GetPasswordSettingsRequest" in calls
     assert "EditAdminRequest" not in calls
-    assert messages and "Неверный пароль 2FA" in messages[-1][1]
+    assert notifications and "пароль 2FA" in notifications[-1]
 
 
 def test_owner_transfer_validates_password_then_promotes_and_transfers(monkeypatch):
@@ -158,13 +155,9 @@ def test_owner_transfer_validates_password_then_promotes_and_transfers(monkeypat
     monkeypatch.setattr(plugin, "compute_check", lambda _state, _password: object())
     monkeypatch.setattr(plugin, "_update_job", update_job)
     monkeypatch.setattr(plugin, "_funpay_send", lambda *_args: _async_value(None))
-    monkeypatch.setattr(
-        plugin,
-        "_bot",
-        lambda: SimpleNamespace(send_message=lambda *_args, **_kwargs: None),
-    )
+    monkeypatch.setattr(plugin, "_notify_owner", lambda *_args: _async_value(None))
 
-    asyncio.run(plugin._transfer_owner(9, "correct-password", 42))
+    asyncio.run(plugin._transfer_owner(9, "correct-password"))
 
     assert calls == [
         "GetParticipantRequest",
@@ -175,6 +168,54 @@ def test_owner_transfer_validates_password_then_promotes_and_transfers(monkeypat
         "EditChatCreatorRequest",
     ]
     assert updates == [(9, {"status": "completed", "error_text": None})]
+
+
+def test_verified_buyer_is_transferred_automatically_with_saved_2fa(monkeypatch):
+    events = []
+    job = {
+        "id": 11,
+        "buyer_username": "@buyer_name",
+        "channel_id": 123,
+        "channel_access_hash": 456,
+        "order_id": "ORDER-3",
+        "channel_url": "https://t.me/fptestchannel",
+    }
+
+    class FakeClient:
+        @staticmethod
+        def is_connected():
+            return True
+
+        async def get_entity(self, username):
+            return SimpleNamespace(id=99, username=username)
+
+        async def __call__(self, request):
+            events.append(type(request).__name__)
+            return object()
+
+    async def update_job(job_id, **values):
+        events.append(("update", job_id, values))
+
+    async def funpay_send(_job, text):
+        events.append(("buyer", text))
+
+    async def transfer(job_id, password):
+        events.append(("transfer", job_id, password))
+
+    monkeypatch.setattr(plugin, "_client", FakeClient())
+    monkeypatch.setattr(plugin, "_update_job", update_job)
+    monkeypatch.setattr(plugin, "_funpay_send", funpay_send)
+    monkeypatch.setattr(plugin, "_stored_2fa_password", lambda: _async_value("saved-2fa"))
+    monkeypatch.setattr(plugin, "_transfer_owner", transfer)
+
+    asyncio.run(plugin._verify_buyer(job))
+
+    assert ("transfer", 11, "saved-2fa") in events
+    assert any(
+        event[0] == "update" and event[2]["status"] == "awaiting_owner_2fa"
+        for event in events
+        if isinstance(event, tuple)
+    )
 
 
 async def _async_value(value):

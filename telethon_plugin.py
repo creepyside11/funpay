@@ -112,6 +112,8 @@ class PluginTelethonService:
         plugin_uuid: str,
         phone: str,
         client: TelegramClient,
+        *,
+        password: str | None = None,
     ) -> Any:
         self.loop = asyncio.get_running_loop()
         if not await client.is_user_authorized():
@@ -123,6 +125,7 @@ class PluginTelethonService:
             plugin_uuid,
             self.secrets.encrypt(phone),
             self.secrets.encrypt(session),
+            self.secrets.encrypt(password) if password else None,
             int(me.id),
             getattr(me, "username", None),
         )
@@ -131,6 +134,13 @@ class PluginTelethonService:
             await old.disconnect()
         self.clients[(telegram_id, plugin_uuid)] = client
         return me
+
+    async def get_2fa_password(
+        self, telegram_id: int, plugin_uuid: str
+    ) -> str | None:
+        row = await self.db.get_plugin_telethon_session(telegram_id, plugin_uuid)
+        encrypted = row["password_enc"] if row else None
+        return self.secrets.decrypt(encrypted) if encrypted else None
 
     async def stop_plugin(
         self, telegram_id: int, plugin_uuid: str, *, delete_session: bool = False

@@ -13,6 +13,8 @@ from bot import (
     PLUGIN_CATALOG_DESCRIPTION_MAX,
     PLUGIN_CATALOG_DESCRIPTION_MIN,
     PLUGIN_DOCUMENTATION_PATH,
+    PLUGIN_TELETHON_DISCONNECT_ASK_PREFIX,
+    PLUGIN_TELETHON_DISCONNECT_DO_PREFIX,
     READY_PLUGINS,
     SecretBox,
     TELEGRAM_CHANNEL_BOOST_PLUGIN_UUID,
@@ -1274,6 +1276,15 @@ def test_plugin_settings_button_uses_cardinal_callback_contract():
     )
 
 
+def test_plugin_telethon_disconnect_callbacks_fit_telegram_limit():
+    for prefix in (
+        PLUGIN_TELETHON_DISCONNECT_ASK_PREFIX,
+        PLUGIN_TELETHON_DISCONNECT_DO_PREFIX,
+    ):
+        callback_data = f"{prefix}{TELEGRAM_CHANNEL_BOOST_PLUGIN_UUID}"
+        assert len(callback_data.encode("utf-8")) <= 64
+
+
 def test_cardinal_plugin_contract_is_loaded(tmp_path):
     source = '''
 from cardinal import get_cardinal
@@ -1332,10 +1343,17 @@ def test_telethon_service_encrypts_session_and_bridge_runs_awaitables():
         async def delete_plugin_telethon_session(self, telegram_id, uuid):
             saved["deleted"] = (telegram_id, uuid)
 
+        async def get_plugin_telethon_session(self, _telegram_id, _uuid):
+            return {"password_enc": saved["args"][4]}
+
     class FakeSecrets:
         @staticmethod
         def encrypt(value):
             return f"encrypted:{value}"
+
+        @staticmethod
+        def decrypt(value):
+            return value.removeprefix("encrypted:")
 
     class FakeSession:
         @staticmethod
@@ -1358,15 +1376,22 @@ def test_telethon_service_encrypts_session_and_bridge_runs_awaitables():
     async def exercise():
         service = PluginTelethonService(FakeDatabase(), FakeSecrets())
         client = FakeClient()
-        me = await service.activate(10, "plugin-uuid", "+79991234567", client)
+        me = await service.activate(
+            10,
+            "plugin-uuid",
+            "+79991234567",
+            client,
+            password="2fa-secret",
+        )
+        password = await service.get_2fa_password(10, "plugin-uuid")
         result = await asyncio.to_thread(
             service.bridge(10).run,
             asyncio.sleep(0, result="bridge-ok"),
         )
         await service.stop_plugin(10, "plugin-uuid", delete_session=True)
-        return me, result, client
+        return me, result, password, client
 
-    me, result, client = asyncio.run(exercise())
+    me, result, password, client = asyncio.run(exercise())
 
     assert me.id == 77
     assert result == "bridge-ok"
@@ -1375,9 +1400,11 @@ def test_telethon_service_encrypts_session_and_bridge_runs_awaitables():
         "plugin-uuid",
         "encrypted:+79991234567",
         "encrypted:session-secret",
+        "encrypted:2fa-secret",
         77,
         "tester",
     )
+    assert password == "2fa-secret"
     assert saved["deleted"] == (10, "plugin-uuid")
     assert client.disconnected is True
 
@@ -1440,6 +1467,26 @@ def test_ready_plugins_have_valid_cardinal_sources(tmp_path):
     assert channel_boost.hooks["BIND_TO_TELETHON_READY"]
     assert channel_boost.hooks["BIND_TO_NEW_ORDER"]
     assert channel_boost.hooks["BIND_TO_NEW_MESSAGE"]
+
+
+def test_official_plugin_seed_refreshes_already_installed_sources():
+    calls = []
+
+    class FakeDatabase:
+        async def execute(self, query, *args):
+            calls.append((query, args))
+
+    asyncio.run(bot_module.Database.seed_official_plugins(FakeDatabase()))
+
+    refreshes = [call for call in calls if "UPDATE funpay_plugins" in call[0]]
+    assert len(refreshes) == len(READY_PLUGINS)
+    channel_boost = next(
+        args
+        for _query, args in refreshes
+        if args[0] == TELEGRAM_CHANNEL_BOOST_PLUGIN_UUID
+    )
+    assert channel_boost[3] == "1.0.1"
+    assert 'VERSION = "1.0.1"' in channel_boost[5]
 
 
 def test_catalog_description_validation_and_publisher_name():
