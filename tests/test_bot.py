@@ -9,6 +9,7 @@ import requests
 
 import bot as bot_module
 from bot import (
+    AI_ASSISTANT_PLUGIN_UUID,
     AUTO_SMM_PLUGIN_UUID,
     PLAYEROK_PLUGIN_DOCUMENTATION_PATH,
     PLUGIN_CATALOG_DESCRIPTION_MAX,
@@ -1474,6 +1475,13 @@ def test_ready_plugins_have_valid_cardinal_sources(tmp_path):
     assert auto_smm.telethon_enabled is False
     assert auto_smm.hooks["BIND_TO_NEW_ORDER"]
     assert auto_smm.hooks["BIND_TO_NEW_MESSAGE"]
+    ai_assistant = next(
+        plugin for plugin in loaded if plugin.uuid == AI_ASSISTANT_PLUGIN_UUID
+    )
+    assert ai_assistant.telethon_enabled is False
+    assert ai_assistant.hooks["BIND_TO_INIT_ORDER"]
+    assert ai_assistant.hooks["BIND_TO_NEW_ORDER"]
+    assert ai_assistant.hooks["BIND_TO_NEW_MESSAGE"]
 
 
 def test_official_plugin_seed_refreshes_already_installed_sources():
@@ -1501,6 +1509,13 @@ def test_official_plugin_seed_refreshes_already_installed_sources():
     )
     assert auto_smm[3] == "1.1.0"
     assert 'VERSION = "1.1.0"' in auto_smm[5]
+    ai_assistant = next(
+        args
+        for _query, args in refreshes
+        if args[0] == AI_ASSISTANT_PLUGIN_UUID
+    )
+    assert ai_assistant[3] == "1.0.0"
+    assert 'VERSION = "1.0.0"' in ai_assistant[5]
 
 
 def test_catalog_description_validation_and_publisher_name():

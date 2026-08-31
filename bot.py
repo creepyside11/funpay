@@ -94,6 +94,7 @@ ADVANCED_STATS_PLUGIN_UUID = "c55a4072-eab8-4d87-8f17-b111e4b8bb22"
 STATUS_PLUGIN_UUID = "b19339bb-8f13-49cb-a4c1-0d3a55e1cc33"
 TELEGRAM_CHANNEL_BOOST_PLUGIN_UUID = "3f4874b9-0797-4d4a-aba6-c69aa63b2e08"
 AUTO_SMM_PLUGIN_UUID = "6a76248a-f44d-4fc3-98d5-d40c0a2663b7"
+AI_ASSISTANT_PLUGIN_UUID = "1d8870db-4d2c-4e8a-9d5f-884cbfa13fe1"
 PLUGIN_SETTINGS_CALLBACK_PREFIX = "47"
 PLUGIN_TELETHON_DISCONNECT_ASK_PREFIX = "pt_disc_ask:"
 PLUGIN_TELETHON_DISCONNECT_DO_PREFIX = "pt_disc_do:"
@@ -171,6 +172,18 @@ READY_PLUGINS = (
         "плагин подтверждает ссылку, создаёт заказ, отслеживает статус и по настройке лота "
         "позволяет покупателю запросить рефилл командой #рефилл.",
         source_file="AutoSmm.py",
+        builtin_settings=False,
+    ),
+    ReadyPluginSpec(
+        AI_ASSISTANT_PLUGIN_UUID,
+        "AIAssistant.py",
+        "AI Assistant",
+        "1.0.0",
+        "AI-помощник покупателям для выбранных лотов",
+        "Подключается к Anthropic-совместимому Messages API через официальный Python SDK. "
+        "Для каждого лота хранит отдельный системный промпт и отвечает покупателю, когда "
+        "тот смотрит привязанный товар или уже оформил по нему заказ.",
+        source_file="AIAssistant.py",
         builtin_settings=False,
     ),
 )
