@@ -1,10273 +1,2575 @@
-from __future__ import annotations
-
-import asyncio
-import base64
-import hashlib
-import html
-import logging
-import os
-import re
-import threading
-from collections import Counter, defaultdict
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
-from http.cookies import CookieError, SimpleCookie
-from io import BytesIO
-from pathlib import Path
-from types import SimpleNamespace
-from typing import Any
-from urllib.parse import urlsplit
-
-import asyncpg
-import certifi
-from aiogram import Bot, Dispatcher, F, Router
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ChatType, ParseMode
-from aiogram.exceptions import TelegramBadRequest
-from aiogram.filters import Command, CommandStart
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import (
-    BotCommand,
-    BufferedInputFile,
-    CallbackQuery,
-    ErrorEvent,
-    FSInputFile,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    Message,
-)
-from cryptography.fernet import Fernet, InvalidToken
-from telethon.errors import (
-    FloodWaitError,
-    PasswordHashInvalidError,
-    PhoneCodeExpiredError,
-    PhoneCodeInvalidError,
-    PhoneNumberInvalidError,
-    SessionPasswordNeededError,
-)
-
-from FunPayAPI import Account, Runner, events, types
-from FunPayAPI import exceptions as fp_exceptions
-from ai_plugin_builder import (
-    DEFAULT_API_BASE_URL as AI_BUILDER_DEFAULT_API_BASE_URL,
-    AIPluginBuilderError,
-    AnthropicPluginBuilder,
-    generated_filename,
-    inspect_generated_source,
-    validate_api_base_url as validate_ai_builder_api_base_url,
-    validate_model_id as validate_ai_builder_model_id,
-    validate_plugin_request,
-)
-from playerok_plugin_system import (
-    PLAYEROK_READY_PLUGIN_BY_UUID,
-    PLAYEROK_READY_PLUGINS,
-    PlayerokPluginData,
-    PlayerokPluginManager,
-    PlayerokPluginValidationError,
-    playerok_ready_plugin_source,
-    playerok_setting_label,
-)
-from plugin_system import PluginData, PluginManager, PluginValidationError
-from telethon_plugin import PluginTelethonService, TelethonConfigurationError
-
-PLAYEROK_IMPORT_ERROR: ImportError | None = None
-try:
-    from playerokapi.account import Account as PlayerokAccount
-    from playerokapi.enums import ItemDealDirections as PlayerokItemDealDirections
-    from playerokapi.enums import ItemDealStatuses as PlayerokItemDealStatuses
-    from playerokapi.enums import ItemStatuses as PlayerokItemStatuses
-except ImportError as exc:  # –û—Å—Ç–∞–≤–ª—è–µ–º FunPay –¥–æ—Å—Ç—É–ø–Ω—ã–º –ø—Ä–∏ –Ω–µ–ø–æ–ª–Ω–æ–π –ª–æ–∫–∞–ª—å–Ω–æ–π —Å–±–æ—Ä–∫–µ.
-    PLAYEROK_IMPORT_ERROR = exc
-    PlayerokAccount = None
-    PlayerokItemDealDirections = None
-    PlayerokItemDealStatuses = None
-    PlayerokItemStatuses = None
-
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO").upper(),
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
-logger = logging.getLogger("funpay_bot")
-
-USER_AGENT = (
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
-)
-PLUGIN_DOCUMENTATION_PATH = Path(__file__).with_name("PLUGIN_DEVELOPMENT.md")
-PLAYEROK_PLUGIN_DOCUMENTATION_PATH = Path(__file__).with_name(
-    "PLAYEROK_PLUGIN_DEVELOPMENT.md"
-)
-
-AUTO_LOTS_PLUGIN_UUID = "77b095e0-13a1-4e12-9c52-3a7b83a89b11"
-ADVANCED_STATS_PLUGIN_UUID = "c55a4072-eab8-4d87-8f17-b111e4b8bb22"
-STATUS_PLUGIN_UUID = "b19339bb-8f13-49cb-a4c1-0d3a55e1cc33"
-TELEGRAM_CHANNEL_BOOST_PLUGIN_UUID = "3f4874b9-0797-4d4a-aba6-c69aa63b2e08"
-AUTO_SMM_PLUGIN_UUID = "6a76248a-f44d-4fc3-98d5-d40c0a2663b7"
-AI_ASSISTANT_PLUGIN_UUID = "1d8870db-4d2c-4e8a-9d5f-884cbfa13fe1"
-PLUGIN_SETTINGS_CALLBACK_PREFIX = "47"
-PLUGIN_TELETHON_DISCONNECT_ASK_PREFIX = "pt_disc_ask:"
-PLUGIN_TELETHON_DISCONNECT_DO_PREFIX = "pt_disc_do:"
-PLUGIN_CATALOG_PAGE_SIZE = 6
-PLUGIN_CATALOG_DESCRIPTION_MIN = 40
-PLUGIN_CATALOG_DESCRIPTION_MAX = 2000
-AI_BUILDER_TOKEN_MASK = "‚Ä¢‚Ä¢‚Ä¢‚Ä¢‚Ä¢‚Ä¢‚Ä¢‚Ä¢"
-PLAYEROK_POLL_SECONDS = 20
-PLAYEROK_AUTO_PUBLISH_SECONDS = 300
-PLUGIN_STOP_TIMEOUT = 10
-PLUGIN_LOAD_TIMEOUT = 20
-
-
-@dataclass(frozen=True, slots=True)
-class ReadyPluginSpec:
-    uuid: str
-    filename: str
-    name: str
-    version: str
-    description: str
-    details: str
-    source_file: str | None = None
-    builtin_settings: bool = True
-
-
-READY_PLUGINS = (
-    ReadyPluginSpec(
-        AUTO_LOTS_PLUGIN_UUID,
-        "AutoLotsPlugin.py",
-        "AutoLotsPlugin",
-        "1.0.0",
-        "–ú–∞—Å—Å–æ–≤–æ–µ —É–ø—Ä–∞–≤–ª–µ–Ω–∏–µ –ª–æ—Ç–∞–º–∏",
-        "–ü–æ–∫–∞–∑—ã–≤–∞–µ—Ç –∞–∫—Ç–∏–≤–Ω—ã–µ –∏ –≤—ã–∫–ª—é—á–µ–Ω–Ω—ã–µ –ª–æ—Ç—ã, –º–∞—Å—Å–æ–≤–æ –∞–∫—Ç–∏–≤–∏—Ä—É–µ—Ç –∏–ª–∏ "
-        "–¥–µ–∞–∫—Ç–∏–≤–∏—Ä—É–µ—Ç –æ–±—ã—á–Ω—ã–µ –∏ –≤–∞–ª—é—Ç–Ω—ã–µ –ø—Ä–µ–¥–ª–æ–∂–µ–Ω–∏—è. –û–±—ã—á–Ω—ã–µ –ª–æ—Ç—ã –º–æ–∂–Ω–æ –º–∞—Å—Å–æ–≤–æ —É–¥–∞–ª–∏—Ç—å; "
-        "–≤–∞–ª—é—Ç–Ω—ã–µ –ø—Ä–µ–¥–ª–æ–∂–µ–Ω–∏—è –ø—Ä–∏ —É–¥–∞–ª–µ–Ω–∏–∏ –±–µ–∑–æ–ø–∞—Å–Ω–æ –¥–µ–∞–∫—Ç–∏–≤–∏—Ä—É—é—Ç—Å—è.",
-    ),
-    ReadyPluginSpec(
-        ADVANCED_STATS_PLUGIN_UUID,
-        "AdvancedProfileStats.py",
-        "Advanced Profile Stats",
-        "1.0.0",
-        "–†–∞—Å—à–∏—Ä–µ–Ω–Ω–∞—è —Å—Ç–∞—Ç–∏—Å—Ç–∏–∫–∞ –ø—Ä–æ—Ñ–∏–ª—è",
-        "–°—á–∏—Ç–∞–µ—Ç –ø—Ä–æ–¥–∞–∂–∏, –∑–∞–∫—Ä—ã—Ç—ã–µ –∏ –≤–æ–∑–≤—Ä–∞—â—ë–Ω–Ω—ã–µ –∑–∞–∫–∞–∑—ã, —É–Ω–∏–∫–∞–ª—å–Ω—ã—Ö –ø–æ–∫—É–ø–∞—Ç–µ–ª–µ–π, "
-        "–≤—ã—Ä—É—á–∫—É –∏ –ø–æ–ø—É–ª—è—Ä–Ω—ã–µ –ª–æ—Ç—ã –∑–∞ –≤—ã–±—Ä–∞–Ω–Ω—ã–π –ø–µ—Ä–∏–æ–¥. –î–æ–ø–æ–ª–Ω–∏—Ç–µ–ª—å–Ω–æ –ø–æ–∫–∞–∑—ã–≤–∞–µ—Ç –æ–±—â–∏–π "
-        "–±–∞–ª–∞–Ω—Å, –¥–æ—Å—Ç—É–ø–Ω—É—é –∫ –≤—ã–≤–æ–¥—É —Å—É–º–º—É –∏ —Å—Ä–µ–¥—Å—Ç–≤–∞ –Ω–∞ —É–¥–µ—Ä–∂–∞–Ω–∏–∏.",
-    ),
-    ReadyPluginSpec(
-        STATUS_PLUGIN_UUID,
-        "StatusPlugin.py",
-        "Status Plugin",
-        "1.0.0",
-        "–°—Ç–∞—Ç—É—Å –ø—Ä–æ–¥–∞–≤—Ü–∞ –≤ —á–∞—Ç–∞—Ö FunPay",
-        "–ü–æ–∑–≤–æ–ª—è–µ—Ç –∑–∞–¥–∞—Ç—å —Å–æ–±—Å—Ç–≤–µ–Ω–Ω—ã–π —Ç–µ–∫—Å—Ç —Å—Ç–∞—Ç—É—Å–∞. –ü–æ–∫—É–ø–∞—Ç–µ–ª—å –æ—Ç–ø—Ä–∞–≤–ª—è–µ—Ç –≤ –ª–∏—á–Ω–æ–º —á–∞—Ç–µ "
-        "FunPay –∫–æ–º–∞–Ω–¥—É #status –∏ –º–≥–Ω–æ–≤–µ–Ω–Ω–æ –ø–æ–ª—É—á–∞–µ—Ç –Ω–∞—Å—Ç—Ä–æ–µ–Ω–Ω—ã–π –æ—Ç–≤–µ—Ç.",
-    ),
-    ReadyPluginSpec(
-        TELEGRAM_CHANNEL_BOOST_PLUGIN_UUID,
-        "TelegramChannelBoost.py",
-        "Telegram Channel Boost",
-        "1.1.0",
-        "–°–∫–ª–∞–¥ –∑–∞—Ä–∞–Ω–µ–µ –ø–æ–¥–≥–æ—Ç–æ–≤–ª–µ–Ω–Ω—ã—Ö Telegram-–∫–∞–Ω–∞–ª–æ–≤",
-        "–ó–∞—Ä–∞–Ω–µ–µ —Å–æ–∑–¥–∞—ë—Ç —á–µ—Ä–µ–∑ Telethon –∏ –Ω–∞–∫—Ä—É—á–∏–≤–∞–µ—Ç –Ω–∞—Å—Ç—Ä–∞–∏–≤–∞–µ–º—ã–π —Ä–µ–∑–µ—Ä–≤ –ø—É–±–ª–∏—á–Ω—ã—Ö –∫–∞–Ω–∞–ª–æ–≤, "
-        "—Ä–∞–∑ –≤ –ø—è—Ç—å –º–∏–Ω—É—Ç –ø—Ä–æ–≤–µ—Ä—è–µ—Ç —Ä–µ–∞–ª—å–Ω–æ–µ —á–∏—Å–ª–æ –ø–æ–¥–ø–∏—Å—á–∏–∫–æ–≤ –∏ –∑–∞–ø—Ä–∞—à–∏–≤–∞–µ—Ç refill –ø—Ä–∏ –ø—Ä–æ—Å–∞–¥–∫–µ. "
-        "–ü–æ—Å–ª–µ –ø–æ–∫—É–ø–∫–∏ –º–≥–Ω–æ–≤–µ–Ω–Ω–æ —Ä–µ–∑–µ—Ä–≤–∏—Ä—É–µ—Ç –≥–æ—Ç–æ–≤—ã–π –∫–∞–Ω–∞–ª, –ø–æ–¥—Ç–≤–µ—Ä–∂–¥–∞–µ—Ç username –ø–æ–∫—É–ø–∞—Ç–µ–ª—è "
-        "–∏ –±–µ–∑–æ–ø–∞—Å–Ω–æ –ø–µ—Ä–µ–¥–∞—ë—Ç –µ–º—É –≤–ª–∞–¥–µ–ª—å—Ü–∞.",
-        source_file="TelegramChannelBoost.py",
-        builtin_settings=False,
-    ),
-    ReadyPluginSpec(
-        AUTO_SMM_PLUGIN_UUID,
-        "AutoSmm.py",
-        "AutoSmm",
-        "1.1.0",
-        "–ê–≤—Ç–æ–º–∞—Ç–∏—á–µ—Å–∫–∏–µ SMM-–∑–∞–∫–∞–∑—ã –¥–ª—è –Ω–µ—Å–∫–æ–ª—å–∫–∏—Ö –ª–æ—Ç–æ–≤",
-        "–ü–æ–∑–≤–æ–ª—è–µ—Ç –ø—Ä–∏–≤—è–∑–∞—Ç—å –Ω–µ—Å–∫–æ–ª—å–∫–æ –ª–æ—Ç–æ–≤ FunPay –∫ —Ä–∞–∑–Ω—ã–º —É—Å–ª—É–≥–∞–º —Å–æ–≤–º–µ—Å—Ç–∏–º–æ–≥–æ SMM API. "
-        "–î–ª—è –∫–∞–∂–¥–æ–π –ø—Ä–∏–≤—è–∑–∫–∏ –∑–∞–¥–∞—é—Ç—Å—è ID —É—Å–ª—É–≥–∏ –∏ –∫–æ–ª–∏—á–µ—Å—Ç–≤–æ –Ω–∞ –æ–¥–Ω—É –∫—É–ø–ª–µ–Ω–Ω—É—é –µ–¥–∏–Ω–∏—Ü—É; "
-        "–ø–ª–∞–≥–∏–Ω –ø–æ–¥—Ç–≤–µ—Ä–∂–¥–∞–µ—Ç —Å—Å—ã–ª–∫—É, —Å–æ–∑–¥–∞—ë—Ç –∑–∞–∫–∞–∑, –æ—Ç—Å–ª–µ–∂–∏–≤–∞–µ—Ç —Å—Ç–∞—Ç—É—Å –∏ –ø–æ –Ω–∞—Å—Ç—Ä–æ–π–∫–µ –ª–æ—Ç–∞ "
-        "–ø–æ–∑–≤–æ–ª—è–µ—Ç –ø–æ–∫—É–ø–∞—Ç–µ–ª—é –∑–∞–ø—Ä–æ—Å–∏—Ç—å —Ä–µ—Ñ–∏–ª–ª –∫–æ–º–∞–Ω–¥–æ–π #—Ä–µ—Ñ–∏–ª–ª.",
-        source_file="AutoSmm.py",
-        builtin_settings=False,
-    ),
-    ReadyPluginSpec(
-        AI_ASSISTANT_PLUGIN_UUID,
-        "AIAssistant.py",
-        "AI Assistant",
-        "1.0.0",
-        "AI-–ø–æ–º–æ—â–Ω–∏–∫ –ø–æ–∫—É–ø–∞—Ç–µ–ª—è–º –¥–ª—è –≤—ã–±—Ä–∞–Ω–Ω—ã—Ö –ª–æ—Ç–æ–≤",
-        "–ü–æ–¥–∫–ª—é—á–∞–µ—Ç—Å—è –∫ Anthropic-—Å–æ–≤–º–µ—Å—Ç–∏–º–æ–º—É Messages API —á–µ—Ä–µ–∑ –æ—Ñ–∏—Ü–∏–∞–ª—å–Ω—ã–π Python SDK. "
-        "–î–ª—è –∫–∞–∂–¥–æ–≥–æ –ª–æ—Ç–∞ —Ö—Ä–∞–Ω–∏—Ç –æ—Ç–¥–µ–ª—å–Ω—ã–π —Å–∏—Å—Ç–µ–º–Ω—ã–π –ø—Ä–æ–º–ø—Ç –∏ –æ—Ç–≤–µ—á–∞–µ—Ç –ø–æ–∫—É–ø–∞—Ç–µ–ª—é, –∫–æ–≥–¥–∞ "
-        "—Ç–æ—Ç —Å–º–æ—Ç—Ä–∏—Ç –ø—Ä–∏–≤—è–∑–∞–Ω–Ω—ã–π —Ç–æ–≤–∞—Ä –∏–ª–∏ —É–∂–µ –æ—Ñ–æ—Ä–º–∏–ª –ø–æ –Ω–µ–º—É –∑–∞–∫–∞–∑.",
-        source_file="AIAssistant.py",
-        builtin_settings=False,
-    ),
-)
-READY_PLUGIN_BY_UUID = {plugin.uuid: plugin for plugin in READY_PLUGINS}
-
-
-def ready_plugin_source(plugin: ReadyPluginSpec) -> str:
-    """–í–æ–∑–≤—Ä–∞—â–∞–µ—Ç –≤–∞–ª–∏–¥–Ω—ã–π –æ–¥–Ω–æ—Ñ–∞–π–ª–æ–≤—ã–π –º–æ–¥—É–ª—å —Ñ–æ—Ä–º–∞—Ç–∞ FunPayCardinal."""
-    if plugin.source_file:
-        return (
-            Path(__file__).with_name("ready_plugins") / plugin.source_file
-        ).read_text(encoding="utf-8")
-    return (
-        f"NAME = {plugin.name!r}\n"
-        f"VERSION = {plugin.version!r}\n"
-        f"DESCRIPTION = {plugin.description!r}\n"
-        "CREDITS = 'FunPay aiogram bot'\n"
-        "SETTINGS_PAGE = True\n"
-        f"UUID = {plugin.uuid!r}\n"
-        "BIND_TO_DELETE = None\n"
-    )
-
-
-def plugin_settings_callback_data(plugin: PluginData) -> str | None:
-    """–í–æ–∑–≤—Ä–∞—â–∞–µ—Ç –ø–æ—Å—Ç–æ—è–Ω–Ω—ã–π callback —Å—Ç—Ä–∞–Ω–∏—Ü—ã –Ω–∞—Å—Ç—Ä–æ–µ–∫ —É—Å—Ç–∞–Ω–æ–≤–ª–µ–Ω–Ω–æ–≥–æ –ø–ª–∞–≥–∏–Ω–∞."""
-    if not plugin.settings_page:
-        return None
-    ready_plugin = READY_PLUGIN_BY_UUID.get(plugin.uuid)
-    if ready_plugin and ready_plugin.builtin_settings:
-        return f"builtin_open:{plugin.uuid}"
-    return f"{PLUGIN_SETTINGS_CALLBACK_PREFIX}:{plugin.uuid}:0"
-
-
-def validate_catalog_description(value: str) -> str:
-    description = value.strip()
-    if not PLUGIN_CATALOG_DESCRIPTION_MIN <= len(description) <= PLUGIN_CATALOG_DESCRIPTION_MAX:
-        raise ValueError(
-            f"–û–ø–∏—Å–∞–Ω–∏–µ –¥–æ–ª–∂–Ω–æ —Å–æ–¥–µ—Ä–∂–∞—Ç—å –æ—Ç {PLUGIN_CATALOG_DESCRIPTION_MIN} "
-            f"–¥–æ {PLUGIN_CATALOG_DESCRIPTION_MAX} —Å–∏–º–≤–æ–ª–æ–≤."
-        )
-    return description
-
-
-def telegram_publisher_name(user: Any) -> str:
-    if getattr(user, "username", None):
-        return f"@{user.username}"
-    return clipped(getattr(user, "full_name", "–ü–æ–ª—å–∑–æ–≤–∞—Ç–µ–ª—å Telegram"), 100)
-
-
-@dataclass(slots=True)
-class Config:
-    bot_token: str
-    database_url: str
-    app_secret: str
-
-    @classmethod
-    def from_env(cls) -> Config:
-        token = os.getenv("BOT_TOKEN", "").strip()
-        database_url = os.getenv("DATABASE_URL", "").strip()
-        if not token:
-            raise RuntimeError("–ù–µ –∑–∞–¥–∞–Ω–∞ –ø–µ—Ä–µ–º–µ–Ω–Ω–∞—è –æ–∫—Ä—É–∂–µ–Ω–∏—è BOT_TOKEN")
-        if not database_url:
-            raise RuntimeError("–ù–µ –∑–∞–¥–∞–Ω–∞ –ø–µ—Ä–µ–º–µ–Ω–Ω–∞—è –æ–∫—Ä—É–∂–µ–Ω–∏—è DATABASE_URL")
-        if database_url.startswith("postgres://"):
-            database_url = "postgresql://" + database_url.removeprefix("postgres://")
-        return cls(token, database_url, os.getenv("APP_SECRET", token))
-
-
-class SecretBox:
-    """–®–∏—Ñ—Ä—É–µ—Ç —á—É–≤—Å—Ç–≤–∏—Ç–µ–ª—å–Ω—ã–µ –ø–æ–ª—è –ø–µ—Ä–µ–¥ —Å–æ—Ö—Ä–∞–Ω–µ–Ω–∏–µ–º –≤ PostgreSQL."""
-
-    def __init__(self, secret: str):
-        key = base64.urlsafe_b64encode(hashlib.sha256(secret.encode()).digest())
-        self._fernet = Fernet(key)
-
-    def encrypt(self, value: str) -> str:
-        return self._fernet.encrypt(value.encode()).decode()
-
-    def decrypt(self, value: str) -> str:
-        return self._fernet.decrypt(value.encode()).decode()
-
-
-class Database:
-    def __init__(self, url: str):
-        self.url = url
-        self.pool: asyncpg.Pool | None = None
-
-    async def connect(self) -> None:
-        self.pool = await asyncpg.create_pool(self.url, min_size=1, max_size=10, command_timeout=30)
-        await self.execute(
-            """
-            CREATE TABLE IF NOT EXISTS funpay_users (
-                telegram_id BIGINT PRIMARY KEY,
-                proxy_enc TEXT,
-                golden_key_enc TEXT,
-                funpay_id BIGINT,
-                funpay_username TEXT,
-                account_active BOOLEAN NOT NULL DEFAULT FALSE,
-                active_marketplace TEXT NOT NULL DEFAULT 'funpay',
-                active_funpay_account_id BIGINT,
-                active_playerok_account_id BIGINT,
-                playerok_proxy_enc TEXT,
-                playerok_cookie_enc TEXT,
-                playerok_id TEXT,
-                playerok_username TEXT,
-                playerok_active BOOLEAN NOT NULL DEFAULT FALSE,
-                playerok_notify_messages BOOLEAN NOT NULL DEFAULT TRUE,
-                playerok_notify_deals BOOLEAN NOT NULL DEFAULT TRUE,
-                playerok_notify_reviews BOOLEAN NOT NULL DEFAULT TRUE,
-                playerok_notify_system BOOLEAN NOT NULL DEFAULT TRUE,
-                playerok_auto_publish_enabled BOOLEAN NOT NULL DEFAULT FALSE,
-                playerok_autoreply_enabled BOOLEAN NOT NULL DEFAULT FALSE,
-                playerok_autoreply_text TEXT NOT NULL DEFAULT '–ó–¥—Ä–∞–≤—Å—Ç–≤—É–π—Ç–µ! –°–ø–∞—Å–∏–±–æ –∑–∞ —Å–æ–æ–±—â–µ–Ω–∏–µ. –°–∫–æ—Ä–æ –æ—Ç–≤–µ—á—É.',
-                playerok_autoreply_cooldown_minutes INTEGER NOT NULL DEFAULT 30,
-                playerok_autoreply_delay_seconds INTEGER NOT NULL DEFAULT 0,
-                playerok_autoreply_work_start SMALLINT NOT NULL DEFAULT 0,
-                playerok_autoreply_work_end SMALLINT NOT NULL DEFAULT 24,
-                playerok_auto_delivery_enabled BOOLEAN NOT NULL DEFAULT FALSE,
-                playerok_auto_confirm_enabled BOOLEAN NOT NULL DEFAULT FALSE,
-                playerok_notify_delivery BOOLEAN NOT NULL DEFAULT TRUE,
-                notify_messages BOOLEAN NOT NULL DEFAULT TRUE,
-                notify_new_orders BOOLEAN NOT NULL DEFAULT TRUE,
-                notify_order_status BOOLEAN NOT NULL DEFAULT TRUE,
-                notify_reviews BOOLEAN NOT NULL DEFAULT TRUE,
-                notify_lots_raise BOOLEAN NOT NULL DEFAULT TRUE,
-                notify_system BOOLEAN NOT NULL DEFAULT TRUE,
-                auto_raise_enabled BOOLEAN NOT NULL DEFAULT FALSE,
-                keep_online_enabled BOOLEAN NOT NULL DEFAULT TRUE,
-                autoreply_enabled BOOLEAN NOT NULL DEFAULT FALSE,
-                autoreply_text TEXT NOT NULL DEFAULT '–ó–¥—Ä–∞–≤—Å—Ç–≤—É–π—Ç–µ! –°–ø–∞—Å–∏–±–æ –∑–∞ —Å–æ–æ–±—â–µ–Ω–∏–µ. –°–∫–æ—Ä–æ –æ—Ç–≤–µ—á—É.',
-                autoreply_cooldown_minutes INTEGER NOT NULL DEFAULT 30,
-                autoreply_delay_seconds INTEGER NOT NULL DEFAULT 0,
-                autoreply_new_chats_only BOOLEAN NOT NULL DEFAULT FALSE,
-                autoreply_work_start SMALLINT NOT NULL DEFAULT 0,
-                autoreply_work_end SMALLINT NOT NULL DEFAULT 24,
-                review_reply_enabled BOOLEAN NOT NULL DEFAULT FALSE,
-                review_reply_1 TEXT NOT NULL DEFAULT '–°–ø–∞—Å–∏–±–æ –∑–∞ –æ–±—Ä–∞—Ç–Ω—É—é —Å–≤—è–∑—å. –ú—ã —Ä–∞–∑–±–µ—Ä—ë–º—Å—è –≤ —Å–∏—Ç—É–∞—Ü–∏–∏.',
-                review_reply_2 TEXT NOT NULL DEFAULT '–°–ø–∞—Å–∏–±–æ –∑–∞ –æ—Ç–∑—ã–≤. –ù–∞–º –∂–∞–ª—å, —á—Ç–æ –∑–∞–∫–∞–∑ –≤–∞—Å —Ä–∞–∑–æ—á–∞—Ä–æ–≤–∞–ª.',
-                review_reply_3 TEXT NOT NULL DEFAULT '–°–ø–∞—Å–∏–±–æ –∑–∞ –æ—Ç–∑—ã–≤! –£—á—Ç—ë–º –≤–∞—à–∏ –∑–∞–º–µ—á–∞–Ω–∏—è.',
-                review_reply_4 TEXT NOT NULL DEFAULT '–°–ø–∞—Å–∏–±–æ –∑–∞ —Ö–æ—Ä–æ—à—É—é –æ—Ü–µ–Ω–∫—É –∏ –≤–∞—à –∑–∞–∫–∞–∑!',
-                review_reply_5 TEXT NOT NULL DEFAULT '–°–ø–∞—Å–∏–±–æ –∑–∞ –æ—Ç–ª–∏—á–Ω—É—é –æ—Ü–µ–Ω–∫—É! –ë—É–¥–µ–º —Ä–∞–¥—ã –≤–∏–¥–µ—Ç—å –≤–∞—Å —Å–Ω–æ–≤–∞.',
-                auto_delivery_enabled BOOLEAN NOT NULL DEFAULT FALSE,
-                multi_delivery_enabled BOOLEAN NOT NULL DEFAULT TRUE,
-                delivery_auto_restore BOOLEAN NOT NULL DEFAULT TRUE,
-                delivery_auto_disable BOOLEAN NOT NULL DEFAULT TRUE,
-                notify_delivery BOOLEAN NOT NULL DEFAULT TRUE,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            );
-
-            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS notify_reviews BOOLEAN NOT NULL DEFAULT TRUE;
-            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS active_marketplace TEXT NOT NULL DEFAULT 'funpay';
-            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS active_funpay_account_id BIGINT;
-            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS active_playerok_account_id BIGINT;
-            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS playerok_proxy_enc TEXT;
-            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS playerok_cookie_enc TEXT;
-            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS playerok_id TEXT;
-            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS playerok_username TEXT;
-            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS playerok_active BOOLEAN NOT NULL DEFAULT FALSE;
-            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS playerok_notify_messages BOOLEAN NOT NULL DEFAULT TRUE;
-            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS playerok_notify_deals BOOLEAN NOT NULL DEFAULT TRUE;
-            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS playerok_notify_reviews BOOLEAN NOT NULL DEFAULT TRUE;
-            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS playerok_notify_system BOOLEAN NOT NULL DEFAULT TRUE;
-            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS playerok_auto_publish_enabled BOOLEAN NOT NULL DEFAULT FALSE;
-            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS playerok_autoreply_enabled BOOLEAN NOT NULL DEFAULT FALSE;
-            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS playerok_autoreply_text TEXT NOT NULL DEFAULT '–ó–¥—Ä–∞–≤—Å—Ç–≤—É–π—Ç–µ! –°–ø–∞—Å–∏–±–æ –∑–∞ —Å–æ–æ–±—â–µ–Ω–∏–µ. –°–∫–æ—Ä–æ –æ—Ç–≤–µ—á—É.';
-            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS playerok_autoreply_cooldown_minutes INTEGER NOT NULL DEFAULT 30;
-            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS playerok_autoreply_delay_seconds INTEGER NOT NULL DEFAULT 0;
-            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS playerok_autoreply_work_start SMALLINT NOT NULL DEFAULT 0;
-            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS playerok_autoreply_work_end SMALLINT NOT NULL DEFAULT 24;
-            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS playerok_auto_delivery_enabled BOOLEAN NOT NULL DEFAULT FALSE;
-            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS playerok_auto_confirm_enabled BOOLEAN NOT NULL DEFAULT FALSE;
-            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS playerok_notify_delivery BOOLEAN NOT NULL DEFAULT TRUE;
-            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS auto_delivery_enabled BOOLEAN NOT NULL DEFAULT FALSE;
-            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS multi_delivery_enabled BOOLEAN NOT NULL DEFAULT TRUE;
-            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS delivery_auto_restore BOOLEAN NOT NULL DEFAULT TRUE;
-            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS delivery_auto_disable BOOLEAN NOT NULL DEFAULT TRUE;
-            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS notify_delivery BOOLEAN NOT NULL DEFAULT TRUE;
-            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS notify_lots_raise BOOLEAN NOT NULL DEFAULT TRUE;
-            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS notify_system BOOLEAN NOT NULL DEFAULT TRUE;
-            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS auto_raise_enabled BOOLEAN NOT NULL DEFAULT FALSE;
-            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS keep_online_enabled BOOLEAN NOT NULL DEFAULT TRUE;
-            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS autoreply_cooldown_minutes INTEGER NOT NULL DEFAULT 30;
-            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS autoreply_delay_seconds INTEGER NOT NULL DEFAULT 0;
-            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS autoreply_new_chats_only BOOLEAN NOT NULL DEFAULT FALSE;
-            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS autoreply_work_start SMALLINT NOT NULL DEFAULT 0;
-            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS autoreply_work_end SMALLINT NOT NULL DEFAULT 24;
-            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS review_reply_enabled BOOLEAN NOT NULL DEFAULT FALSE;
-            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS review_reply_1 TEXT NOT NULL DEFAULT '–°–ø–∞—Å–∏–±–æ –∑–∞ –æ–±—Ä–∞—Ç–Ω—É—é —Å–≤—è–∑—å. –ú—ã —Ä–∞–∑–±–µ—Ä—ë–º—Å—è –≤ —Å–∏—Ç—É–∞—Ü–∏–∏.';
-            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS review_reply_2 TEXT NOT NULL DEFAULT '–°–ø–∞—Å–∏–±–æ –∑–∞ –æ—Ç–∑—ã–≤. –ù–∞–º –∂–∞–ª—å, —á—Ç–æ –∑–∞–∫–∞–∑ –≤–∞—Å —Ä–∞–∑–æ—á–∞—Ä–æ–≤–∞–ª.';
-            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS review_reply_3 TEXT NOT NULL DEFAULT '–°–ø–∞—Å–∏–±–æ –∑–∞ –æ—Ç–∑—ã–≤! –£—á—Ç—ë–º –≤–∞—à–∏ –∑–∞–º–µ—á–∞–Ω–∏—è.';
-            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS review_reply_4 TEXT NOT NULL DEFAULT '–°–ø–∞—Å–∏–±–æ –∑–∞ —Ö–æ—Ä–æ—à—É—é –æ—Ü–µ–Ω–∫—É –∏ –≤–∞—à –∑–∞–∫–∞–∑!';
-            ALTER TABLE funpay_users ADD COLUMN IF NOT EXISTS review_reply_5 TEXT NOT NULL DEFAULT '–°–ø–∞—Å–∏–±–æ –∑–∞ –æ—Ç–ª–∏—á–Ω—É—é –æ—Ü–µ–Ω–∫—É! –ë—É–¥–µ–º —Ä–∞–¥—ã –≤–∏–¥–µ—Ç—å –≤–∞—Å —Å–Ω–æ–≤–∞.';
-
-            CREATE TABLE IF NOT EXISTS marketplace_accounts (
-                id BIGSERIAL PRIMARY KEY,
-                telegram_id BIGINT NOT NULL REFERENCES funpay_users(telegram_id) ON DELETE CASCADE,
-                marketplace TEXT NOT NULL CHECK (marketplace IN ('funpay', 'playerok')),
-                label TEXT NOT NULL,
-                external_id TEXT NOT NULL,
-                username TEXT,
-                proxy_enc TEXT NOT NULL,
-                credential_enc TEXT NOT NULL,
-                auth_method TEXT NOT NULL DEFAULT 'cookie',
-                enabled BOOLEAN NOT NULL DEFAULT TRUE,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                UNIQUE (telegram_id, marketplace, external_id)
-            );
-
-            CREATE INDEX IF NOT EXISTS marketplace_accounts_user_idx
-                ON marketplace_accounts (telegram_id, marketplace, enabled, created_at);
-
-            CREATE TABLE IF NOT EXISTS funpay_autoreply_log (
-                telegram_id BIGINT NOT NULL REFERENCES funpay_users(telegram_id) ON DELETE CASCADE,
-                chat_id TEXT NOT NULL,
-                last_sent TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                PRIMARY KEY (telegram_id, chat_id)
-            );
-
-            CREATE TABLE IF NOT EXISTS funpay_plugins (
-                telegram_id BIGINT NOT NULL REFERENCES funpay_users(telegram_id) ON DELETE CASCADE,
-                uuid TEXT NOT NULL,
-                filename TEXT NOT NULL,
-                name TEXT NOT NULL,
-                version TEXT NOT NULL,
-                description TEXT NOT NULL,
-                credits TEXT NOT NULL,
-                settings_page BOOLEAN NOT NULL DEFAULT FALSE,
-                source TEXT NOT NULL,
-                enabled BOOLEAN NOT NULL DEFAULT TRUE,
-                ai_generated BOOLEAN NOT NULL DEFAULT FALSE,
-                ai_prompt TEXT,
-                ai_summary TEXT,
-                ai_revision INTEGER NOT NULL DEFAULT 0,
-                ai_updated_at TIMESTAMPTZ,
-                uploaded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                PRIMARY KEY (telegram_id, uuid)
-            );
-
-            ALTER TABLE funpay_plugins
-                ADD COLUMN IF NOT EXISTS ai_generated BOOLEAN NOT NULL DEFAULT FALSE;
-            ALTER TABLE funpay_plugins ADD COLUMN IF NOT EXISTS ai_prompt TEXT;
-            ALTER TABLE funpay_plugins ADD COLUMN IF NOT EXISTS ai_summary TEXT;
-            ALTER TABLE funpay_plugins
-                ADD COLUMN IF NOT EXISTS ai_revision INTEGER NOT NULL DEFAULT 0;
-            ALTER TABLE funpay_plugins ADD COLUMN IF NOT EXISTS ai_updated_at TIMESTAMPTZ;
-
-            CREATE TABLE IF NOT EXISTS funpay_plugin_settings (
-                telegram_id BIGINT NOT NULL,
-                plugin_uuid TEXT NOT NULL,
-                setting_key TEXT NOT NULL,
-                setting_value TEXT NOT NULL,
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                PRIMARY KEY (telegram_id, plugin_uuid, setting_key),
-                FOREIGN KEY (telegram_id, plugin_uuid)
-                    REFERENCES funpay_plugins(telegram_id, uuid) ON DELETE CASCADE
-            );
-
-            CREATE TABLE IF NOT EXISTS funpay_plugin_telethon_sessions (
-                telegram_id BIGINT NOT NULL,
-                plugin_uuid TEXT NOT NULL,
-                phone_enc TEXT NOT NULL,
-                session_enc TEXT NOT NULL,
-                password_enc TEXT,
-                telegram_user_id BIGINT NOT NULL,
-                telegram_username TEXT,
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                PRIMARY KEY (telegram_id, plugin_uuid),
-                FOREIGN KEY (telegram_id, plugin_uuid)
-                    REFERENCES funpay_plugins(telegram_id, uuid) ON DELETE CASCADE
-            );
-
-            ALTER TABLE funpay_plugin_telethon_sessions
-                ADD COLUMN IF NOT EXISTS password_enc TEXT;
-
-            CREATE TABLE IF NOT EXISTS funpay_plugin_catalog (
-                uuid TEXT PRIMARY KEY,
-                owner_telegram_id BIGINT REFERENCES funpay_users(telegram_id) ON DELETE CASCADE,
-                publisher_name TEXT NOT NULL,
-                filename TEXT NOT NULL,
-                name TEXT NOT NULL,
-                version TEXT NOT NULL,
-                short_description TEXT NOT NULL,
-                description TEXT NOT NULL,
-                credits TEXT NOT NULL,
-                source TEXT NOT NULL,
-                is_official BOOLEAN NOT NULL DEFAULT FALSE,
-                ai_generated BOOLEAN NOT NULL DEFAULT FALSE,
-                install_count BIGINT NOT NULL DEFAULT 0,
-                published_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            );
-
-            ALTER TABLE funpay_plugin_catalog
-                ADD COLUMN IF NOT EXISTS ai_generated BOOLEAN NOT NULL DEFAULT FALSE;
-
-            CREATE TABLE IF NOT EXISTS funpay_plugin_builder_settings (
-                telegram_id BIGINT PRIMARY KEY
-                    REFERENCES funpay_users(telegram_id) ON DELETE CASCADE,
-                api_base_url TEXT NOT NULL DEFAULT 'https://api.anthropic.com',
-                api_token_enc TEXT,
-                model_id TEXT,
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            );
-
-            CREATE INDEX IF NOT EXISTS funpay_plugin_catalog_order_idx
-                ON funpay_plugin_catalog (is_official DESC, install_count DESC, updated_at DESC);
-
-            CREATE TABLE IF NOT EXISTS funpay_delivery_rules (
-                id BIGSERIAL PRIMARY KEY,
-                telegram_id BIGINT NOT NULL REFERENCES funpay_users(telegram_id) ON DELETE CASCADE,
-                lot_id BIGINT NOT NULL,
-                lot_title TEXT NOT NULL,
-                response TEXT NOT NULL,
-                products TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
-                enabled BOOLEAN NOT NULL DEFAULT TRUE,
-                disable_auto_restore BOOLEAN NOT NULL DEFAULT FALSE,
-                disable_auto_disable BOOLEAN NOT NULL DEFAULT FALSE,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                UNIQUE (telegram_id, lot_id)
-            );
-
-            CREATE TABLE IF NOT EXISTS funpay_delivery_log (
-                telegram_id BIGINT NOT NULL REFERENCES funpay_users(telegram_id) ON DELETE CASCADE,
-                order_id TEXT NOT NULL,
-                rule_id BIGINT REFERENCES funpay_delivery_rules(id) ON DELETE SET NULL,
-                status TEXT NOT NULL,
-                details TEXT,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                PRIMARY KEY (telegram_id, order_id)
-            );
-
-            CREATE TABLE IF NOT EXISTS funpay_command_replies (
-                id BIGSERIAL PRIMARY KEY,
-                telegram_id BIGINT NOT NULL REFERENCES funpay_users(telegram_id) ON DELETE CASCADE,
-                trigger TEXT NOT NULL,
-                response TEXT NOT NULL,
-                enabled BOOLEAN NOT NULL DEFAULT TRUE,
-                notify BOOLEAN NOT NULL DEFAULT TRUE,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                UNIQUE (telegram_id, trigger)
-            );
-
-            CREATE TABLE IF NOT EXISTS funpay_notification_targets (
-                telegram_id BIGINT NOT NULL REFERENCES funpay_users(telegram_id) ON DELETE CASCADE,
-                chat_id BIGINT NOT NULL,
-                title TEXT NOT NULL,
-                enabled BOOLEAN NOT NULL DEFAULT TRUE,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                PRIMARY KEY (telegram_id, chat_id)
-            );
-
-            CREATE TABLE IF NOT EXISTS playerok_autoreply_log (
-                telegram_id BIGINT NOT NULL REFERENCES funpay_users(telegram_id) ON DELETE CASCADE,
-                chat_id TEXT NOT NULL,
-                last_sent TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                PRIMARY KEY (telegram_id, chat_id)
-            );
-
-            CREATE TABLE IF NOT EXISTS playerok_command_replies (
-                id BIGSERIAL PRIMARY KEY,
-                telegram_id BIGINT NOT NULL REFERENCES funpay_users(telegram_id) ON DELETE CASCADE,
-                trigger TEXT NOT NULL,
-                response TEXT NOT NULL,
-                enabled BOOLEAN NOT NULL DEFAULT TRUE,
-                notify BOOLEAN NOT NULL DEFAULT TRUE,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                UNIQUE (telegram_id, trigger)
-            );
-
-            CREATE TABLE IF NOT EXISTS playerok_delivery_rules (
-                id BIGSERIAL PRIMARY KEY,
-                telegram_id BIGINT NOT NULL REFERENCES funpay_users(telegram_id) ON DELETE CASCADE,
-                item_id TEXT NOT NULL,
-                item_title TEXT NOT NULL,
-                response TEXT NOT NULL,
-                products TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
-                enabled BOOLEAN NOT NULL DEFAULT TRUE,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                UNIQUE (telegram_id, item_id)
-            );
-
-            CREATE TABLE IF NOT EXISTS playerok_delivery_log (
-                telegram_id BIGINT NOT NULL REFERENCES funpay_users(telegram_id) ON DELETE CASCADE,
-                deal_id TEXT NOT NULL,
-                rule_id BIGINT REFERENCES playerok_delivery_rules(id) ON DELETE SET NULL,
-                status TEXT NOT NULL,
-                details TEXT,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                PRIMARY KEY (telegram_id, deal_id)
-            );
-
-            CREATE TABLE IF NOT EXISTS playerok_promotion_requests (
-                token TEXT PRIMARY KEY,
-                telegram_id BIGINT NOT NULL REFERENCES funpay_users(telegram_id) ON DELETE CASCADE,
-                account_id BIGINT NOT NULL REFERENCES marketplace_accounts(id) ON DELETE CASCADE,
-                item_id TEXT NOT NULL,
-                item_title TEXT NOT NULL,
-                priority_status_id TEXT NOT NULL,
-                priority_name TEXT NOT NULL,
-                expected_price INTEGER NOT NULL CHECK (expected_price > 0),
-                period_days INTEGER NOT NULL DEFAULT 0,
-                status TEXT NOT NULL DEFAULT 'pending'
-                    CHECK (status IN ('pending', 'processing', 'succeeded', 'failed')),
-                error_text TEXT,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            );
-
-            CREATE INDEX IF NOT EXISTS playerok_promotion_requests_user_idx
-                ON playerok_promotion_requests (telegram_id, created_at DESC);
-
-            CREATE TABLE IF NOT EXISTS playerok_plugins (
-                telegram_id BIGINT NOT NULL REFERENCES funpay_users(telegram_id) ON DELETE CASCADE,
-                uuid TEXT NOT NULL,
-                filename TEXT NOT NULL,
-                name TEXT NOT NULL,
-                version TEXT NOT NULL,
-                description TEXT NOT NULL,
-                credits TEXT NOT NULL,
-                settings_page BOOLEAN NOT NULL DEFAULT FALSE,
-                source TEXT NOT NULL,
-                enabled BOOLEAN NOT NULL DEFAULT TRUE,
-                uploaded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                PRIMARY KEY (telegram_id, uuid)
-            );
-
-            CREATE TABLE IF NOT EXISTS playerok_plugin_settings (
-                telegram_id BIGINT NOT NULL,
-                plugin_uuid TEXT NOT NULL,
-                setting_key TEXT NOT NULL,
-                setting_value TEXT NOT NULL,
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                PRIMARY KEY (telegram_id, plugin_uuid, setting_key),
-                FOREIGN KEY (telegram_id, plugin_uuid)
-                    REFERENCES playerok_plugins(telegram_id, uuid) ON DELETE CASCADE
-            );
-
-            CREATE TABLE IF NOT EXISTS playerok_plugin_catalog (
-                uuid TEXT PRIMARY KEY,
-                owner_telegram_id BIGINT REFERENCES funpay_users(telegram_id) ON DELETE CASCADE,
-                publisher_name TEXT NOT NULL,
-                filename TEXT NOT NULL,
-                name TEXT NOT NULL,
-                version TEXT NOT NULL,
-                short_description TEXT NOT NULL,
-                description TEXT NOT NULL,
-                credits TEXT NOT NULL,
-                source TEXT NOT NULL,
-                is_official BOOLEAN NOT NULL DEFAULT FALSE,
-                install_count BIGINT NOT NULL DEFAULT 0,
-                published_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            );
-
-            CREATE INDEX IF NOT EXISTS playerok_plugin_catalog_order_idx
-                ON playerok_plugin_catalog
-                (is_official DESC, install_count DESC, updated_at DESC);
-            """
-        )
-        await self.migrate_legacy_marketplace_accounts()
-        await self.seed_official_plugins()
-        await self.seed_official_playerok_plugins()
-
-    async def close(self) -> None:
-        if self.pool:
-            await self.pool.close()
-
-    async def execute(self, query: str, *args: Any) -> str:
-        if not self.pool:
-            raise RuntimeError("–ë–∞–∑–∞ –¥–∞–Ω–Ω—ã—Ö –Ω–µ –ø–æ–¥–∫–ª—é—á–µ–Ω–∞")
-        return await self.pool.execute(query, *args)
-
-    async def fetchrow(self, query: str, *args: Any) -> asyncpg.Record | None:
-        if not self.pool:
-            raise RuntimeError("–ë–∞–∑–∞ –¥–∞–Ω–Ω—ã—Ö –Ω–µ –ø–æ–¥–∫–ª—é—á–µ–Ω–∞")
-        return await self.pool.fetchrow(query, *args)
-
-    async def fetch(self, query: str, *args: Any) -> list[asyncpg.Record]:
-        if not self.pool:
-            raise RuntimeError("–ë–∞–∑–∞ –¥–∞–Ω–Ω—ã—Ö –Ω–µ –ø–æ–¥–∫–ª—é—á–µ–Ω–∞")
-        return await self.pool.fetch(query, *args)
-
-    async def ensure_user(self, telegram_id: int) -> None:
-        await self.execute(
-            "INSERT INTO funpay_users (telegram_id) VALUES ($1) ON CONFLICT DO NOTHING",
-            telegram_id,
-        )
-
-    async def get_user(self, telegram_id: int) -> asyncpg.Record | None:
-        return await self.fetchrow("SELECT * FROM funpay_users WHERE telegram_id=$1", telegram_id)
-
-    async def migrate_legacy_marketplace_accounts(self) -> None:
-        """–û–¥–Ω–æ–∫—Ä–∞—Ç–Ω–æ –ø–µ—Ä–µ–Ω–æ—Å–∏—Ç —Å—Ç–∞—Ä—ã–µ –æ–¥–∏–Ω–æ—á–Ω—ã–µ –ø–æ–¥–∫–ª—é—á–µ–Ω–∏—è –±–µ–∑ —Ä–∞—Å–∫—Ä—ã—Ç–∏—è —Å–µ–∫—Ä–µ—Ç–æ–≤."""
-        await self.execute(
-            """
-            INSERT INTO marketplace_accounts
-                (telegram_id, marketplace, label, external_id, username,
-                 proxy_enc, credential_enc, auth_method)
-            SELECT telegram_id, 'funpay', COALESCE(funpay_username, 'FunPay'),
-                   funpay_id::TEXT, funpay_username, proxy_enc, golden_key_enc, 'golden_key'
-              FROM funpay_users u
-             WHERE account_active=TRUE AND proxy_enc IS NOT NULL
-               AND golden_key_enc IS NOT NULL AND funpay_id IS NOT NULL
-            ON CONFLICT (telegram_id, marketplace, external_id) DO NOTHING;
-
-            INSERT INTO marketplace_accounts
-                (telegram_id, marketplace, label, external_id, username,
-                 proxy_enc, credential_enc, auth_method)
-            SELECT telegram_id, 'playerok', COALESCE(playerok_username, 'Playerok'),
-                   playerok_id, playerok_username, playerok_proxy_enc,
-                   playerok_cookie_enc, 'cookie'
-              FROM funpay_users u
-             WHERE playerok_active=TRUE AND playerok_proxy_enc IS NOT NULL
-               AND playerok_cookie_enc IS NOT NULL AND playerok_id IS NOT NULL
-            ON CONFLICT (telegram_id, marketplace, external_id) DO NOTHING;
-
-            UPDATE funpay_users u
-               SET active_funpay_account_id = COALESCE(
-                       active_funpay_account_id,
-                       (SELECT a.id FROM marketplace_accounts a
-                         WHERE a.telegram_id=u.telegram_id AND a.marketplace='funpay'
-                         ORDER BY a.created_at, a.id LIMIT 1)
-                   ),
-                   active_playerok_account_id = COALESCE(
-                       active_playerok_account_id,
-                       (SELECT a.id FROM marketplace_accounts a
-                         WHERE a.telegram_id=u.telegram_id AND a.marketplace='playerok'
-                         ORDER BY a.created_at, a.id LIMIT 1)
-                   );
-            """
-        )
-
-    @staticmethod
-    def _active_account_column(marketplace: str) -> str:
-        if marketplace == "funpay":
-            return "active_funpay_account_id"
-        if marketplace == "playerok":
-            return "active_playerok_account_id"
-        raise ValueError("–ù–µ–∏–∑–≤–µ—Å—Ç–Ω–∞—è –ø–ª–æ—â–∞–¥–∫–∞")
-
-    async def list_marketplace_accounts(
-        self, telegram_id: int, marketplace: str
-    ) -> list[asyncpg.Record]:
-        self._active_account_column(marketplace)
-        return await self.fetch(
-            """
-            SELECT * FROM marketplace_accounts
-             WHERE telegram_id=$1 AND marketplace=$2 AND enabled=TRUE
-             ORDER BY created_at, id
-            """,
-            telegram_id,
-            marketplace,
-        )
-
-    async def get_marketplace_account(
-        self, telegram_id: int, marketplace: str, account_id: int
-    ) -> asyncpg.Record | None:
-        self._active_account_column(marketplace)
-        return await self.fetchrow(
-            """
-            SELECT * FROM marketplace_accounts
-             WHERE telegram_id=$1 AND marketplace=$2 AND id=$3 AND enabled=TRUE
-            """,
-            telegram_id,
-            marketplace,
-            account_id,
-        )
-
-    async def get_active_marketplace_account(
-        self, telegram_id: int, marketplace: str
-    ) -> asyncpg.Record | None:
-        column = self._active_account_column(marketplace)
-        row = await self.fetchrow(
-            f"""
-            SELECT a.* FROM marketplace_accounts a
-              JOIN funpay_users u ON u.telegram_id=a.telegram_id
-             WHERE a.telegram_id=$1 AND a.marketplace=$2 AND a.enabled=TRUE
-             ORDER BY (a.id=u.{column}) DESC, a.created_at, a.id
-             LIMIT 1
-            """,
-            telegram_id,
-            marketplace,
-        )
-        if row:
-            await self.execute(
-                f"UPDATE funpay_users SET {column}=$2 WHERE telegram_id=$1",
-                telegram_id,
-                row["id"],
-            )
-        return row
-
-    async def add_marketplace_account(
-        self,
-        telegram_id: int,
-        marketplace: str,
-        proxy_enc: str,
-        credential_enc: str,
-        external_id: str,
-        username: str | None,
-        *,
-        auth_method: str,
-    ) -> asyncpg.Record:
-        column = self._active_account_column(marketplace)
-        await self.ensure_user(telegram_id)
-        label = (username or f"{marketplace.title()} {external_id}").strip()[:120]
-        row = await self.fetchrow(
-            """
-            INSERT INTO marketplace_accounts
-                (telegram_id, marketplace, label, external_id, username,
-                 proxy_enc, credential_enc, auth_method, enabled, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, TRUE, NOW())
-            ON CONFLICT (telegram_id, marketplace, external_id) DO UPDATE
-                SET label=EXCLUDED.label, username=EXCLUDED.username,
-                    proxy_enc=EXCLUDED.proxy_enc,
-                    credential_enc=EXCLUDED.credential_enc,
-                    auth_method=EXCLUDED.auth_method, enabled=TRUE, updated_at=NOW()
-            RETURNING *
-            """,
-            telegram_id,
-            marketplace,
-            label,
-            str(external_id),
-            username,
-            proxy_enc,
-            credential_enc,
-            auth_method,
-        )
-        await self.execute(
-            f"""
-            UPDATE funpay_users
-               SET {column}=$2, active_marketplace=$3,
-                   account_active=CASE WHEN $3='funpay' THEN TRUE ELSE account_active END,
-                   playerok_active=CASE WHEN $3='playerok' THEN TRUE ELSE playerok_active END,
-                   updated_at=NOW()
-             WHERE telegram_id=$1
-            """,
-            telegram_id,
-            row["id"],
-            marketplace,
-        )
-        return row
-
-    async def set_active_account(
-        self, telegram_id: int, marketplace: str, account_id: int
-    ) -> asyncpg.Record:
-        column = self._active_account_column(marketplace)
-        row = await self.get_marketplace_account(telegram_id, marketplace, account_id)
-        if not row:
-            raise ValueError("–ê–∫–∫–∞—É–Ω—Ç –Ω–µ –Ω–∞–π–¥–µ–Ω")
-        await self.execute(
-            f"""
-            UPDATE funpay_users SET {column}=$2, active_marketplace=$3, updated_at=NOW()
-             WHERE telegram_id=$1
-            """,
-            telegram_id,
-            account_id,
-            marketplace,
-        )
-        return row
-
-    async def delete_marketplace_account(
-        self, telegram_id: int, marketplace: str, account_id: int
-    ) -> asyncpg.Record | None:
-        column = self._active_account_column(marketplace)
-        await self.execute(
-            """
-            DELETE FROM marketplace_accounts
-             WHERE telegram_id=$1 AND marketplace=$2 AND id=$3
-            """,
-            telegram_id,
-            marketplace,
-            account_id,
-        )
-        replacement = await self.fetchrow(
-            """
-            SELECT * FROM marketplace_accounts
-             WHERE telegram_id=$1 AND marketplace=$2 AND enabled=TRUE
-             ORDER BY created_at, id LIMIT 1
-            """,
-            telegram_id,
-            marketplace,
-        )
-        await self.execute(
-            f"""
-            UPDATE funpay_users
-               SET {column}=$2,
-                   account_active=CASE WHEN $3='funpay' THEN ($2::BIGINT IS NOT NULL) ELSE account_active END,
-                   playerok_active=CASE WHEN $3='playerok' THEN ($2::BIGINT IS NOT NULL) ELSE playerok_active END,
-                   updated_at=NOW()
-             WHERE telegram_id=$1
-            """,
-            telegram_id,
-            replacement["id"] if replacement else None,
-            marketplace,
-        )
-        return replacement
-
-    async def save_account(
-        self,
-        telegram_id: int,
-        proxy_enc: str,
-        golden_key_enc: str,
-        account: Account,
-    ) -> asyncpg.Record:
-        return await self.add_marketplace_account(
-            telegram_id,
-            "funpay",
-            proxy_enc,
-            golden_key_enc,
-            str(account.id),
-            account.username,
-            auth_method="golden_key",
-        )
-
-    async def disconnect_account(self, telegram_id: int) -> None:
-        account = await self.get_active_marketplace_account(telegram_id, "funpay")
-        if account:
-            await self.delete_marketplace_account(telegram_id, "funpay", int(account["id"]))
-
-    async def save_playerok_account(
-        self,
-        telegram_id: int,
-        proxy_enc: str,
-        cookie_enc: str,
-        account: Any,
-        auth_method: str = "cookie",
-    ) -> asyncpg.Record:
-        return await self.add_marketplace_account(
-            telegram_id,
-            "playerok",
-            proxy_enc,
-            cookie_enc,
-            str(account.id),
-            account.username,
-            auth_method=auth_method,
-        )
-
-    async def disconnect_playerok_account(self, telegram_id: int) -> None:
-        account = await self.get_active_marketplace_account(telegram_id, "playerok")
-        if account:
-            await self.delete_marketplace_account(telegram_id, "playerok", int(account["id"]))
-
-    async def set_active_marketplace(self, telegram_id: int, marketplace: str) -> None:
-        if marketplace not in {"funpay", "playerok"}:
-            raise ValueError("–ù–µ–∏–∑–≤–µ—Å—Ç–Ω–∞—è –ø–ª–æ—â–∞–¥–∫–∞")
-        await self.execute(
-            "UPDATE funpay_users SET active_marketplace=$2, updated_at=NOW() WHERE telegram_id=$1",
-            telegram_id,
-            marketplace,
-        )
-
-    async def set_flag(self, telegram_id: int, column: str, value: bool) -> None:
-        allowed = {
-            "notify_messages",
-            "notify_new_orders",
-            "notify_order_status",
-            "notify_reviews",
-            "notify_lots_raise",
-            "notify_system",
-            "auto_raise_enabled",
-            "keep_online_enabled",
-            "autoreply_enabled",
-            "autoreply_new_chats_only",
-            "review_reply_enabled",
-            "playerok_notify_messages",
-            "playerok_notify_deals",
-            "playerok_notify_reviews",
-            "playerok_notify_system",
-            "playerok_auto_publish_enabled",
-            "playerok_autoreply_enabled",
-            "playerok_auto_delivery_enabled",
-            "playerok_auto_confirm_enabled",
-            "playerok_notify_delivery",
-            "auto_delivery_enabled",
-            "multi_delivery_enabled",
-            "delivery_auto_restore",
-            "delivery_auto_disable",
-            "notify_delivery",
-        }
-        if column not in allowed:
-            raise ValueError("–ù–µ–¥–æ–ø—É—Å—Ç–∏–º–∞—è –Ω–∞—Å—Ç—Ä–æ–π–∫–∞")
-        await self.execute(
-            f"UPDATE funpay_users SET {column}=$2, updated_at=NOW() WHERE telegram_id=$1",
-            telegram_id,
-            value,
-        )
-
-    async def set_autoreply_text(self, telegram_id: int, text: str) -> None:
-        await self.execute(
-            "UPDATE funpay_users SET autoreply_text=$2, updated_at=NOW() WHERE telegram_id=$1",
-            telegram_id,
-            text,
-        )
-
-    async def set_playerok_autoreply_text(self, telegram_id: int, text: str) -> None:
-        await self.execute(
-            "UPDATE funpay_users SET playerok_autoreply_text=$2, updated_at=NOW() WHERE telegram_id=$1",
-            telegram_id,
-            text,
-        )
-
-    async def set_integer_setting(self, telegram_id: int, column: str, value: int) -> None:
-        allowed = {
-            "autoreply_cooldown_minutes": (0, 1440),
-            "autoreply_delay_seconds": (0, 300),
-            "autoreply_work_start": (0, 23),
-            "autoreply_work_end": (1, 24),
-            "playerok_autoreply_cooldown_minutes": (0, 1440),
-            "playerok_autoreply_delay_seconds": (0, 300),
-            "playerok_autoreply_work_start": (0, 23),
-            "playerok_autoreply_work_end": (1, 24),
-        }
-        if column not in allowed or not allowed[column][0] <= value <= allowed[column][1]:
-            raise ValueError("–ù–µ–¥–æ–ø—É—Å—Ç–∏–º–æ–µ –∑–Ω–∞—á–µ–Ω–∏–µ –Ω–∞—Å—Ç—Ä–æ–π–∫–∏")
-        await self.execute(
-            f"UPDATE funpay_users SET {column}=$2, updated_at=NOW() WHERE telegram_id=$1",
-            telegram_id,
-            value,
-        )
-
-    async def set_review_reply(self, telegram_id: int, stars: int, text: str) -> None:
-        if stars not in range(1, 6):
-            raise ValueError("–û—Ü–µ–Ω–∫–∞ –¥–æ–ª–∂–Ω–∞ –±—ã—Ç—å –æ—Ç 1 –¥–æ 5")
-        await self.execute(
-            f"UPDATE funpay_users SET review_reply_{stars}=$2, updated_at=NOW() WHERE telegram_id=$1",
-            telegram_id,
-            text,
-        )
-
-    async def claim_autoreply(
-        self,
-        telegram_id: int,
-        chat_id: str,
-        cooldown_minutes: int = 30,
-        first_only: bool = False,
-    ) -> bool:
-        if first_only:
-            row = await self.fetchrow(
-                """
-                INSERT INTO funpay_autoreply_log (telegram_id, chat_id, last_sent)
-                VALUES ($1, $2, NOW())
-                ON CONFLICT DO NOTHING
-                RETURNING telegram_id
-                """,
-                telegram_id,
-                chat_id,
-            )
-            return row is not None
-        row = await self.fetchrow(
-            """
-            INSERT INTO funpay_autoreply_log (telegram_id, chat_id, last_sent)
-            VALUES ($1, $2, NOW())
-            ON CONFLICT (telegram_id, chat_id) DO UPDATE
-               SET last_sent=NOW()
-             WHERE funpay_autoreply_log.last_sent < NOW() - make_interval(mins => $3)
-            RETURNING telegram_id
-            """,
-            telegram_id,
-            chat_id,
-            cooldown_minutes,
-        )
-        return row is not None
-
-    async def claim_playerok_autoreply(
-        self, telegram_id: int, chat_id: str, cooldown_minutes: int = 30
-    ) -> bool:
-        row = await self.fetchrow(
-            """
-            INSERT INTO playerok_autoreply_log (telegram_id, chat_id, last_sent)
-            VALUES ($1, $2, NOW())
-            ON CONFLICT (telegram_id, chat_id) DO UPDATE
-               SET last_sent=NOW()
-             WHERE playerok_autoreply_log.last_sent < NOW() - make_interval(mins => $3)
-            RETURNING telegram_id
-            """,
-            telegram_id,
-            chat_id,
-            cooldown_minutes,
-        )
-        return row is not None
-
-    async def list_plugins(self, telegram_id: int) -> list[asyncpg.Record]:
-        return await self.fetch(
-            "SELECT * FROM funpay_plugins WHERE telegram_id=$1 ORDER BY uploaded_at, name",
-            telegram_id,
-        )
-
-    async def get_plugin(self, telegram_id: int, uuid: str) -> asyncpg.Record | None:
-        return await self.fetchrow(
-            "SELECT * FROM funpay_plugins WHERE telegram_id=$1 AND uuid=$2",
-            telegram_id,
-            uuid,
-        )
-
-    async def get_plugin_builder_settings(self, telegram_id: int) -> asyncpg.Record:
-        await self.execute(
-            """
-            INSERT INTO funpay_plugin_builder_settings (telegram_id)
-            VALUES ($1)
-            ON CONFLICT (telegram_id) DO NOTHING
-            """,
-            telegram_id,
-        )
-        row = await self.fetchrow(
-            "SELECT * FROM funpay_plugin_builder_settings WHERE telegram_id=$1",
-            telegram_id,
-        )
-        if row is None:
-            raise RuntimeError("–Ω–µ —É–¥–∞–ª–æ—Å—å –∑–∞–≥—Ä—É–∑–∏—Ç—å –Ω–∞—Å—Ç—Ä–æ–π–∫–∏ AI-–∫–æ–Ω—Å—Ç—Ä—É–∫—Ç–æ—Ä–∞")
-        return row
-
-    async def set_plugin_builder_setting(
-        self, telegram_id: int, key: str, value: str | None
-    ) -> None:
-        if key not in {"api_base_url", "api_token_enc", "model_id"}:
-            raise ValueError("–Ω–µ–∏–∑–≤–µ—Å—Ç–Ω–∞—è –Ω–∞—Å—Ç—Ä–æ–π–∫–∞ AI-–∫–æ–Ω—Å—Ç—Ä—É–∫—Ç–æ—Ä–∞")
-        await self.execute(
-            """
-            INSERT INTO funpay_plugin_builder_settings (telegram_id)
-            VALUES ($1)
-            ON CONFLICT (telegram_id) DO NOTHING
-            """,
-            telegram_id,
-        )
-        await self.execute(
-            f"""
-            UPDATE funpay_plugin_builder_settings
-               SET {key}=$2, updated_at=NOW()
-             WHERE telegram_id=$1
-            """,
-            telegram_id,
-            value,
-        )
-
-    async def mark_plugin_ai_generated(
-        self,
-        telegram_id: int,
-        uuid: str,
-        prompt: str,
-        summary: str,
-    ) -> None:
-        await self.execute(
-            """
-            UPDATE funpay_plugins
-               SET ai_generated=TRUE, ai_prompt=$3, ai_summary=$4,
-                   ai_revision=ai_revision+1, ai_updated_at=NOW()
-             WHERE telegram_id=$1 AND uuid=$2
-            """,
-            telegram_id,
-            uuid,
-            prompt,
-            summary,
-        )
-
-    async def seed_official_plugins(self) -> None:
-        for plugin in READY_PLUGINS:
-            source = ready_plugin_source(plugin)
-            await self.execute(
-                """
-                INSERT INTO funpay_plugin_catalog
-                    (uuid, owner_telegram_id, publisher_name, filename, name, version,
-                     short_description, description, credits, source, is_official)
-                VALUES ($1, NULL, '–ö–æ–º–∞–Ω–¥–∞ –ø—Ä–æ–µ–∫—Ç–∞', $2, $3, $4, $5, $6,
-                        'FunPay aiogram bot', $7, TRUE)
-                ON CONFLICT (uuid) DO UPDATE
-                    SET publisher_name=EXCLUDED.publisher_name,
-                        filename=EXCLUDED.filename, name=EXCLUDED.name,
-                        version=EXCLUDED.version,
-                        short_description=EXCLUDED.short_description,
-                        description=EXCLUDED.description, credits=EXCLUDED.credits,
-                        source=EXCLUDED.source, is_official=TRUE, updated_at=NOW()
-                  WHERE funpay_plugin_catalog.is_official=TRUE
-                """,
-                plugin.uuid,
-                plugin.filename,
-                plugin.name,
-                plugin.version,
-                plugin.description,
-                plugin.details,
-                source,
-            )
-            await self.execute(
-                """
-                UPDATE funpay_plugins
-                   SET filename=$2, name=$3, version=$4, description=$5,
-                       credits='FunPay aiogram bot', settings_page=TRUE, source=$6
-                 WHERE uuid=$1
-                """,
-                plugin.uuid,
-                plugin.filename,
-                plugin.name,
-                plugin.version,
-                plugin.description,
-                source,
-            )
-
-    async def list_catalog_plugins(
-        self, limit: int, offset: int
-    ) -> tuple[list[asyncpg.Record], int]:
-        rows = await self.fetch(
-            """
-            SELECT * FROM funpay_plugin_catalog
-             ORDER BY is_official DESC, install_count DESC, updated_at DESC, name
-             LIMIT $1 OFFSET $2
-            """,
-            limit,
-            offset,
-        )
-        count_row = await self.fetchrow("SELECT COUNT(*) AS count FROM funpay_plugin_catalog")
-        return rows, int(count_row["count"]) if count_row else 0
-
-    async def get_catalog_plugin(self, uuid: str) -> asyncpg.Record | None:
-        return await self.fetchrow(
-            "SELECT * FROM funpay_plugin_catalog WHERE uuid=$1",
-            uuid,
-        )
-
-    async def publish_catalog_plugin(
-        self,
-        telegram_id: int,
-        uuid: str,
-        publisher_name: str,
-        description: str,
-    ) -> bool:
-        row = await self.fetchrow(
-            """
-            INSERT INTO funpay_plugin_catalog
-                (uuid, owner_telegram_id, publisher_name, filename, name, version,
-                 short_description, description, credits, source, is_official,
-                 ai_generated, published_at, updated_at)
-            SELECT uuid, telegram_id, $3, filename, name, version, description, $4,
-                   credits, source, FALSE, ai_generated, NOW(), NOW()
-              FROM funpay_plugins
-             WHERE telegram_id=$1 AND uuid=$2
-            ON CONFLICT (uuid) DO UPDATE
-                SET publisher_name=EXCLUDED.publisher_name,
-                    filename=EXCLUDED.filename, name=EXCLUDED.name,
-                    version=EXCLUDED.version,
-                    short_description=EXCLUDED.short_description,
-                    description=EXCLUDED.description, credits=EXCLUDED.credits,
-                    source=EXCLUDED.source, ai_generated=EXCLUDED.ai_generated,
-                    updated_at=NOW()
-              WHERE funpay_plugin_catalog.owner_telegram_id=$1
-                AND funpay_plugin_catalog.is_official=FALSE
-            RETURNING uuid
-            """,
-            telegram_id,
-            uuid,
-            publisher_name,
-            description,
-        )
-        return row is not None
-
-    async def unpublish_catalog_plugin(self, telegram_id: int, uuid: str) -> bool:
-        result = await self.execute(
-            """
-            DELETE FROM funpay_plugin_catalog
-             WHERE uuid=$1 AND owner_telegram_id=$2 AND is_official=FALSE
-            """,
-            uuid,
-            telegram_id,
-        )
-        return result.endswith(" 1")
-
-    async def increment_catalog_install(self, uuid: str) -> None:
-        await self.execute(
-            "UPDATE funpay_plugin_catalog SET install_count=install_count+1 WHERE uuid=$1",
-            uuid,
-        )
-
-    async def upsert_plugin(self, telegram_id: int, plugin: PluginData, source: str) -> None:
-        await self.execute(
-            """
-            INSERT INTO funpay_plugins
-                (telegram_id, uuid, filename, name, version, description, credits,
-                 settings_page, source, enabled, uploaded_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, TRUE, NOW())
-            ON CONFLICT (telegram_id, uuid) DO UPDATE
-                SET filename=EXCLUDED.filename, name=EXCLUDED.name, version=EXCLUDED.version,
-                    description=EXCLUDED.description, credits=EXCLUDED.credits,
-                    settings_page=EXCLUDED.settings_page, source=EXCLUDED.source,
-                    enabled=TRUE, uploaded_at=NOW()
-            """,
-            telegram_id,
-            plugin.uuid,
-            plugin.filename,
-            plugin.name,
-            plugin.version,
-            plugin.description,
-            plugin.credits,
-            plugin.settings_page,
-            source,
-        )
-
-    async def set_plugin_enabled(self, telegram_id: int, uuid: str, enabled: bool) -> None:
-        await self.execute(
-            "UPDATE funpay_plugins SET enabled=$3 WHERE telegram_id=$1 AND uuid=$2",
-            telegram_id,
-            uuid,
-            enabled,
-        )
-
-    async def delete_plugin(self, telegram_id: int, uuid: str) -> None:
-        await self.execute(
-            "DELETE FROM funpay_plugins WHERE telegram_id=$1 AND uuid=$2",
-            telegram_id,
-            uuid,
-        )
-
-    async def get_plugin_setting(
-        self, telegram_id: int, uuid: str, key: str, default: str = ""
-    ) -> str:
-        row = await self.fetchrow(
-            """
-            SELECT setting_value FROM funpay_plugin_settings
-             WHERE telegram_id=$1 AND plugin_uuid=$2 AND setting_key=$3
-            """,
-            telegram_id,
-            uuid,
-            key,
-        )
-        return str(row["setting_value"]) if row else default
-
-    async def set_plugin_setting(
-        self, telegram_id: int, uuid: str, key: str, value: str
-    ) -> None:
-        await self.execute(
-            """
-            INSERT INTO funpay_plugin_settings
-                (telegram_id, plugin_uuid, setting_key, setting_value, updated_at)
-            VALUES ($1, $2, $3, $4, NOW())
-            ON CONFLICT (telegram_id, plugin_uuid, setting_key) DO UPDATE
-                SET setting_value=EXCLUDED.setting_value, updated_at=NOW()
-            """,
-            telegram_id,
-            uuid,
-            key,
-            value,
-        )
-
-    async def get_plugin_telethon_session(
-        self, telegram_id: int, uuid: str
-    ) -> asyncpg.Record | None:
-        return await self.fetchrow(
-            """
-            SELECT * FROM funpay_plugin_telethon_sessions
-             WHERE telegram_id=$1 AND plugin_uuid=$2
-            """,
-            telegram_id,
-            uuid,
-        )
-
-    async def save_plugin_telethon_session(
-        self,
-        telegram_id: int,
-        uuid: str,
-        phone_enc: str,
-        session_enc: str,
-        password_enc: str | None,
-        telegram_user_id: int,
-        telegram_username: str | None,
-    ) -> None:
-        await self.execute(
-            """
-            INSERT INTO funpay_plugin_telethon_sessions
-                (telegram_id, plugin_uuid, phone_enc, session_enc, password_enc,
-                 telegram_user_id, telegram_username, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
-            ON CONFLICT (telegram_id, plugin_uuid) DO UPDATE
-                SET phone_enc=EXCLUDED.phone_enc,
-                    session_enc=EXCLUDED.session_enc,
-                    password_enc=EXCLUDED.password_enc,
-                    telegram_user_id=EXCLUDED.telegram_user_id,
-                    telegram_username=EXCLUDED.telegram_username,
-                    updated_at=NOW()
-            """,
-            telegram_id,
-            uuid,
-            phone_enc,
-            session_enc,
-            password_enc,
-            telegram_user_id,
-            telegram_username,
-        )
-
-    async def delete_plugin_telethon_session(
-        self, telegram_id: int, uuid: str
-    ) -> None:
-        await self.execute(
-            """
-            DELETE FROM funpay_plugin_telethon_sessions
-             WHERE telegram_id=$1 AND plugin_uuid=$2
-            """,
-            telegram_id,
-            uuid,
-        )
-
-    async def seed_official_playerok_plugins(self) -> None:
-        for plugin in PLAYEROK_READY_PLUGINS:
-            await self.execute(
-                """
-                INSERT INTO playerok_plugin_catalog
-                    (uuid, owner_telegram_id, publisher_name, filename, name, version,
-                     short_description, description, credits, source, is_official)
-                VALUES ($1, NULL, '–ö–æ–º–∞–Ω–¥–∞ –ø—Ä–æ–µ–∫—Ç–∞', $2, $3, $4, $5, $6,
-                        'FunPay aiogram bot', $7, TRUE)
-                ON CONFLICT (uuid) DO UPDATE
-                    SET publisher_name=EXCLUDED.publisher_name,
-                        filename=EXCLUDED.filename, name=EXCLUDED.name,
-                        version=EXCLUDED.version,
-                        short_description=EXCLUDED.short_description,
-                        description=EXCLUDED.description, credits=EXCLUDED.credits,
-                        source=EXCLUDED.source, is_official=TRUE, updated_at=NOW()
-                  WHERE playerok_plugin_catalog.is_official=TRUE
-                """,
-                plugin.uuid,
-                plugin.filename,
-                plugin.name,
-                plugin.version,
-                plugin.description,
-                plugin.details,
-                playerok_ready_plugin_source(plugin),
-            )
-
-    async def list_playerok_plugins(self, telegram_id: int) -> list[asyncpg.Record]:
-        return await self.fetch(
-            "SELECT * FROM playerok_plugins WHERE telegram_id=$1 ORDER BY uploaded_at, name",
-            telegram_id,
-        )
-
-    async def get_playerok_plugin(
-        self, telegram_id: int, uuid: str
-    ) -> asyncpg.Record | None:
-        return await self.fetchrow(
-            "SELECT * FROM playerok_plugins WHERE telegram_id=$1 AND uuid=$2",
-            telegram_id,
-            uuid,
-        )
-
-    async def list_playerok_catalog_plugins(
-        self, limit: int, offset: int
-    ) -> tuple[list[asyncpg.Record], int]:
-        rows = await self.fetch(
-            """
-            SELECT * FROM playerok_plugin_catalog
-             ORDER BY is_official DESC, install_count DESC, updated_at DESC, name
-             LIMIT $1 OFFSET $2
-            """,
-            limit,
-            offset,
-        )
-        count_row = await self.fetchrow(
-            "SELECT COUNT(*) AS count FROM playerok_plugin_catalog"
-        )
-        return rows, int(count_row["count"]) if count_row else 0
-
-    async def get_playerok_catalog_plugin(self, uuid: str) -> asyncpg.Record | None:
-        return await self.fetchrow(
-            "SELECT * FROM playerok_plugin_catalog WHERE uuid=$1", uuid
-        )
-
-    async def publish_playerok_catalog_plugin(
-        self,
-        telegram_id: int,
-        uuid: str,
-        publisher_name: str,
-        description: str,
-    ) -> bool:
-        row = await self.fetchrow(
-            """
-            INSERT INTO playerok_plugin_catalog
-                (uuid, owner_telegram_id, publisher_name, filename, name, version,
-                 short_description, description, credits, source, is_official,
-                 published_at, updated_at)
-            SELECT uuid, telegram_id, $3, filename, name, version, description, $4,
-                   credits, source, FALSE, NOW(), NOW()
-              FROM playerok_plugins
-             WHERE telegram_id=$1 AND uuid=$2
-            ON CONFLICT (uuid) DO UPDATE
-                SET publisher_name=EXCLUDED.publisher_name,
-                    filename=EXCLUDED.filename, name=EXCLUDED.name,
-                    version=EXCLUDED.version,
-                    short_description=EXCLUDED.short_description,
-                    description=EXCLUDED.description, credits=EXCLUDED.credits,
-                    source=EXCLUDED.source, updated_at=NOW()
-              WHERE playerok_plugin_catalog.owner_telegram_id=$1
-                AND playerok_plugin_catalog.is_official=FALSE
-            RETURNING uuid
-            """,
-            telegram_id,
-            uuid,
-            publisher_name,
-            description,
-        )
-        return row is not None
-
-    async def unpublish_playerok_catalog_plugin(
-        self, telegram_id: int, uuid: str
-    ) -> bool:
-        result = await self.execute(
-            """
-            DELETE FROM playerok_plugin_catalog
-             WHERE uuid=$1 AND owner_telegram_id=$2 AND is_official=FALSE
-            """,
-            uuid,
-            telegram_id,
-        )
-        return result.endswith(" 1")
-
-    async def increment_playerok_catalog_install(self, uuid: str) -> None:
-        await self.execute(
-            """
-            UPDATE playerok_plugin_catalog
-               SET install_count=install_count+1
-             WHERE uuid=$1
-            """,
-            uuid,
-        )
-
-    async def upsert_playerok_plugin(
-        self, telegram_id: int, plugin: PlayerokPluginData, source: str
-    ) -> None:
-        await self.execute(
-            """
-            INSERT INTO playerok_plugins
-                (telegram_id, uuid, filename, name, version, description, credits,
-                 settings_page, source, enabled, uploaded_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, TRUE, NOW())
-            ON CONFLICT (telegram_id, uuid) DO UPDATE
-                SET filename=EXCLUDED.filename, name=EXCLUDED.name,
-                    version=EXCLUDED.version, description=EXCLUDED.description,
-                    credits=EXCLUDED.credits, settings_page=EXCLUDED.settings_page,
-                    source=EXCLUDED.source, enabled=TRUE, uploaded_at=NOW()
-            """,
-            telegram_id,
-            plugin.uuid,
-            plugin.filename,
-            plugin.name,
-            plugin.version,
-            plugin.description,
-            plugin.credits,
-            plugin.settings_page,
-            source,
-        )
-
-    async def set_playerok_plugin_enabled(
-        self, telegram_id: int, uuid: str, enabled: bool
-    ) -> None:
-        await self.execute(
-            "UPDATE playerok_plugins SET enabled=$3 WHERE telegram_id=$1 AND uuid=$2",
-            telegram_id,
-            uuid,
-            enabled,
-        )
-
-    async def delete_playerok_plugin(self, telegram_id: int, uuid: str) -> None:
-        await self.execute(
-            "DELETE FROM playerok_plugins WHERE telegram_id=$1 AND uuid=$2",
-            telegram_id,
-            uuid,
-        )
-
-    async def list_playerok_plugin_settings(
-        self, telegram_id: int, uuid: str
-    ) -> dict[str, str]:
-        rows = await self.fetch(
-            """
-            SELECT setting_key, setting_value FROM playerok_plugin_settings
-             WHERE telegram_id=$1 AND plugin_uuid=$2
-            """,
-            telegram_id,
-            uuid,
-        )
-        return {str(row["setting_key"]): str(row["setting_value"]) for row in rows}
-
-    async def set_playerok_plugin_setting(
-        self, telegram_id: int, uuid: str, key: str, value: str
-    ) -> None:
-        await self.execute(
-            """
-            INSERT INTO playerok_plugin_settings
-                (telegram_id, plugin_uuid, setting_key, setting_value, updated_at)
-            VALUES ($1, $2, $3, $4, NOW())
-            ON CONFLICT (telegram_id, plugin_uuid, setting_key) DO UPDATE
-                SET setting_value=EXCLUDED.setting_value, updated_at=NOW()
-            """,
-            telegram_id,
-            uuid,
-            key,
-            value,
-        )
-
-    async def active_users(self) -> list[asyncpg.Record]:
-        return await self.fetch(
-            """
-            SELECT * FROM marketplace_accounts
-             WHERE marketplace='funpay' AND enabled=TRUE
-               AND proxy_enc IS NOT NULL AND credential_enc IS NOT NULL
-            """
-        )
-
-    async def active_playerok_users(self) -> list[asyncpg.Record]:
-        return await self.fetch(
-            """
-            SELECT * FROM marketplace_accounts
-             WHERE marketplace='playerok' AND enabled=TRUE
-               AND proxy_enc IS NOT NULL AND credential_enc IS NOT NULL
-            """
-        )
-
-    async def list_delivery_rules(self, telegram_id: int) -> list[asyncpg.Record]:
-        return await self.fetch(
-            "SELECT * FROM funpay_delivery_rules WHERE telegram_id=$1 ORDER BY lot_title",
-            telegram_id,
-        )
-
-    async def get_delivery_rule(self, telegram_id: int, rule_id: int) -> asyncpg.Record | None:
-        return await self.fetchrow(
-            "SELECT * FROM funpay_delivery_rules WHERE telegram_id=$1 AND id=$2",
-            telegram_id,
-            rule_id,
-        )
-
-    async def find_delivery_rule(
-        self, telegram_id: int, lot_title: str
-    ) -> asyncpg.Record | None:
-        return await self.fetchrow(
-            """
-            SELECT * FROM funpay_delivery_rules
-             WHERE telegram_id=$1 AND position(lot_title in $2)>0
-             ORDER BY length(lot_title) DESC LIMIT 1
-            """,
-            telegram_id,
-            lot_title,
-        )
-
-    async def save_delivery_rule(
-        self, telegram_id: int, lot_id: int, lot_title: str, response: str
-    ) -> asyncpg.Record:
-        return await self.fetchrow(
-            """
-            INSERT INTO funpay_delivery_rules (telegram_id, lot_id, lot_title, response)
-            VALUES ($1, $2, $3, $4)
-            ON CONFLICT (telegram_id, lot_id) DO UPDATE
-                SET lot_title=EXCLUDED.lot_title, response=EXCLUDED.response,
-                    enabled=TRUE, updated_at=NOW()
-            RETURNING *
-            """,
-            telegram_id,
-            lot_id,
-            lot_title,
-            response,
-        )
-
-    async def add_delivery_products(
-        self, telegram_id: int, rule_id: int, products: list[str]
-    ) -> None:
-        await self.execute(
-            """
-            UPDATE funpay_delivery_rules
-               SET products=products || $3::TEXT[], updated_at=NOW()
-             WHERE telegram_id=$1 AND id=$2
-            """,
-            telegram_id,
-            rule_id,
-            products,
-        )
-
-    async def clear_delivery_products(self, telegram_id: int, rule_id: int) -> None:
-        await self.execute(
-            """
-            UPDATE funpay_delivery_rules
-               SET products=ARRAY[]::TEXT[], updated_at=NOW()
-             WHERE telegram_id=$1 AND id=$2
-            """,
-            telegram_id,
-            rule_id,
-        )
-
-    async def toggle_delivery_rule(self, telegram_id: int, rule_id: int) -> None:
-        await self.execute(
-            """
-            UPDATE funpay_delivery_rules SET enabled=NOT enabled, updated_at=NOW()
-             WHERE telegram_id=$1 AND id=$2
-            """,
-            telegram_id,
-            rule_id,
-        )
-
-    async def toggle_delivery_rule_option(
-        self, telegram_id: int, rule_id: int, column: str
-    ) -> None:
-        if column not in {"disable_auto_restore", "disable_auto_disable"}:
-            raise ValueError("–ù–µ–∏–∑–≤–µ—Å—Ç–Ω–∞—è –Ω–∞—Å—Ç—Ä–æ–π–∫–∞ –ø—Ä–∞–≤–∏–ª–∞ –∞–≤—Ç–æ–≤—ã–¥–∞—á–∏")
-        await self.execute(
-            f"""
-            UPDATE funpay_delivery_rules
-               SET {column}=NOT {column}, updated_at=NOW()
-             WHERE telegram_id=$1 AND id=$2
-            """,
-            telegram_id,
-            rule_id,
-        )
-
-    async def delete_delivery_rule(self, telegram_id: int, rule_id: int) -> None:
-        await self.execute(
-            "DELETE FROM funpay_delivery_rules WHERE telegram_id=$1 AND id=$2",
-            telegram_id,
-            rule_id,
-        )
-
-    async def claim_delivery(
-        self, telegram_id: int, order_id: str, lot_title: str, amount: int
-    ) -> tuple[asyncpg.Record, list[str], int, str | None] | None:
-        if not self.pool:
-            raise RuntimeError("–ë–∞–∑–∞ –¥–∞–Ω–Ω—ã—Ö –Ω–µ –ø–æ–¥–∫–ª—é—á–µ–Ω–∞")
-        async with self.pool.acquire() as connection:  # noqa: SIM117 - transaction needs connection.
-            async with connection.transaction():
-                duplicate = await connection.fetchval(
-                    "SELECT 1 FROM funpay_delivery_log WHERE telegram_id=$1 AND order_id=$2",
-                    telegram_id,
-                    order_id,
-                )
-                if duplicate:
-                    return None
-                rule = await connection.fetchrow(
-                    """
-                    SELECT * FROM funpay_delivery_rules
-                     WHERE telegram_id=$1 AND enabled=TRUE
-                       AND position(lot_title in $2)>0
-                     ORDER BY length(lot_title) DESC
-                     LIMIT 1 FOR UPDATE
-                    """,
-                    telegram_id,
-                    lot_title,
-                )
-                if not rule:
-                    return None
-                stock = list(rule["products"] or [])
-                needs_product = "$product" in rule["response"]
-                if needs_product and len(stock) < amount:
-                    error = f"–ù–µ–¥–æ—Å—Ç–∞—Ç–æ—á–Ω–æ —Ç–æ–≤–∞—Ä–æ–≤: –Ω—É–∂–Ω–æ {amount}, –¥–æ—Å—Ç—É–ø–Ω–æ {len(stock)}"
-                    await connection.execute(
-                        """
-                        INSERT INTO funpay_delivery_log
-                            (telegram_id, order_id, rule_id, status, details)
-                        VALUES ($1, $2, $3, 'failed', $4)
-                        """,
-                        telegram_id,
-                        order_id,
-                        rule["id"],
-                        error,
-                    )
-                    return rule, [], len(stock), error
-                products = stock[:amount] if needs_product else []
-                remaining = stock[amount:] if needs_product else stock
-                await connection.execute(
-                    "UPDATE funpay_delivery_rules SET products=$3, updated_at=NOW() WHERE telegram_id=$1 AND id=$2",
-                    telegram_id,
-                    rule["id"],
-                    remaining,
-                )
-                await connection.execute(
-                    """
-                    INSERT INTO funpay_delivery_log
-                        (telegram_id, order_id, rule_id, status)
-                    VALUES ($1, $2, $3, 'processing')
-                    """,
-                    telegram_id,
-                    order_id,
-                    rule["id"],
-                )
-                return rule, products, len(remaining), None
-
-    async def finish_delivery(
-        self, telegram_id: int, order_id: str, status: str, details: str = ""
-    ) -> None:
-        await self.execute(
-            """
-            UPDATE funpay_delivery_log SET status=$3, details=$4
-             WHERE telegram_id=$1 AND order_id=$2
-            """,
-            telegram_id,
-            order_id,
-            status,
-            details,
-        )
-
-    async def restore_delivery_products(
-        self, telegram_id: int, rule_id: int, products: list[str]
-    ) -> None:
-        if products:
-            await self.execute(
-                """
-                UPDATE funpay_delivery_rules
-                   SET products=$3::TEXT[] || products, updated_at=NOW()
-                 WHERE telegram_id=$1 AND id=$2
-                """,
-                telegram_id,
-                rule_id,
-                products,
-            )
-
-    async def list_command_replies(self, telegram_id: int) -> list[asyncpg.Record]:
-        return await self.fetch(
-            "SELECT * FROM funpay_command_replies WHERE telegram_id=$1 ORDER BY trigger",
-            telegram_id,
-        )
-
-    async def get_command_reply(self, telegram_id: int, reply_id: int) -> asyncpg.Record | None:
-        return await self.fetchrow(
-            "SELECT * FROM funpay_command_replies WHERE telegram_id=$1 AND id=$2",
-            telegram_id,
-            reply_id,
-        )
-
-    async def find_command_reply(self, telegram_id: int, trigger: str) -> asyncpg.Record | None:
-        return await self.fetchrow(
-            """
-            SELECT * FROM funpay_command_replies
-             WHERE telegram_id=$1 AND trigger=$2 AND enabled=TRUE
-            """,
-            telegram_id,
-            trigger.casefold().strip(),
-        )
-
-    async def save_command_reply(
-        self, telegram_id: int, trigger: str, response: str
-    ) -> asyncpg.Record:
-        return await self.fetchrow(
-            """
-            INSERT INTO funpay_command_replies (telegram_id, trigger, response)
-            VALUES ($1, $2, $3)
-            ON CONFLICT (telegram_id, trigger) DO UPDATE
-                SET response=EXCLUDED.response, enabled=TRUE, updated_at=NOW()
-            RETURNING *
-            """,
-            telegram_id,
-            trigger.casefold().strip(),
-            response,
-        )
-
-    async def toggle_command_reply(self, telegram_id: int, reply_id: int) -> None:
-        await self.execute(
-            """
-            UPDATE funpay_command_replies SET enabled=NOT enabled, updated_at=NOW()
-             WHERE telegram_id=$1 AND id=$2
-            """,
-            telegram_id,
-            reply_id,
-        )
-
-    async def toggle_command_notification(self, telegram_id: int, reply_id: int) -> None:
-        await self.execute(
-            """
-            UPDATE funpay_command_replies SET notify=NOT notify, updated_at=NOW()
-             WHERE telegram_id=$1 AND id=$2
-            """,
-            telegram_id,
-            reply_id,
-        )
-
-    async def delete_command_reply(self, telegram_id: int, reply_id: int) -> None:
-        await self.execute(
-            "DELETE FROM funpay_command_replies WHERE telegram_id=$1 AND id=$2",
-            telegram_id,
-            reply_id,
-        )
-
-    async def list_notification_targets(self, telegram_id: int) -> list[asyncpg.Record]:
-        return await self.fetch(
-            "SELECT * FROM funpay_notification_targets WHERE telegram_id=$1 ORDER BY created_at",
-            telegram_id,
-        )
-
-    async def save_notification_target(
-        self, telegram_id: int, chat_id: int, title: str
-    ) -> None:
-        await self.execute(
-            """
-            INSERT INTO funpay_notification_targets (telegram_id, chat_id, title)
-            VALUES ($1, $2, $3)
-            ON CONFLICT (telegram_id, chat_id) DO UPDATE
-                SET title=EXCLUDED.title, enabled=TRUE
-            """,
-            telegram_id,
-            chat_id,
-            title,
-        )
-
-    async def delete_notification_target(self, telegram_id: int, chat_id: int) -> None:
-        await self.execute(
-            "DELETE FROM funpay_notification_targets WHERE telegram_id=$1 AND chat_id=$2",
-            telegram_id,
-            chat_id,
-        )
-
-    async def list_playerok_command_replies(self, telegram_id: int) -> list[asyncpg.Record]:
-        return await self.fetch(
-            "SELECT * FROM playerok_command_replies WHERE telegram_id=$1 ORDER BY trigger",
-            telegram_id,
-        )
-
-    async def get_playerok_command_reply(
-        self, telegram_id: int, reply_id: int
-    ) -> asyncpg.Record | None:
-        return await self.fetchrow(
-            "SELECT * FROM playerok_command_replies WHERE telegram_id=$1 AND id=$2",
-            telegram_id,
-            reply_id,
-        )
-
-    async def find_playerok_command_reply(
-        self, telegram_id: int, trigger: str
-    ) -> asyncpg.Record | None:
-        return await self.fetchrow(
-            """
-            SELECT * FROM playerok_command_replies
-             WHERE telegram_id=$1 AND trigger=$2 AND enabled=TRUE
-            """,
-            telegram_id,
-            trigger.casefold().strip(),
-        )
-
-    async def save_playerok_command_reply(
-        self, telegram_id: int, trigger: str, response: str
-    ) -> asyncpg.Record:
-        return await self.fetchrow(
-            """
-            INSERT INTO playerok_command_replies (telegram_id, trigger, response)
-            VALUES ($1, $2, $3)
-            ON CONFLICT (telegram_id, trigger) DO UPDATE
-                SET response=EXCLUDED.response, enabled=TRUE, updated_at=NOW()
-            RETURNING *
-            """,
-            telegram_id,
-            trigger.casefold().strip(),
-            response,
-        )
-
-    async def toggle_playerok_command_reply(self, telegram_id: int, reply_id: int) -> None:
-        await self.execute(
-            """
-            UPDATE playerok_command_replies SET enabled=NOT enabled, updated_at=NOW()
-             WHERE telegram_id=$1 AND id=$2
-            """,
-            telegram_id,
-            reply_id,
-        )
-
-    async def delete_playerok_command_reply(self, telegram_id: int, reply_id: int) -> None:
-        await self.execute(
-            "DELETE FROM playerok_command_replies WHERE telegram_id=$1 AND id=$2",
-            telegram_id,
-            reply_id,
-        )
-
-    async def list_playerok_delivery_rules(self, telegram_id: int) -> list[asyncpg.Record]:
-        return await self.fetch(
-            "SELECT * FROM playerok_delivery_rules WHERE telegram_id=$1 ORDER BY item_title",
-            telegram_id,
-        )
-
-    async def get_playerok_delivery_rule(
-        self, telegram_id: int, rule_id: int
-    ) -> asyncpg.Record | None:
-        return await self.fetchrow(
-            "SELECT * FROM playerok_delivery_rules WHERE telegram_id=$1 AND id=$2",
-            telegram_id,
-            rule_id,
-        )
-
-    async def save_playerok_delivery_rule(
-        self, telegram_id: int, item_id: str, item_title: str, response: str
-    ) -> asyncpg.Record:
-        return await self.fetchrow(
-            """
-            INSERT INTO playerok_delivery_rules (telegram_id, item_id, item_title, response)
-            VALUES ($1, $2, $3, $4)
-            ON CONFLICT (telegram_id, item_id) DO UPDATE
-                SET item_title=EXCLUDED.item_title, response=EXCLUDED.response,
-                    enabled=TRUE, updated_at=NOW()
-            RETURNING *
-            """,
-            telegram_id,
-            item_id,
-            item_title,
-            response,
-        )
-
-    async def add_playerok_delivery_products(
-        self, telegram_id: int, rule_id: int, products: list[str]
-    ) -> None:
-        await self.execute(
-            """
-            UPDATE playerok_delivery_rules
-               SET products=products || $3::TEXT[], updated_at=NOW()
-             WHERE telegram_id=$1 AND id=$2
-            """,
-            telegram_id,
-            rule_id,
-            products,
-        )
-
-    async def clear_playerok_delivery_products(self, telegram_id: int, rule_id: int) -> None:
-        await self.execute(
-            """
-            UPDATE playerok_delivery_rules
-               SET products=ARRAY[]::TEXT[], updated_at=NOW()
-             WHERE telegram_id=$1 AND id=$2
-            """,
-            telegram_id,
-            rule_id,
-        )
-
-    async def toggle_playerok_delivery_rule(self, telegram_id: int, rule_id: int) -> None:
-        await self.execute(
-            """
-            UPDATE playerok_delivery_rules SET enabled=NOT enabled, updated_at=NOW()
-             WHERE telegram_id=$1 AND id=$2
-            """,
-            telegram_id,
-            rule_id,
-        )
-
-    async def delete_playerok_delivery_rule(self, telegram_id: int, rule_id: int) -> None:
-        await self.execute(
-            "DELETE FROM playerok_delivery_rules WHERE telegram_id=$1 AND id=$2",
-            telegram_id,
-            rule_id,
-        )
-
-    async def claim_playerok_delivery(
-        self, telegram_id: int, deal_id: str, item_id: str
-    ) -> tuple[asyncpg.Record, list[str], int, str | None] | None:
-        if not self.pool:
-            raise RuntimeError("–ë–∞–∑–∞ –¥–∞–Ω–Ω—ã—Ö –Ω–µ –ø–æ–¥–∫–ª—é—á–µ–Ω–∞")
-        async with self.pool.acquire() as connection:  # noqa: SIM117 - transaction needs connection.
-            async with connection.transaction():
-                if await connection.fetchval(
-                    "SELECT 1 FROM playerok_delivery_log WHERE telegram_id=$1 AND deal_id=$2",
-                    telegram_id,
-                    deal_id,
-                ):
-                    return None
-                rule = await connection.fetchrow(
-                    """
-                    SELECT * FROM playerok_delivery_rules
-                     WHERE telegram_id=$1 AND item_id=$2 AND enabled=TRUE
-                     LIMIT 1 FOR UPDATE
-                    """,
-                    telegram_id,
-                    item_id,
-                )
-                if not rule:
-                    return None
-                stock = list(rule["products"] or [])
-                needs_product = "$product" in rule["response"]
-                if needs_product and not stock:
-                    error = "–ó–∞–∫–æ–Ω—á–∏–ª–∏—Å—å —Ç–æ–≤–∞—Ä—ã –¥–ª—è –∞–≤—Ç–æ–≤—ã–¥–∞—á–∏"
-                    await connection.execute(
-                        """
-                        INSERT INTO playerok_delivery_log
-                            (telegram_id, deal_id, rule_id, status, details)
-                        VALUES ($1, $2, $3, 'failed', $4)
-                        """,
-                        telegram_id,
-                        deal_id,
-                        rule["id"],
-                        error,
-                    )
-                    return rule, [], 0, error
-                products = stock[:1] if needs_product else []
-                remaining = stock[1:] if needs_product else stock
-                await connection.execute(
-                    "UPDATE playerok_delivery_rules SET products=$3, updated_at=NOW() WHERE telegram_id=$1 AND id=$2",
-                    telegram_id,
-                    rule["id"],
-                    remaining,
-                )
-                await connection.execute(
-                    """
-                    INSERT INTO playerok_delivery_log (telegram_id, deal_id, rule_id, status)
-                    VALUES ($1, $2, $3, 'processing')
-                    """,
-                    telegram_id,
-                    deal_id,
-                    rule["id"],
-                )
-                return rule, products, len(remaining), None
-
-    async def finish_playerok_delivery(
-        self, telegram_id: int, deal_id: str, status: str, details: str = ""
-    ) -> None:
-        await self.execute(
-            """
-            UPDATE playerok_delivery_log SET status=$3, details=$4
-             WHERE telegram_id=$1 AND deal_id=$2
-            """,
-            telegram_id,
-            deal_id,
-            status,
-            details,
-        )
-
-    async def create_playerok_promotion_request(
-        self,
-        telegram_id: int,
-        account_id: int,
-        item_id: str,
-        item_title: str,
-        priority_status_id: str,
-        priority_name: str,
-        expected_price: int,
-        period_days: int,
-    ) -> asyncpg.Record:
-        token = os.urandom(8).hex()
-        row = await self.fetchrow(
-            """
-            INSERT INTO playerok_promotion_requests
-                (token, telegram_id, account_id, item_id, item_title,
-                 priority_status_id, priority_name, expected_price, period_days)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-            RETURNING *
-            """,
-            token,
-            telegram_id,
-            account_id,
-            item_id,
-            clipped(item_title, 500),
-            priority_status_id,
-            clipped(priority_name, 200),
-            expected_price,
-            period_days,
-        )
-        if not row:
-            raise RuntimeError("–ù–µ —É–¥–∞–ª–æ—Å—å —Å–æ–∑–¥–∞—Ç—å –∑–∞–ø—Ä–æ—Å –ø—Ä–æ–¥–≤–∏–∂–µ–Ω–∏—è")
-        return row
-
-    async def get_playerok_promotion_request(
-        self, telegram_id: int, token: str
-    ) -> asyncpg.Record | None:
-        return await self.fetchrow(
-            """
-            SELECT * FROM playerok_promotion_requests
-             WHERE telegram_id=$1 AND token=$2
-            """,
-            telegram_id,
-            token,
-        )
-
-    async def claim_playerok_promotion_request(
-        self, telegram_id: int, token: str
-    ) -> asyncpg.Record | None:
-        return await self.fetchrow(
-            """
-            UPDATE playerok_promotion_requests
-               SET status='processing', updated_at=NOW()
-             WHERE telegram_id=$1 AND token=$2 AND status='pending'
-               AND created_at > NOW() - INTERVAL '15 minutes'
-            RETURNING *
-            """,
-            telegram_id,
-            token,
-        )
-
-    async def finish_playerok_promotion_request(
-        self, telegram_id: int, token: str, status: str, error_text: str = ""
-    ) -> None:
-        if status not in {"succeeded", "failed"}:
-            raise ValueError("–ù–µ–∏–∑–≤–µ—Å—Ç–Ω—ã–π —Å—Ç–∞—Ç—É—Å –ø—Ä–æ–¥–≤–∏–∂–µ–Ω–∏—è")
-        await self.execute(
-            """
-            UPDATE playerok_promotion_requests
-               SET status=$3, error_text=$4, updated_at=NOW()
-             WHERE telegram_id=$1 AND token=$2 AND status='processing'
-            """,
-            telegram_id,
-            token,
-            status,
-            clipped(error_text, 1000),
-        )
-
-    async def restore_playerok_delivery_products(
-        self, telegram_id: int, rule_id: int, products: list[str]
-    ) -> None:
-        if products:
-            await self.execute(
-                """
-                UPDATE playerok_delivery_rules
-                   SET products=$3::TEXT[] || products, updated_at=NOW()
-                 WHERE telegram_id=$1 AND id=$2
-                """,
-                telegram_id,
-                rule_id,
-                products,
-            )
-
-
-def normalize_proxy(raw: str) -> str:
-    value = raw.strip()
-    if "://" not in value:
-        value = "http://" + value
-    parsed = urlsplit(value)
-    if parsed.scheme.lower() not in {"http", "https", "socks4", "socks5", "socks5h"}:
-        raise ValueError("–ü–æ–¥–¥–µ—Ä–∂–∏–≤–∞—é—Ç—Å—è http, https, socks4, socks5 –∏ socks5h")
-    try:
-        port = parsed.port
-    except ValueError as exc:
-        raise ValueError("–ù–µ–∫–æ—Ä—Ä–µ–∫—Ç–Ω—ã–π –ø–æ—Ä—Ç –ø—Ä–æ–∫—Å–∏") from exc
-    if not parsed.hostname or not port:
-        raise ValueError("–ù—É–∂–µ–Ω –∞–¥—Ä–µ—Å –≤–∏–¥–∞ user:password@host:port")
-    return value
-
-
-def proxy_dict(proxy: str) -> dict[str, str]:
-    return {"http": proxy, "https": proxy}
-
-
-def proxy_label(proxy: str) -> str:
-    parsed = urlsplit(proxy)
-    return f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"
-
-
-def masked_phone(phone: str) -> str:
-    digits = re.sub(r"\D", "", phone)
-    if len(digits) < 5:
-        return "—Å–∫—Ä—ã—Ç"
-    return f"+{digits[:2]}{'‚Ä¢' * max(3, len(digits) - 4)}{digits[-2:]}"
-
-
-def funpay_connection_error_message(exc: BaseException) -> str:
-    """–í–æ–∑–≤—Ä–∞—â–∞–µ—Ç –±–µ–∑–æ–ø–∞—Å–Ω—É—é –ø–æ–¥—Å–∫–∞–∑–∫—É –±–µ–∑ –≤—ã–≤–æ–¥–∞ –ø—Ä–æ–∫—Å–∏-–ª–æ–≥–∏–Ω–∞ –∏ –ø–∞—Ä–æ–ª—è."""
-    if getattr(exc, "status_code", None) == 407 or "407" in str(exc):
-        return (
-            "–ü—Ä–æ–∫—Å–∏ –æ—Ç–∫–ª–æ–Ω–∏–ª –∞–≤—Ç–æ—Ä–∏–∑–∞—Ü–∏—é (–æ—à–∏–±–∫–∞ 407). –ü—Ä–æ–≤–µ—Ä—å—Ç–µ –ª–æ–≥–∏–Ω, –ø–∞—Ä–æ–ª—å, "
-            "—Ç–∏–ø –ø—Ä–æ–∫—Å–∏ –∏ —Ä–∞–∑—Ä–µ—à—ë–Ω–Ω—ã–π IP —É –ø—Ä–æ–≤–∞–π–¥–µ—Ä–∞."
-        )
-    return "FunPay –Ω–µ –ø—Ä–∏–Ω—è–ª –¥–∞–Ω–Ω—ã–µ. –ü—Ä–æ–≤–µ—Ä—å—Ç–µ –¥–æ—Å—Ç—É–ø–Ω–æ—Å—Ç—å –ø—Ä–æ–∫—Å–∏ –∏ –∞–∫—Ç—É–∞–ª—å–Ω–æ—Å—Ç—å golden_key."
-
-
-def playerok_proxy_value(proxy: str) -> str:
-    parsed = urlsplit(proxy)
-    if parsed.scheme.lower() not in {"http", "https"}:
-        raise ValueError("PlayerokAPI –ø–æ–¥–¥–µ—Ä–∂–∏–≤–∞–µ—Ç IPv4 HTTP/HTTPS-–ø—Ä–æ–∫—Å–∏")
-    credentials = ""
-    if parsed.username:
-        credentials = parsed.username
-        if parsed.password:
-            credentials += f":{parsed.password}"
-        credentials += "@"
-    return f"{credentials}{parsed.hostname}:{parsed.port}"
-
-
-def create_playerok_account(cookie: str, proxy: str) -> Any:
-    """–°–æ–∑–¥–∞—ë—Ç –Ω–µ–∑–∞–≤–∏—Å–∏–º—ã–π –∞–∫–∫–∞—É–Ω—Ç, –æ–±—Ö–æ–¥—è singleton –≤ PlayerokAPI."""
-    if PlayerokAccount is None:
-        details = f": {PLAYEROK_IMPORT_ERROR}" if PLAYEROK_IMPORT_ERROR else ""
-        raise RuntimeError(f"PlayerokAPI –Ω–µ –∑–∞–≥—Ä—É–∑–∏–ª—Å—è –≤ —Ç–µ–∫—É—â–µ–π —Å–±–æ—Ä–∫–µ{details}")
-    account = object.__new__(PlayerokAccount)
-    kwargs: dict[str, Any] = {
-        "user_agent": USER_AGENT,
-        "proxy": playerok_proxy_value(proxy),
-        "requests_timeout": 20,
-    }
-    if "=" in cookie:
-        kwargs["cookies"] = cookie
-    else:
-        kwargs["token"] = cookie
-    try:
-        PlayerokAccount.__init__(account, **kwargs)
-    except FileNotFoundError:
-        # PlayerokAPI 1.1 –Ω–µ –æ–±—ä—è–≤–ª—è–µ—Ç cacert.pem –≤ package_data. –ö —ç—Ç–æ–º—É –º–æ–º–µ–Ω—Ç—É
-        # __init__ —É–∂–µ –∑–∞–ø–æ–ª–Ω–∏–ª –¥–∞–Ω–Ω—ã–µ –∞–∫–∫–∞—É–Ω—Ç–∞, –ø–æ—ç—Ç–æ–º—É –±–µ–∑–æ–ø–∞—Å–Ω–æ –∑–∞–≤–µ—Ä—à–∞–µ–º –Ω–∞—Å—Ç—Ä–æ–π–∫—É –∫–ª–∏–µ–Ω—Ç–æ–≤.
-        account._cert_path = certifi.where()
-        account._tmp_cert_path = certifi.where()
-        account._Account__tls_requests = None
-        account._Account__curl_session = None
-        account._Account__request_lock = threading.RLock()
-        account._refresh_clients()
-    return account
-
-
-PLAYEROK_CHECK_EMAIL_QUERY = """mutation checkEmailAuthCode($input: CheckEmailAuthCodeInput!) {
-  checkEmailAuthCode(input: $input) {
-    id
-    username
-    email
-    role
-    __typename
-  }
-}"""
-
-
-def _playerok_auth_headers(operation: str, cookie: str = "") -> dict[str, str]:
-    headers = {
-        "accept": "*/*",
-        "content-type": "application/json",
-        "origin": "https://playerok.com",
-        "referer": "https://playerok.com/",
-        "user-agent": USER_AGENT,
-        "x-apollo-operation-name": operation,
-        "x-gql-op": operation,
-        "x-gql-path": "/",
-    }
-    if cookie:
-        headers["cookie"] = cookie
-    return headers
-
-
-def _playerok_response_json(response: Any) -> dict[str, Any]:
-    try:
-        payload = response.json()
-    except Exception as exc:
-        raise RuntimeError(
-            f"Playerok –≤–µ—Ä–Ω—É–ª –Ω–µ JSON (HTTP {getattr(response, 'status_code', '‚Äî')})"
-        ) from exc
-    if getattr(response, "status_code", 0) != 200:
-        raise RuntimeError(f"Playerok –≤–µ—Ä–Ω—É–ª HTTP {response.status_code}")
-    errors = payload.get("errors") or []
-    if errors:
-        message = errors[0].get("message", "–ù–µ–∏–∑–≤–µ—Å—Ç–Ω–∞—è –æ—à–∏–±–∫–∞ Playerok")
-        raise RuntimeError(str(message))
-    return payload
-
-
-def _playerok_session_cookies(session: Any, response: Any | None = None) -> str:
-    cookies: dict[str, str] = {}
-    responses = [response, *list(getattr(response, "history", None) or [])]
-    sources = [getattr(session, "cookies", None)]
-    sources.extend(getattr(item, "cookies", None) for item in responses if item)
-    for source in sources:
-        if source is None:
-            continue
-        try:
-            cookies.update({str(key): str(value) for key, value in source.get_dict().items()})
-        except AttributeError:
-            try:
-                cookies.update({str(key): str(value) for key, value in source.items()})
-            except (AttributeError, TypeError, ValueError):
-                continue
-    for item in responses:
-        headers = getattr(item, "headers", None)
-        if headers is None:
-            continue
-        raw_values: list[str] = []
-        get_list = getattr(headers, "get_list", None)
-        if callable(get_list):
-            try:
-                raw_values.extend(str(value) for value in get_list("set-cookie"))
-            except (KeyError, TypeError, ValueError):
-                pass
-        if not raw_values:
-            try:
-                raw = headers.get("set-cookie", "")
-            except (AttributeError, KeyError, TypeError):
-                raw = ""
-            if raw:
-                raw_values.append(str(raw))
-        for raw in raw_values:
-            parsed = SimpleCookie()
-            try:
-                parsed.load(raw)
-            except (CookieError, TypeError, ValueError):
-                continue
-            cookies.update(
-                {
-                    str(key): str(morsel.value)
-                    for key, morsel in parsed.items()
-                    if morsel.value
-                }
-            )
-        for header_name in (
-            "x-auth-token",
-            "x-access-token",
-            "authorization",
-        ):
-            try:
-                raw_token = str(headers.get(header_name, "") or "").strip()
-            except (AttributeError, KeyError, TypeError):
-                raw_token = ""
-            if raw_token:
-                cookies.setdefault("token", raw_token.removeprefix("Bearer ").strip())
-    return "; ".join(f"{key}={value}" for key, value in cookies.items())
-
-
-def request_playerok_email_code(email: str, proxy: str) -> str:
-    """–û—Ç–ø—Ä–∞–≤–ª—è–µ—Ç –æ–¥–Ω–æ—Ä–∞–∑–æ–≤—ã–π –∫–æ–¥ –∏ –≤–æ–∑–≤—Ä–∞—â–∞–µ—Ç cookie –Ω–µ–∑–∞–≤–µ—Ä—à—ë–Ω–Ω–æ–π auth-—Å–µ—Å—Å–∏–∏."""
-    try:
-        from curl_cffi import requests as curl_requests
-    except ImportError as exc:
-        raise RuntimeError("curl_cffi –Ω–µ —É—Å—Ç–∞–Ω–æ–≤–ª–µ–Ω –≤ —Ç–µ–∫—É—â–µ–π —Å–±–æ—Ä–∫–µ") from exc
-    session = curl_requests.Session(
-        impersonate="chrome",
-        proxy=proxy,
-        timeout=25,
-    )
-    payload = {
-        "operationName": "getEmailAuthCode",
-        "query": (
-            "mutation getEmailAuthCode($email: String!) {\n"
-            "  getEmailAuthCode(input: {email: $email})\n}"
-        ),
-        "variables": {"email": email},
-    }
-    response = session.post(
-        "https://playerok.com/graphql",
-        json=payload,
-        headers=_playerok_auth_headers("getEmailAuthCode"),
-    )
-    data = _playerok_response_json(response)
-    if not data.get("data", {}).get("getEmailAuthCode"):
-        raise RuntimeError("Playerok –Ω–µ –ø–æ–¥—Ç–≤–µ—Ä–¥–∏–ª –æ—Ç–ø—Ä–∞–≤–∫—É –∫–æ–¥–∞")
-    return _playerok_session_cookies(session, response)
-
-
-def verify_playerok_email_code(
-    email: str, code: str, proxy: str, session_cookie: str
-) -> tuple[str, dict[str, Any]]:
-    """–ü–æ–¥—Ç–≤–µ—Ä–∂–¥–∞–µ—Ç –∫–æ–¥ –∏ –≤–æ–∑–≤—Ä–∞—â–∞–µ—Ç –ø–æ–ª–Ω—ã–π cookie-–∑–∞–≥–æ–ª–æ–≤–æ–∫ –∏ –ø—Ä–æ—Ñ–∏–ª—å viewer."""
-    try:
-        from curl_cffi import requests as curl_requests
-    except ImportError as exc:
-        raise RuntimeError("curl_cffi –Ω–µ —É—Å—Ç–∞–Ω–æ–≤–ª–µ–Ω –≤ —Ç–µ–∫—É—â–µ–π —Å–±–æ—Ä–∫–µ") from exc
-    session = curl_requests.Session(
-        impersonate="chrome",
-        proxy=proxy,
-        timeout=25,
-    )
-    payload = {
-        "operationName": "checkEmailAuthCode",
-        "query": PLAYEROK_CHECK_EMAIL_QUERY,
-        "variables": {"input": {"email": email, "code": code}},
-    }
-    response = session.post(
-        "https://playerok.com/graphql",
-        json=payload,
-        headers=_playerok_auth_headers("checkEmailAuthCode", session_cookie),
-    )
-    data = _playerok_response_json(response)
-    viewer = data.get("data", {}).get("checkEmailAuthCode")
-    if not viewer:
-        raise RuntimeError("Playerok –Ω–µ –ø–æ–¥—Ç–≤–µ—Ä–¥–∏–ª –∫–æ–¥")
-    cookie = _playerok_session_cookies(session, response)
-    merged: dict[str, str] = {}
-    for raw in (session_cookie, cookie):
-        for part in raw.split(";"):
-            if "=" in part:
-                key, value = part.split("=", 1)
-                merged[key.strip()] = value.strip()
-    # Playerok –ø–æ—Å—Ç–µ–ø–µ–Ω–Ω–æ –ø–µ—Ä–µ–≤–æ–¥–∏—Ç —Å–µ—Å—Å–∏–∏ —Å cookie `token` –Ω–∞ `auid`.
-    # –ù–µ —Ç—Ä–µ–±—É–µ–º –∫–æ–Ω–∫—Ä–µ—Ç–Ω–æ–µ –∏–º—è: —Å—Ä–∞–∑—É –ø–æ—Å–ª–µ —ç—Ç–æ–π —Ñ—É–Ω–∫—Ü–∏–∏ –æ–±—Ä–∞–±–æ—Ç—á–∏–∫
-    # —Å–æ–∑–¥–∞—ë—Ç Account –∏ –≤—ã–∑—ã–≤–∞–µ—Ç get(), —Ç–æ –µ—Å—Ç—å –ø—Ä–æ–≤–µ—Ä—è–µ—Ç —Å–µ—Å—Å–∏—é —É —Å–∞–º–æ–≥–æ Playerok.
-    if not merged:
-        raise RuntimeError(
-            "Playerok –ø–æ–¥—Ç–≤–µ—Ä–¥–∏–ª –∫–æ–¥, –Ω–æ –Ω–µ –≤–µ—Ä–Ω—É–ª cookie —Å–µ—Å–∏–∏"
-        )
-    return "; ".join(f"{key}={value}" for key, value in merged.items()), viewer
-
-
-def clipped(value: Any, size: int = 700) -> str:
-    text = str(value or "")
-    return text if len(text) <= size else text[: size - 1] + "‚Ä¶"
-
-
-def render_template(
-    text: str,
-    *,
-    message: Any | None = None,
-    order: Any | None = None,
-    review: Any | None = None,
-    account: Account | None = None,
-    chat_id: int | str | None = None,
-    chat_name: str | None = None,
-) -> str:
-    """–ü–æ–¥—Å—Ç–∞–≤–ª—è–µ—Ç –±–µ–∑–æ–ø–∞—Å–Ω—ã–µ —Ç–µ–∫—Å—Ç–æ–≤—ã–µ –ø–µ—Ä–µ–º–µ–Ω–Ω—ã–µ –≤ –∏—Å—Ö–æ–¥—è—â–∏–µ —Å–æ–æ–±—â–µ–Ω–∏—è FunPay."""
-    now = datetime.now(timezone.utc).astimezone()
-    username = chat_name or ""
-    message_text = ""
-    if message is not None:
-        username = message.author or message.chat_name or username
-        chat_name = message.chat_name or chat_name
-        chat_id = message.chat_id if chat_id is None else chat_id
-        message_text = str(message)
-    if order is not None:
-        username = order.buyer_username or username
-        chat_id = order.chat_id if chat_id is None else chat_id
-    if review is None and order is not None:
-        review = getattr(order, "review", None)
-    order_title = ""
-    if order is not None:
-        order_title = getattr(order, "title", None) or getattr(order, "description", None) or ""
-    variables = {
-        "$full_date": now.strftime("%d.%m.%Y"),
-        "$date": now.strftime("%d.%m.%Y"),
-        "$full_time": now.strftime("%H:%M:%S"),
-        "$time": now.strftime("%H:%M"),
-        "$username": str(username or ""),
-        "$chat_name": str(chat_name or username or ""),
-        "$chat_id": str(chat_id or ""),
-        "$message_text": message_text,
-        "$account_name": str(account.username if account else ""),
-        "$account_id": str(account.id if account else ""),
-        "$order_id": str(order.id if order else ""),
-        "$order_link": f"https://funpay.com/orders/{order.id}/" if order else "",
-        "$order_title": str(order_title),
-        "$stars": str(getattr(review, "stars", "") or ""),
-        "$rating": str(getattr(review, "stars", "") or ""),
-        "$review_text": str(getattr(review, "text", "") or ""),
-        "$review_reply": str(getattr(review, "reply", "") or ""),
-    }
-    for variable in sorted(variables, key=len, reverse=True):
-        text = text.replace(variable, variables[variable])
-    return text
-
-
-def render_playerok_template(
-    text: str, account: Any, *, chat: Any | None = None, message: Any | None = None,
-    deal: Any | None = None,
-) -> str:
-    """–ü–æ–¥—Å—Ç–∞–≤–ª—è–µ—Ç –æ–±—â–∏–µ –ø–µ—Ä–µ–º–µ–Ω–Ω—ã–µ –±–µ–∑ –ø—Ä–∏–≤—è–∑–∫–∏ –∫ –æ–±—ä–µ–∫—Ç–∞–º FunPay."""
-    buyer = getattr(message, "user", None) or getattr(deal, "user", None)
-    item = getattr(deal, "item", None)
-    text = text.replace("$message_text", str(getattr(message, "text", "") or ""))
-    text = text.replace("$order_link", "")
-    return render_template(
-        text,
-        account=account,
-        chat_id=getattr(chat, "id", None),
-        chat_name=getattr(buyer, "username", None) or getattr(chat, "id", None),
-        order=SimpleNamespace(
-            id=str(getattr(deal, "id", "")),
-            buyer_username=getattr(buyer, "username", None),
-            chat_id=getattr(chat, "id", None),
-            title=getattr(item, "name", None),
-        ) if deal else None,
-    )
-
-
-def format_money(value: float) -> str:
-    return f"{value:,.2f}".replace(",", " ").rstrip("0").rstrip(".")
-
-
-def playerok_paid_priorities(values: list[Any]) -> list[Any]:
-    """–û—Å—Ç–∞–≤–ª—è–µ—Ç –ø–ª–∞—Ç–Ω—ã–µ —Ç–∞—Ä–∏—Ñ—ã Playerok –∏ —Å–æ—Ä—Ç–∏—Ä—É–µ—Ç –∏—Ö –ø–æ —Ü–µ–Ω–µ."""
-    result = []
-    for value in values:
-        try:
-            price = int(getattr(value, "price", 0) or 0)
-        except (TypeError, ValueError):
-            continue
-        if price > 0 and getattr(value, "id", None):
-            result.append(value)
-    return sorted(result, key=lambda item: int(item.price))
-
-
-def playerok_priority_label(value: Any) -> str:
-    name = str(getattr(value, "name", None) or "–ü—Ä–æ–¥–≤–∏–∂–µ–Ω–∏–µ")
-    period = int(getattr(value, "period", 0) or 0)
-    price = int(getattr(value, "price", 0) or 0)
-    duration = f" ¬∑ {period} –¥–Ω." if period else ""
-    return f"{name}{duration} ¬∑ {format_money(price)} ‚ÇΩ"
-
-
-def within_work_hours(start: int, end: int, hour: int) -> bool:
-    if start == 0 and end == 24:
-        return True
-    if start < end:
-        return start <= hour < end
-    return hour >= start or hour < end
-
-
-def extract_order_id(value: Any) -> str | None:
-    match = re.search(r"#([A-Za-z0-9_-]{4,40})", str(value or ""))
-    return match.group(1) if match else None
-
-
-def normalize_review_reply(value: str) -> str:
-    lines = value.strip().splitlines()[:10]
-    return "\n".join(lines)[:999].strip()
-
-
-@dataclass
-class SalesStats:
-    days: int | None
-    total: int = 0
-    closed: int = 0
-    paid: int = 0
-    refunded: int = 0
-    buyers: set[int] = field(default_factory=set)
-    revenue: dict[str, float] = field(default_factory=lambda: defaultdict(float))
-    refunded_sum: dict[str, float] = field(default_factory=lambda: defaultdict(float))
-    lot_counts: Counter[str] = field(default_factory=Counter)
-    truncated: bool = False
-
-
-def load_sales_stats(account: Account, days: int | None, max_pages: int = 200) -> SalesStats:
-    """–°–æ–±–∏—Ä–∞–µ—Ç —Å—Ç–∞—Ç–∏—Å—Ç–∏–∫—É –ø—Ä–æ–¥–∞–∂, –ø—Ä–æ—Ö–æ–¥—è —Å—Ç—Ä–∞–Ω–∏—Ü—ã –∑–∞–∫–∞–∑–æ–≤ –¥–æ –Ω–∞—á–∞–ª–∞ –ø–µ—Ä–∏–æ–¥–∞."""
-    moscow_now = datetime.now(timezone(timedelta(hours=3))).replace(tzinfo=None)
-    since = moscow_now - timedelta(days=days) if days else None
-    stats = SalesStats(days)
-    cursor = None
-    locale = None
-    subcategories = None
-    for _ in range(max_pages):
-        cursor, orders, locale, subcategories = account.get_sales(
-            start_from=cursor,
-            locale=locale,
-            subcategories=subcategories,
-        )
-        reached_period_start = False
-        for order in orders:
-            if since and order.date < since:
-                reached_period_start = True
-                continue
-            stats.total += 1
-            stats.buyers.add(order.buyer_id)
-            currency = str(order.currency)
-            if order.status is types.OrderStatuses.CLOSED:
-                stats.closed += 1
-                stats.revenue[currency] += order.price
-                stats.lot_counts[clipped(order.description, 120)] += 1
-            elif order.status is types.OrderStatuses.PAID:
-                stats.paid += 1
-            elif order.status in {
-                types.OrderStatuses.REFUNDED,
-                types.OrderStatuses.PARTIALLY_REFUNDED,
-            }:
-                stats.refunded += 1
-                stats.refunded_sum[currency] += order.price
-        if reached_period_start or not cursor:
-            break
-    else:
-        stats.truncated = bool(cursor)
-    return stats
-
-
-def format_sales_stats(stats: SalesStats) -> str:
-    period = "–∑–∞ –≤—Å—ë –≤—Ä–µ–º—è" if stats.days is None else f"–∑–∞ {stats.days} –¥–Ω."
-    revenue = ", ".join(
-        f"{format_money(value)} {html.escape(currency)}"
-        for currency, value in sorted(stats.revenue.items())
-    ) or "0"
-    refunds = ", ".join(
-        f"{format_money(value)} {html.escape(currency)}"
-        for currency, value in sorted(stats.refunded_sum.items())
-    ) or "0"
-    top = "\n".join(
-        f"{index}. {html.escape(title)} ‚Äî <b>{count}</b>"
-        for index, (title, count) in enumerate(stats.lot_counts.most_common(3), 1)
-    ) or "–Ω–µ—Ç –∑–∞–∫—Ä—ã—Ç—ã—Ö –∑–∞–∫–∞–∑–æ–≤"
-    note = "\n\n‚ö†Ô∏è –î–æ—Å—Ç–∏–≥–Ω—É—Ç –ª–∏–º–∏—Ç 200 —Å—Ç—Ä–∞–Ω–∏—Ü –∑–∞–∫–∞–∑–æ–≤." if stats.truncated else ""
-    return (
-        f"üìä <b>–°—Ç–∞—Ç–∏—Å—Ç–∏–∫–∞ {period}</b>\n\n"
-        f"–í—Å–µ–≥–æ –∑–∞–∫–∞–∑–æ–≤: <b>{stats.total}</b>\n"
-        f"–ó–∞–∫—Ä—ã—Ç–æ: <b>{stats.closed}</b>\n"
-        f"–û–∂–∏–¥–∞—é—Ç –≤—ã–ø–æ–ª–Ω–µ–Ω–∏—è: <b>{stats.paid}</b>\n"
-        f"–í–æ–∑–≤—Ä–∞—Ç–æ–≤: <b>{stats.refunded}</b> –Ω–∞ {refunds}\n"
-        f"–£–Ω–∏–∫–∞–ª—å–Ω—ã—Ö –ø–æ–∫—É–ø–∞—Ç–µ–ª–µ–π: <b>{len(stats.buyers)}</b>\n"
-        f"–í—ã—Ä—É—á–∫–∞ –ø–æ –∑–∞–∫—Ä—ã—Ç—ã–º: <b>{revenue}</b>\n\n"
-        f"üèÜ <b>–ü–æ–ø—É–ª—è—Ä–Ω—ã–µ –ª–æ—Ç—ã</b>\n{top}{note}"
-    )
-
-
-@dataclass
-class LotBulkResult:
-    common_total: int = 0
-    currency_total: int = 0
-    changed: int = 0
-    errors: list[str] = field(default_factory=list)
-
-
-def load_lot_inventory(account: Account) -> tuple[Any, list[Any], list[Any]]:
-    profile = account.get_user(account.id)
-    lots = profile.get_lots()
-    common = [
-        lot
-        for lot in lots
-        if lot.subcategory.type is types.SubCategoryTypes.COMMON
-    ]
-    currency = [
-        lot
-        for lot in lots
-        if lot.subcategory.type is types.SubCategoryTypes.CURRENCY
-    ]
-    return profile, common, currency
-
-
-def apply_bulk_lot_action(account: Account, action: str) -> LotBulkResult:
-    """–ú–∞—Å—Å–æ–≤–æ –º–µ–Ω—è–µ—Ç –æ–±—ã—á–Ω—ã–µ –∏ –≤–∞–ª—é—Ç–Ω—ã–µ –ø—Ä–µ–¥–ª–æ–∂–µ–Ω–∏—è –æ–¥–Ω–æ–≥–æ –∞–∫–∫–∞—É–Ω—Ç–∞."""
-    if action not in {"activate", "deactivate", "delete"}:
-        raise ValueError("–ù–µ–∏–∑–≤–µ—Å—Ç–Ω–æ–µ –¥–µ–π—Å—Ç–≤–∏–µ —Å –ª–æ—Ç–∞–º–∏")
-    _, common, currency = load_lot_inventory(account)
-    result = LotBulkResult(len(common), len(currency))
-    for lot in common:
-        try:
-            if action == "delete":
-                account.delete_lot(int(lot.id))
-            else:
-                fields = account.get_lot_fields(int(lot.id))
-                fields.active = action == "activate"
-                account.save_lot(fields.renew_fields())
-            result.changed += 1
-        except Exception as exc:  # noqa: BLE001 - API –æ–ø–µ—Ä–∞—Ü–∏–π —Å –ª–æ—Ç–∞–º–∏ –≤—ã–±—Ä–∞—Å—ã–≤–∞–µ—Ç —Ä–∞–∑–Ω—ã–µ –∏—Å–∫–ª—é—á–µ–Ω–∏—è.
-            result.errors.append(f"{lot.id}: {clipped(exc, 120)}")
-
-    subcategories = {lot.subcategory.id: lot.subcategory for lot in currency}.values()
-    for subcategory in subcategories:
-        try:
-            fields = account.get_chip_fields(subcategory.id)
-            for offer in fields.chip_offers.values():
-                offer.active = action == "activate" if action != "delete" else False
-            account.save_chip(fields.renew_fields())
-            result.changed += len(fields.chip_offers)
-        except Exception as exc:  # noqa: BLE001 - API –≤–∞–ª—é—Ç–Ω—ã—Ö –ª–æ—Ç–æ–≤ –≤—ã–±—Ä–∞—Å—ã–≤–∞–µ—Ç —Ä–∞–∑–Ω—ã–µ –∏—Å–∫–ª—é—á–µ–Ω–∏—è.
-            result.errors.append(f"–≤–∞–ª—é—Ç–∞ {subcategory.id}: {clipped(exc, 120)}")
-    return result
-
-
-def order_status_label(status: types.OrderStatuses) -> str:
-    return {
-        types.OrderStatuses.PAID: "–æ–ø–ª–∞—á–µ–Ω, –æ–∂–∏–¥–∞–µ—Ç –≤—ã–ø–æ–ª–Ω–µ–Ω–∏—è",
-        types.OrderStatuses.CLOSED: "–∑–∞–∫—Ä—ã—Ç",
-        types.OrderStatuses.REFUNDED: "–≤–æ–∑–≤—Ä–∞—Ç",
-        types.OrderStatuses.PARTIALLY_REFUNDED: "—á–∞—Å—Ç–∏—á–Ω—ã–π –≤–æ–∑–≤—Ä–∞—Ç",
-        types.OrderStatuses.UNPAID: "–Ω–µ –æ–ø–ª–∞—á–µ–Ω",
-    }.get(status, status.name.lower())
-
-
-def format_order(order: types.Order) -> str:
-    """–§–æ—Ä–º–∏—Ä—É–µ—Ç –∫–∞—Ä—Ç–æ—á–∫—É –∑–∞–∫–∞–∑–∞ –±–µ–∑ –≤—ã–¥–∞—á–∏ —Å–æ—Ö—Ä–∞–Ω—ë–Ω–Ω—ã—Ö —Å–µ–∫—Ä–µ—Ç–æ–≤ —Ç–æ–≤–∞—Ä–∞."""
-    title = order.title or (order.subcategory.name if order.subcategory else "‚Äî")
-    details = [
-        "üì¶ <b>–ó–∞–∫–∞–∑ FunPay</b>",
-        f"ID: <code>{html.escape(str(order.id))}</code>",
-        f"–°—Ç–∞—Ç—É—Å: <b>{html.escape(order_status_label(order.status))}</b>",
-        f"–¢–æ–≤–∞—Ä: {html.escape(clipped(title, 1000))}",
-        f"–ö–æ–ª–∏—á–µ—Å—Ç–≤–æ: <b>{order.amount}</b>",
-        f"–°—É–º–º–∞: <b>{format_money(order.sum)} {html.escape(str(order.currency))}</b>",
-        f"–ü–æ–∫—É–ø–∞—Ç–µ–ª—å: {html.escape(order.buyer_username or '‚Äî')} (<code>{order.buyer_id}</code>)",
-        f"–ü—Ä–æ–¥–∞–≤–µ—Ü: {html.escape(order.seller_username or '‚Äî')} (<code>{order.seller_id}</code>)",
-    ]
-    if order.server:
-        details.append(f"–°–µ—Ä–≤–µ—Ä: {html.escape(order.server.name or '‚Äî')}")
-    if order.side:
-        details.append(f"–°—Ç–æ—Ä–æ–Ω–∞: {html.escape(order.side.name or '‚Äî')}")
-    if order.player:
-        details.append(f"–ü–µ—Ä—Å–æ–Ω–∞–∂: {html.escape(order.player)}")
-    details.append(f"–ß–∞—Ç: <code>{html.escape(str(order.chat_id))}</code>")
-    return "\n".join(details)
-
-
-def format_chat_history(chat: Any, account_id: int) -> list[str]:
-    """–§–æ—Ä–º–∏—Ä—É–µ—Ç –≤—Å—é –¥–æ—Å—Ç—É–ø–Ω—É—é –∏—Å—Ç–æ—Ä–∏—é —á–∞—Ç–∞ –≤ –≤–∞–ª–∏–¥–Ω—ã–µ Telegram HTML-–±–ª–æ–∫–∏."""
-    title = f"üí¨ <b>–ß–∞—Ç —Å {html.escape(chat.name or '‚Äî')}</b> ¬∑ <code>{chat.id}</code>"
-    blocks: list[str] = []
-    if chat.looking_link:
-        blocks.append(
-            f"üëÄ <b>–ü–æ–∫—É–ø–∞—Ç–µ–ª—å —Å–º–æ—Ç—Ä–∏—Ç:</b> "
-            f"<a href=\"{html.escape(chat.looking_link, quote=True)}\">"
-            f"{html.escape(chat.looking_text or '–ª–æ—Ç')}</a>"
-        )
-    for item in chat.messages:
-        incoming = False
-        if item.author_id == 0:
-            icon, author = "‚öôÔ∏è", "FunPay"
-        elif item.author_id == account_id or item.by_bot or item.by_vertex:
-            icon, author = "üü¢", item.author or "–í—ã"
-        else:
-            icon, author = "üîµ", item.author or chat.name or "–ü–æ–∫—É–ø–∞—Ç–µ–ª—å"
-            incoming = True
-        body = item.text or (f'<a href="{html.escape(item.image_link, quote=True)}">–ò–∑–æ–±—Ä–∞–∂–µ–Ω–∏–µ</a>' if item.image_link else "[–±–µ–∑ —Ç–µ–∫—Å—Ç–∞]")
-        if item.text:
-            body = html.escape(clipped(body, 2600))
-        message_block = (
-            f"<pre>{body}</pre>"
-            if incoming and item.text
-            else f"<blockquote>{body}</blockquote>"
-        )
-        blocks.append(f"{icon} <b>{html.escape(author)}</b>\n{message_block}")
-    if not blocks:
-        blocks.append("–°–æ–æ–±—â–µ–Ω–∏–π –ø–æ–∫–∞ –Ω–µ—Ç.")
-
-    chunks: list[str] = []
-    current = title
-    for block in blocks:
-        candidate = f"{current}\n\n{block}"
-        if len(candidate) > 3800 and current != title:
-            chunks.append(current)
-            current = block
-        else:
-            current = candidate
-    chunks.append(current)
-    return chunks
-
-
-def load_full_chat(account: Account, chat_id: int, max_messages: int = 2000) -> tuple[types.Chat, bool]:
-    """–ó–∞–≥—Ä—É–∂–∞–µ—Ç –¥–æ—Å—Ç—É–ø–Ω—É—é –∏—Å—Ç–æ—Ä–∏—é –Ω–∞–∑–∞–¥ –ø–æ —Å—Ç—Ä–∞–Ω–∏—Ü–∞–º FunPay."""
-    chat = account.get_chat(chat_id, True)
-    messages = list(chat.messages)
-    seen_ids = {item.id for item in messages if item.id is not None}
-    truncated = False
-    while seen_ids and len(messages) < max_messages:
-        cursor = min(seen_ids)
-        older = account.get_chat_history(chat_id, cursor, chat.name)
-        new_items = [item for item in older if item.id is not None and item.id not in seen_ids]
-        if not new_items:
-            break
-        messages.extend(new_items)
-        seen_ids.update(item.id for item in new_items)
-        if min(item.id for item in new_items) >= cursor:
-            break
-    if len(messages) >= max_messages:
-        messages = sorted(messages, key=lambda item: item.id or 0)[-max_messages:]
-        truncated = True
-    else:
-        messages.sort(key=lambda item: item.id or 0)
-    chat.messages = messages
-    return chat, truncated
-
-
-def load_detailed_balance(account: Account) -> types.Balance:
-    """–ü–æ–ª—É—á–∞–µ—Ç –æ–±—â–∏–π –∏ –¥–æ—Å—Ç—É–ø–Ω—ã–π –∫ –≤—ã–≤–æ–¥—É –±–∞–ª–∞–Ω—Å –≤–æ –≤—Å–µ—Ö –≤–∞–ª—é—Ç–∞—Ö."""
-    profile = account.get_user(account.id)
-    lots = profile.get_common_lots()
-    if lots:
-        try:
-            return account.get_balance(lots[0].id)
-        except Exception:
-            logger.debug("–ù–µ —É–¥–∞–ª–æ—Å—å –ø–æ–ª—É—á–∏—Ç—å –±–∞–ª–∞–Ω—Å —á–µ—Ä–µ–∑ —Å–æ–±—Å—Ç–≤–µ–Ω–Ω—ã–π –ª–æ—Ç", exc_info=True)
-    subcategories = account.get_sorted_subcategories()[types.SubCategoryTypes.COMMON]
-    for subcategory_id in subcategories:
-        try:
-            public_lots = account.get_subcategory_public_lots(types.SubCategoryTypes.COMMON, subcategory_id)
-            if public_lots:
-                return account.get_balance(public_lots[0].id)
-        except Exception:
-            logger.debug(
-                "–ù–µ —É–¥–∞–ª–æ—Å—å –ø–æ–ª—É—á–∏—Ç—å –±–∞–ª–∞–Ω—Å —á–µ—Ä–µ–∑ –ø–æ–¥–∫–∞—Ç–µ–≥–æ—Ä–∏—é %s",
-                subcategory_id,
-                exc_info=True,
-            )
-            continue
-    raise RuntimeError("–ù–µ –Ω–∞–π–¥–µ–Ω –ª–æ—Ç, —á–µ—Ä–µ–∑ –∫–æ—Ç–æ—Ä—ã–π FunPay –æ—Ç–¥–∞—ë—Ç –ø–æ–¥—Ä–æ–±–Ω—ã–π –±–∞–ª–∞–Ω—Å")
-
-
-@dataclass
-class AccountRuntime:
-    telegram_id: int
-    account: Account
-    runner: Runner
-    account_key: int = 0
-    account_label: str = ""
-    keep_online_enabled: bool = True
-    auto_raise_enabled: bool = False
-    stop_event: threading.Event = field(default_factory=threading.Event)
-    tasks: list[asyncio.Task[Any]] = field(default_factory=list)
-    background_tasks: set[asyncio.Task[Any]] = field(default_factory=set)
-    raise_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    last_raise_at: datetime | None = None
-    next_raise_at: float = 0
-    last_raise_summary: str = "–µ—â—ë –Ω–µ –∑–∞–ø—É—Å–∫–∞–ª–æ—Å—å"
-    raise_schedule: dict[int, float] = field(default_factory=dict)
-
-
-@dataclass
-class PlayerokRuntime:
-    telegram_id: int
-    account: Any
-    account_key: int = 0
-    account_label: str = ""
-    stop_event: asyncio.Event = field(default_factory=asyncio.Event)
-    task: asyncio.Task[Any] | None = None
-    publish_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    message_ids: dict[str, str] = field(default_factory=dict)
-    deal_statuses: dict[str, str] = field(default_factory=dict)
-    review_ids: set[str] = field(default_factory=set)
-    initialized: bool = False
-    next_auto_publish_at: float = 0
-    poll_failures: int = 0
-
-
-class RuntimeManager:
-    def __init__(self, bot: Bot, db: Database, secrets: SecretBox):
-        self.bot = bot
-        self.db = db
-        self.secrets = secrets
-        self.runtimes: dict[int, AccountRuntime] = {}
-        self.playerok_runtimes: dict[int, PlayerokRuntime] = {}
-        self.funpay_account_runtimes: dict[int, AccountRuntime] = {}
-        self.playerok_account_runtimes: dict[int, PlayerokRuntime] = {}
-        self.loop: asyncio.AbstractEventLoop | None = None
-        self.telethon = PluginTelethonService(db, secrets)
-        self.plugins = PluginManager(db, bot, self.telethon)
-        self.playerok_plugins = PlayerokPluginManager(db, bot)
-        self.connection_tasks: dict[tuple[str, int], asyncio.Task[Any]] = {}
-
-    async def _reload_funpay_plugins(
-        self, telegram_id: int, runtime: AccountRuntime
-    ) -> None:
-        """–ü–µ—Ä–µ–∑–∞–ø—É—Å–∫–∞–µ—Ç –ø–ª–∞–≥–∏–Ω—ã, –Ω–µ –ø–æ–∑–≤–æ–ª—è—è –∏—Ö —Ö—É–∫–∞–º –±–ª–æ–∫–∏—Ä–æ–≤–∞—Ç—å –ø–æ–¥–∫–ª—é—á–µ–Ω–∏–µ –∞–∫–∫–∞—É–Ω—Ç–∞."""
-        if telegram_id in self.plugins.runtimes:
-            try:
-                await asyncio.wait_for(
-                    self.plugins.stop_runtime(telegram_id),
-                    timeout=PLUGIN_STOP_TIMEOUT,
-                )
-            except TimeoutError:
-                logger.warning(
-                    "–û—Å—Ç–∞–Ω–æ–≤–∫–∞ FunPay-–ø–ª–∞–≥–∏–Ω–æ–≤ –ø–æ–ª—å–∑–æ–≤–∞—Ç–µ–ª—è %s –ø—Ä–µ–≤—ã—Å–∏–ª–∞ —Ç–∞–π–º-–∞—É—Ç",
-                    telegram_id,
-                )
-                self.plugins.runtimes.pop(telegram_id, None)
-            except Exception:
-                logger.exception(
-                    "–ù–µ —É–¥–∞–ª–æ—Å—å –æ—Å—Ç–∞–Ω–æ–≤–∏—Ç—å FunPay-–ø–ª–∞–≥–∏–Ω—ã –ø–æ–ª—å–∑–æ–≤–∞—Ç–µ–ª—è %s",
-                    telegram_id,
-                )
-                self.plugins.runtimes.pop(telegram_id, None)
-        try:
-            await asyncio.wait_for(
-                self.plugins.load_runtime(telegram_id, runtime),
-                timeout=PLUGIN_LOAD_TIMEOUT,
-            )
-        except TimeoutError:
-            logger.warning(
-                "–ó–∞–ø—É—Å–∫ FunPay-–ø–ª–∞–≥–∏–Ω–æ–≤ –ø–æ–ª—å–∑–æ–≤–∞—Ç–µ–ª—è %s –ø—Ä–µ–≤—ã—Å–∏–ª —Ç–∞–π–º-–∞—É—Ç; "
-                "–æ—Å–Ω–æ–≤–Ω–æ–π runtime –ø—Ä–æ–¥–æ–ª–∂–∏—Ç —Ä–∞–±–æ—Ç—É –±–µ–∑ –Ω–∏—Ö",
-                telegram_id,
-            )
-            self.plugins.runtimes.pop(telegram_id, None)
-        except Exception:
-            logger.exception(
-                "–ù–µ —É–¥–∞–ª–æ—Å—å –∑–∞–ø—É—Å—Ç–∏—Ç—å FunPay-–ø–ª–∞–≥–∏–Ω—ã –ø–æ–ª—å–∑–æ–≤–∞—Ç–µ–ª—è %s; "
-                "–æ—Å–Ω–æ–≤–Ω–æ–π runtime –ø—Ä–æ–¥–æ–ª–∂–∏—Ç —Ä–∞–±–æ—Ç—É –±–µ–∑ –Ω–∏—Ö",
-                telegram_id,
-            )
-            self.plugins.runtimes.pop(telegram_id, None)
-
-    def start_account_in_background(
-        self,
-        telegram_id: int,
-        marketplace: str,
-        row: Any,
-        *,
-        notify: bool = False,
-    ) -> asyncio.Task[Any]:
-        """–ó–∞–ø—É—Å–∫–∞–µ—Ç —Å–æ—Ö—Ä–∞–Ω—ë–Ω–Ω—ã–π –∞–∫–∫–∞—É–Ω—Ç –±–µ–∑ –±–ª–æ–∫–∏—Ä–æ–≤–∫–∏ Telegram polling –∏ /start."""
-        account_key = int(row["id"])
-        key = (marketplace, account_key)
-        current = self.connection_tasks.get(key)
-        if current and not current.done():
-            return current
-
-        async def connect() -> None:
-            settings = None
-            try:
-                settings = await self.db.get_user(telegram_id)
-                if marketplace == "funpay":
-                    runtime = await self.start(
-                        telegram_id,
-                        row=row,
-                        make_active=bool(
-                            settings
-                            and int(settings["active_funpay_account_id"] or 0)
-                            == account_key
-                        ),
-                    )
-                    enabled = bool(settings and settings["notify_system"])
-                    success_text = "üü¢ FunPay Runner –≤–æ—Å—Å—Ç–∞–Ω–æ–≤–ª–µ–Ω –ø–æ—Å–ª–µ –∑–∞–ø—É—Å–∫–∞ –±–æ—Ç–∞."
-                else:
-                    runtime = await self.start_playerok(
-                        telegram_id,
-                        row=row,
-                        make_active=bool(
-                            settings
-                            and int(settings["active_playerok_account_id"] or 0)
-                            == account_key
-                        ),
-                    )
-                    enabled = bool(settings and settings["playerok_notify_system"])
-                    success_text = "üü¢ –°–ª–µ–∂–µ–Ω–∏–µ –∑–∞ –∞–∫–∫–∞—É–Ω—Ç–æ–º –≤–æ—Å—Å—Ç–∞–Ω–æ–≤–ª–µ–Ω–æ –ø–æ—Å–ª–µ –∑–∞–ø—É—Å–∫–∞ –±–æ—Ç–∞."
-                if notify and enabled:
-                    await self.safe_notify(
-                        telegram_id,
-                        success_text,
-                        marketplace=marketplace,
-                        account_runtime=runtime,
-                    )
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                logger.exception(
-                    "–ù–µ —É–¥–∞–ª–æ—Å—å –∑–∞–ø—É—Å—Ç–∏—Ç—å %s-–∞–∫–∫–∞—É–Ω—Ç –ø–æ–ª—å–∑–æ–≤–∞—Ç–µ–ª—è %s",
-                    marketplace,
-                    telegram_id,
-                )
-                enabled = bool(
-                    settings
-                    and settings[
-                        "notify_system"
-                        if marketplace == "funpay"
-                        else "playerok_notify_system"
-                    ]
-                )
-                if notify and enabled:
-                    if marketplace == "funpay":
-                        error_text = funpay_connection_error_message(exc)
-                    else:
-                        error_text = "Playerok –Ω–µ –ø—Ä–∏–Ω—è–ª cookie –∏–ª–∏ –ø—Ä–æ–∫—Å–∏."
-                    try:
-                        await self.safe_notify(
-                            telegram_id,
-                            f"‚ö†Ô∏è {error_text} –û–±–Ω–æ–≤–∏—Ç–µ –¥–∞–Ω–Ω—ã–µ –∞–∫–∫–∞—É–Ω—Ç–∞.",
-                            marketplace=marketplace,
-                            account_name=row["label"],
-                            account_external_id=row["external_id"],
-                        )
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception:
-                        logger.exception(
-                            "–ù–µ —É–¥–∞–ª–æ—Å—å —Å–æ–æ–±—â–∏—Ç—å –æ–± –æ—à–∏–±–∫–µ –ø–æ–¥–∫–ª—é—á–µ–Ω–∏—è %s –ø–æ–ª—å–∑–æ–≤–∞—Ç–µ–ª—é %s",
-                            marketplace,
-                            telegram_id,
-                        )
-
-        task = asyncio.create_task(
-            connect(), name=f"connect-{marketplace}-{account_key}"
-        )
-        self.connection_tasks[key] = task
-
-        def discard(done: asyncio.Task[Any]) -> None:
-            try:
-                error = done.exception()
-            except asyncio.CancelledError:
-                error = None
-            if error is not None:
-                logger.error(
-                    "–ù–µ–æ–±—Ä–∞–±–æ—Ç–∞–Ω–Ω–∞—è –æ—à–∏–±–∫–∞ —Ñ–æ–Ω–æ–≤–æ–≥–æ –ø–æ–¥–∫–ª—é—á–µ–Ω–∏—è %s –∞–∫–∫–∞—É–Ω—Ç–∞ %s",
-                    marketplace,
-                    account_key,
-                    exc_info=(type(error), error, error.__traceback__),
-                )
-            if self.connection_tasks.get(key) is done:
-                self.connection_tasks.pop(key, None)
-
-        task.add_done_callback(discard)
-        return task
-
-    async def start_saved(self) -> None:
-        self.loop = asyncio.get_running_loop()
-
-        async def load_rows(marketplace: str) -> list[Any]:
-            try:
-                if marketplace == "funpay":
-                    return list(await self.db.active_users())
-                return list(await self.db.active_playerok_users())
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception(
-                    "–ù–µ —É–¥–∞–ª–æ—Å—å –ø–æ–ª—É—á–∏—Ç—å —Å–æ—Ö—Ä–∞–Ω—ë–Ω–Ω—ã–µ %s-–∞–∫–∫–∞—É–Ω—Ç—ã; –±–æ—Ç –ø—Ä–æ–¥–æ–ª–∂–∏—Ç –∑–∞–ø—É—Å–∫",
-                    marketplace,
-                )
-                return []
-
-        funpay_rows, playerok_rows = await asyncio.gather(
-            load_rows("funpay"), load_rows("playerok")
-        )
-        for marketplace, rows in (
-            ("funpay", funpay_rows),
-            ("playerok", playerok_rows),
-        ):
-            for row in rows:
-                try:
-                    self.start_account_in_background(
-                        int(row["telegram_id"]), marketplace, row, notify=True
-                    )
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    logger.exception(
-                        "–ù–µ —É–¥–∞–ª–æ—Å—å –∑–∞–ø–ª–∞–Ω–∏—Ä–æ–≤–∞—Ç—å –≤–æ—Å—Å—Ç–∞–Ω–æ–≤–ª–µ–Ω–∏–µ %s-–∞–∫–∫–∞—É–Ω—Ç–∞; "
-                        "–æ—Å—Ç–∞–ª—å–Ω—ã–µ –∞–∫–∫–∞—É–Ω—Ç—ã –ø—Ä–æ–¥–æ–ª–∂–∞—Ç –∑–∞–ø—É—Å–∫",
-                        marketplace,
-                    )
-
-    async def start_playerok(
-        self,
-        telegram_id: int,
-        row: asyncpg.Record | None = None,
-        account: Any | None = None,
-        *,
-        make_active: bool = True,
-    ) -> PlayerokRuntime:
-        row = row or await self.db.get_active_marketplace_account(telegram_id, "playerok")
-        if not row or not row["proxy_enc"] or not row["credential_enc"]:
-            raise RuntimeError("Playerok –Ω–µ –Ω–∞—Å—Ç—Ä–æ–µ–Ω")
-        account_key = int(row["id"])
-        if account_key in self.playerok_account_runtimes:
-            await self.stop_playerok_account(account_key)
-        if account is None:
-            proxy = self.secrets.decrypt(row["proxy_enc"])
-            cookie = self.secrets.decrypt(row["credential_enc"])
-            account = create_playerok_account(cookie, proxy)
-            await asyncio.wait_for(asyncio.to_thread(account.get), timeout=50)
-        runtime = PlayerokRuntime(
-            telegram_id=telegram_id,
-            account=account,
-            account_key=account_key,
-            account_label=str(row["label"]),
-        )
-        self.playerok_account_runtimes[account_key] = runtime
-        if make_active or telegram_id not in self.playerok_runtimes:
-            if telegram_id in self.playerok_plugins.runtimes:
-                await self.playerok_plugins.stop_runtime(telegram_id)
-            self.playerok_runtimes[telegram_id] = runtime
-            await self.playerok_plugins.load_runtime(telegram_id, runtime)
-        runtime.task = asyncio.create_task(self._playerok_poll_loop(runtime))
-        logger.info(
-            "Playerok runtime –∑–∞–ø—É—â–µ–Ω: telegram=%s account=%s playerok=%s",
-            telegram_id,
-            account_key,
-            account.id,
-        )
-        return runtime
-
-    async def publish_playerok_drafts(
-        self,
-        telegram_id: int,
-        runtime_override: PlayerokRuntime | None = None,
-    ) -> tuple[int, int, list[str]]:
-        runtime = runtime_override or self.playerok_runtimes.get(telegram_id)
-        if not runtime or PlayerokItemStatuses is None:
-            raise RuntimeError("Playerok –Ω–µ –ø–æ–¥–∫–ª—é—á—ë–Ω")
-        async with runtime.publish_lock:
-            page = await asyncio.to_thread(
-                runtime.account.get_my_items,
-                statuses=[PlayerokItemStatuses.DRAFT],
-                count=24,
-            )
-            drafts = list(getattr(page, "items", []) or [])
-            published = 0
-            errors: list[str] = []
-            for item in drafts:
-                try:
-                    statuses = await asyncio.to_thread(
-                        runtime.account.get_item_priority_statuses,
-                        item.id,
-                        item.price,
-                    )
-                    free_status = next(
-                        (status for status in statuses if int(status.price or 0) == 0),
-                        None,
-                    )
-                    if not free_status:
-                        raise RuntimeError("–Ω–µ—Ç –±–µ—Å–ø–ª–∞—Ç–Ω–æ–≥–æ —Å—Ç–∞—Ç—É—Å–∞ –ø—É–±–ª–∏–∫–∞—Ü–∏–∏")
-                    await asyncio.to_thread(
-                        runtime.account.publish_item,
-                        item.id,
-                        free_status.id,
-                    )
-                    published += 1
-                except Exception as exc:
-                    logger.exception("Playerok: –Ω–µ –æ–ø—É–±–ª–∏–∫–æ–≤–∞–Ω –ø—Ä–µ–¥–º–µ—Ç %s", item.id)
-                    errors.append(f"{clipped(getattr(item, 'name', item.id), 80)}: {clipped(exc, 120)}")
-            return published, len(drafts), errors
-
-    async def _process_playerok_message(
-        self, runtime: PlayerokRuntime, row: asyncpg.Record, chat: Any, message: Any
-    ) -> None:
-        sender = getattr(message, "user", None)
-        if str(getattr(sender, "id", "")) == str(runtime.account.id):
-            return
-        text = (getattr(message, "text", "") or "").strip()
-        if not text:
-            return
-        command = text.casefold()
-        command_rule = await self.db.find_playerok_command_reply(
-            runtime.telegram_id, command
-        )
-        if command_rule:
-            response = render_playerok_template(
-                command_rule["response"], runtime.account, chat=chat, message=message
-            )
-            try:
-                await asyncio.to_thread(runtime.account.send_message, str(chat.id), response)
-            except Exception:
-                logger.exception("Playerok: –Ω–µ –æ—Ç–ø—Ä–∞–≤–ª–µ–Ω –æ—Ç–≤–µ—Ç –Ω–∞ –∫–æ–º–∞–Ω–¥—É %s", command)
-            else:
-                if command_rule["notify"]:
-                    await self.safe_notify(
-                        runtime.telegram_id,
-                        "‚å®Ô∏è <b>–°—Ä–∞–±–æ—Ç–∞–ª–∞ –∫–æ–º–∞–Ω–¥–∞</b>\n\n"
-                        f"–ö–æ–º–∞–Ω–¥–∞: <code>{html.escape(command)}</code>\n"
-                        f"–ü–æ–∫—É–ø–∞—Ç–µ–ª—å: <b>{html.escape(clipped(getattr(sender, 'username', '‚Äî'), 120))}</b>\n"
-                        f"–ß–∞—Ç: <code>{html.escape(str(chat.id))}</code>",
-                        marketplace="playerok",
-                        account_runtime=runtime,
-                    )
-            return
-        hour = datetime.now().astimezone().hour
-        if not (
-            row["playerok_autoreply_enabled"]
-            and within_work_hours(
-                row["playerok_autoreply_work_start"],
-                row["playerok_autoreply_work_end"],
-                hour,
-            )
-            and await self.db.claim_playerok_autoreply(
-                runtime.telegram_id,
-                str(chat.id),
-                row["playerok_autoreply_cooldown_minutes"],
-            )
-        ):
-            return
-        delay = int(row["playerok_autoreply_delay_seconds"])
-        if delay:
-            await asyncio.sleep(delay)
-        if (
-            self.playerok_account_runtimes.get(runtime.account_key) is not runtime
-            or runtime.stop_event.is_set()
-        ):
-            return
-        response = render_playerok_template(
-            row["playerok_autoreply_text"], runtime.account, chat=chat, message=message
-        )
-        try:
-            await asyncio.to_thread(runtime.account.send_message, str(chat.id), response)
-        except Exception:
-            logger.exception("Playerok: –∞–≤—Ç–æ–æ—Ç–≤–µ—Ç –Ω–µ –æ—Ç–ø—Ä–∞–≤–ª–µ–Ω –≤ —á–∞—Ç %s", chat.id)
-
-    async def _process_playerok_delivery(
-        self, runtime: PlayerokRuntime, row: asyncpg.Record, deal: Any
-    ) -> None:
-        if not row["playerok_auto_delivery_enabled"]:
-            return
-        status = getattr(getattr(deal, "status", None), "name", "")
-        if status not in {"PENDING", "PAID"}:
-            return
-        item = getattr(deal, "item", None)
-        chat = getattr(deal, "chat", None)
-        item_id = str(getattr(item, "id", "") or "")
-        chat_id = str(getattr(chat, "id", chat) or "")
-        if not item_id or not chat_id:
-            logger.warning("Playerok: —É —Å–¥–µ–ª–∫–∏ %s –Ω–µ—Ç —Ç–æ–≤–∞—Ä–∞ –∏–ª–∏ —á–∞—Ç–∞", getattr(deal, "id", "‚Äî"))
-            return
-        claim = await self.db.claim_playerok_delivery(
-            runtime.telegram_id, str(deal.id), item_id
-        )
-        if not claim:
-            return
-        rule, products, remaining, error = claim
-        if error:
-            if row["playerok_notify_delivery"]:
-                await self.safe_notify(
-                    runtime.telegram_id,
-                    "‚ùå <b>–û—à–∏–±–∫–∞ –∞–≤—Ç–æ–≤—ã–¥–∞—á–∏</b>\n\n"
-                    f"–°–¥–µ–ª–∫–∞: <code>{html.escape(str(deal.id))}</code>\n"
-                    f"–û–±—ä—è–≤–ª–µ–Ω–∏–µ: <b>{html.escape(clipped(rule['item_title'], 700))}</b>\n"
-                    f"–ü—Ä–∏—á–∏–Ω–∞: <code>{html.escape(error)}</code>",
-                    marketplace="playerok",
-                    account_runtime=runtime,
-                )
-            return
-        delivery_text = render_playerok_template(
-            rule["response"], runtime.account, chat=chat, deal=deal
-        ).replace("$product", "\n".join(products))
-        try:
-            await asyncio.to_thread(runtime.account.send_message, chat_id, delivery_text)
-        except Exception as exc:  # noqa: BLE001 - PlayerokAPI exposes heterogeneous transport errors.
-            await self.db.restore_playerok_delivery_products(
-                runtime.telegram_id, rule["id"], products
-            )
-            await self.db.finish_playerok_delivery(
-                runtime.telegram_id, str(deal.id), "failed", clipped(exc, 600)
-            )
-            if row["playerok_notify_delivery"]:
-                await self.safe_notify(
-                    runtime.telegram_id,
-                    "‚ùå <b>–ê–≤—Ç–æ–≤—ã–¥–∞—á–∞ –Ω–µ –æ—Ç–ø—Ä–∞–≤–ª–µ–Ω–∞</b>\n\n"
-                    f"–°–¥–µ–ª–∫–∞: <code>{html.escape(str(deal.id))}</code>\n"
-                    f"–ü—Ä–∏—á–∏–Ω–∞: <code>{html.escape(clipped(exc, 600))}</code>",
-                    marketplace="playerok",
-                    account_runtime=runtime,
-                )
-            return
-
-        completion = "–Ω–µ –∑–∞–ø—Ä–∞—à–∏–≤–∞–ª–æ—Å—å"
-        if row["playerok_auto_confirm_enabled"]:
-            if PlayerokItemDealStatuses is None:
-                completion = "–Ω–µ –≤—ã–ø–æ–ª–Ω–µ–Ω–æ: –±–∏–±–ª–∏–æ—Ç–µ–∫–∞ –Ω–µ –∑–∞–≥—Ä—É–∑–∏–ª–∞ —Å—Ç–∞—Ç—É—Å—ã"
-            else:
-                try:
-                    await asyncio.to_thread(
-                        runtime.account.update_deal,
-                        str(deal.id),
-                        PlayerokItemDealStatuses.SENT,
-                    )
-                    completion = "–∑–∞–∫–∞–∑ –æ—Ç–º–µ—á–µ–Ω –≤—ã–ø–æ–ª–Ω–µ–Ω–Ω—ã–º"
-                except Exception as exc:
-                    completion = f"–Ω–µ —É–¥–∞–ª–æ—Å—å –æ—Ç–º–µ—Ç–∏—Ç—å –≤—ã–ø–æ–ª–Ω–µ–Ω–Ω—ã–º: {clipped(exc, 240)}"
-                    logger.exception("Playerok: –Ω–µ –æ–±–Ω–æ–≤–ª—ë–Ω —Å—Ç–∞—Ç—É—Å —Å–¥–µ–ª–∫–∏ %s", deal.id)
-        await self.db.finish_playerok_delivery(
-            runtime.telegram_id, str(deal.id), "sent", delivery_text
-        )
-        if row["playerok_notify_delivery"]:
-            await self.safe_notify(
-                runtime.telegram_id,
-                "‚úÖ <b>–ê–≤—Ç–æ–≤—ã–¥–∞—á–∞ –≤—ã–ø–æ–ª–Ω–µ–Ω–∞</b>\n\n"
-                f"–°–¥–µ–ª–∫–∞: <code>{html.escape(str(deal.id))}</code>\n"
-                f"–û–±—ä—è–≤–ª–µ–Ω–∏–µ: <b>{html.escape(clipped(rule['item_title'], 700))}</b>\n"
-                f"–û—Å—Ç–∞—Ç–æ–∫: <b>{remaining}</b>\n"
-                f"–°—Ç–∞—Ç—É—Å: <b>{html.escape(completion)}</b>\n\n"
-                f"<pre>{html.escape(clipped(delivery_text, 1200))}</pre>",
-                marketplace="playerok",
-                account_runtime=runtime,
-            )
-
-    async def _playerok_snapshot(self, runtime: PlayerokRuntime) -> tuple[Any, Any, Any]:
-        deals_call = {
-            "count": 24,
-            "direction": PlayerokItemDealDirections.OUT,
-        }
-        return await asyncio.gather(
-            asyncio.to_thread(runtime.account.get_chats, count=24),
-            asyncio.to_thread(runtime.account.get_deals, **deals_call),
-            asyncio.to_thread(runtime.account.get_my_reviews, count=24),
-        )
-
-    async def _handle_playerok_snapshot(
-        self, runtime: PlayerokRuntime, row: asyncpg.Record, snapshot: tuple[Any, Any, Any]
-    ) -> None:
-        chats_page, deals_page, reviews_page = snapshot
-        chats = list(getattr(chats_page, "chats", []) or [])
-        deals = list(getattr(deals_page, "deals", []) or [])
-        reviews = list(getattr(reviews_page, "reviews", []) or [])
-        message_ids = {
-            str(chat.id): str(chat.last_message.id)
-            for chat in chats
-            if getattr(chat, "last_message", None)
-        }
-        deal_statuses = {
-            str(deal.id): getattr(getattr(deal, "status", None), "name", "UNKNOWN")
-            for deal in deals
-        }
-        review_ids = {str(review.id) for review in reviews}
-        if not runtime.initialized:
-            runtime.message_ids = message_ids
-            runtime.deal_statuses = deal_statuses
-            runtime.review_ids = review_ids
-            runtime.initialized = True
-            return
-
-        for chat in chats:
-            message = getattr(chat, "last_message", None)
-            if message and runtime.message_ids.get(str(chat.id)) != str(message.id):
-                await self._process_playerok_message(runtime, row, chat, message)
-                if self.get_playerok(runtime.telegram_id) is runtime:
-                    await self.playerok_plugins.dispatch(
-                        runtime.telegram_id, "BIND_TO_NEW_MESSAGE", chat, message
-                    )
-
-        if row["playerok_notify_messages"]:
-            for chat in chats:
-                message = getattr(chat, "last_message", None)
-                if not message or runtime.message_ids.get(str(chat.id)) == str(message.id):
-                    continue
-                sender = getattr(message, "user", None)
-                if str(getattr(sender, "id", "")) == str(runtime.account.id):
-                    continue
-                await self.safe_notify(
-                    runtime.telegram_id,
-                    "üí¨ <b>–ù–æ–≤–æ–µ —Å–æ–æ–±—â–µ–Ω–∏–µ</b>\n\n"
-                    f"üë§ –û—Ç: <b>{html.escape(clipped(getattr(sender, 'username', '‚Äî'), 120))}</b>\n"
-                    f"üÜî –ß–∞—Ç: <code>{html.escape(str(chat.id))}</code>\n\n"
-                    f"<pre>{html.escape(clipped(getattr(message, 'text', None) or '[–∏–∑–æ–±—Ä–∞–∂–µ–Ω–∏–µ]', 1400))}</pre>",
-                    marketplace="playerok",
-                    account_runtime=runtime,
-                    reply_markup=(
-                        keyboard([[("‚Ü©Ô∏è –û—Ç–≤–µ—Ç–∏—Ç—å", f"po_reply:{chat.id}"), ("üí¨ –ß–∞—Ç", f"po_chat_full:{chat.id}:0")]])
-                        if self.get_playerok(runtime.telegram_id) is runtime
-                        else keyboard([[("üîÑ –ü–µ—Ä–µ–∫–ª—é—á–∏—Ç—å—Å—è –Ω–∞ –∞–∫–∫–∞—É–Ω—Ç", f"account_select:playerok:{runtime.account_key}")]])
-                    ),
-                )
-
-        for deal in deals:
-            if runtime.deal_statuses.get(str(deal.id)) is None:
-                await self._process_playerok_delivery(runtime, row, deal)
-            if (
-                runtime.deal_statuses.get(str(deal.id)) != deal_statuses[str(deal.id)]
-                and self.get_playerok(runtime.telegram_id) is runtime
-            ):
-                await self.playerok_plugins.dispatch(
-                    runtime.telegram_id,
-                    "BIND_TO_DEAL_CHANGED",
-                    deal,
-                    runtime.deal_statuses.get(str(deal.id)),
-                )
-
-        if row["playerok_notify_deals"]:
-            for deal in deals:
-                deal_id = str(deal.id)
-                status = deal_statuses[deal_id]
-                previous = runtime.deal_statuses.get(deal_id)
-                if previous == status:
-                    continue
-                item = getattr(deal, "item", None)
-                buyer = getattr(deal, "user", None)
-                title = "–ù–æ–≤–∞—è —Å–¥–µ–ª–∫–∞" if previous is None else "–°—Ç–∞—Ç—É—Å —Å–¥–µ–ª–∫–∏ –∏–∑–º–µ–Ω—ë–Ω"
-                await self.safe_notify(
-                    runtime.telegram_id,
-                    f"üì¶ <b>{title}</b>\n\n"
-                    f"üÜî –°–¥–µ–ª–∫–∞: <code>{html.escape(deal_id)}</code>\n"
-                    f"üìå –°—Ç–∞—Ç—É—Å: <b>{html.escape(status)}</b>\n"
-                    f"üë§ –ü–æ–∫—É–ø–∞—Ç–µ–ª—å: <b>{html.escape(clipped(getattr(buyer, 'username', '‚Äî'), 120))}</b>\n"
-                    f"üè∑ –û–±—ä—è–≤–ª–µ–Ω–∏–µ: <b>{html.escape(clipped(getattr(item, 'name', '‚Äî'), 700))}</b>\n"
-                    f"üí∞ –¶–µ–Ω–∞: <b>{format_money(getattr(item, 'price', 0))} ‚ÇΩ</b>",
-                    marketplace="playerok",
-                    account_runtime=runtime,
-                    reply_markup=(
-                        keyboard([[("üì¶ –°–¥–µ–ª–∫–∞", f"po_deal:{deal_id}")]])
-                        if self.get_playerok(runtime.telegram_id) is runtime
-                        else keyboard([[("üîÑ –ü–µ—Ä–µ–∫–ª—é—á–∏—Ç—å—Å—è –Ω–∞ –∞–∫–∫–∞—É–Ω—Ç", f"account_select:playerok:{runtime.account_key}")]])
-                    ),
-                )
-
-        if row["playerok_notify_reviews"]:
-            for review in reviews:
-                if str(review.id) in runtime.review_ids:
-                    continue
-                creator = getattr(review, "creator", None)
-                deal = getattr(review, "deal", None)
-                item = getattr(deal, "item", None)
-                rating = int(getattr(review, "rating", 0) or 0)
-                await self.safe_notify(
-                    runtime.telegram_id,
-                    "‚≠ê <b>–ù–æ–≤—ã–π –æ—Ç–∑—ã–≤</b>\n\n"
-                    f"üë§ –ê–≤—Ç–æ—Ä: <b>{html.escape(clipped(getattr(creator, 'username', '‚Äî'), 120))}</b>\n"
-                    f"üåü –û—Ü–µ–Ω–∫–∞: <b>{'‚≠ê' * rating} ({rating}/5)</b>\n"
-                    f"üè∑ –û–±—ä—è–≤–ª–µ–Ω–∏–µ: <b>{html.escape(clipped(getattr(item, 'name', '‚Äî'), 500))}</b>\n\n"
-                    f"<pre>{html.escape(clipped(getattr(review, 'text', None) or '–ë–µ–∑ –∫–æ–º–º–µ–Ω—Ç–∞—Ä–∏—è', 1200))}</pre>",
-                    marketplace="playerok",
-                    account_runtime=runtime,
-                    reply_markup=(
-                        keyboard([[("üì¶ –°–¥–µ–ª–∫–∞", f"po_deal:{getattr(deal, 'id', '')}")]])
-                        if deal and self.get_playerok(runtime.telegram_id) is runtime
-                        else keyboard([[("üîÑ –ü–µ—Ä–µ–∫–ª—é—á–∏—Ç—å—Å—è –Ω–∞ –∞–∫–∫–∞—É–Ω—Ç", f"account_select:playerok:{runtime.account_key}")]])
-                    ),
-                )
-
-        for review in reviews:
-            if (
-                str(review.id) not in runtime.review_ids
-                and self.get_playerok(runtime.telegram_id) is runtime
-            ):
-                await self.playerok_plugins.dispatch(
-                    runtime.telegram_id, "BIND_TO_NEW_REVIEW", review
-                )
-
-        runtime.message_ids = message_ids
-        runtime.deal_statuses = deal_statuses
-        runtime.review_ids = review_ids
-
-    async def _playerok_poll_loop(self, runtime: PlayerokRuntime) -> None:
-        while not runtime.stop_event.is_set():
-            try:
-                row = await self.db.get_user(runtime.telegram_id)
-                if not row or not row["playerok_active"]:
-                    return
-                snapshot = await self._playerok_snapshot(runtime)
-                await self._handle_playerok_snapshot(runtime, row, snapshot)
-                if self.get_playerok(runtime.telegram_id) is runtime:
-                    await self.playerok_plugins.dispatch(
-                        runtime.telegram_id, "BIND_TO_TICK"
-                    )
-                now = asyncio.get_running_loop().time()
-                if row["playerok_auto_publish_enabled"] and now >= runtime.next_auto_publish_at:
-                    published, total, errors = await self.publish_playerok_drafts(
-                        runtime.telegram_id, runtime_override=runtime
-                    )
-                    runtime.next_auto_publish_at = now + PLAYEROK_AUTO_PUBLISH_SECONDS
-                    if published or errors:
-                        await self.safe_notify(
-                            runtime.telegram_id,
-                            f"üì¢ –ê–≤—Ç–æ–ø—É–±–ª–∏–∫–∞—Ü–∏—è —á–µ—Ä–Ω–æ–≤–∏–∫–æ–≤: <b>{published}/{total}</b> –æ–ø—É–±–ª–∏–∫–æ–≤–∞–Ω–æ"
-                            + (f"\n–û—à–∏–±–æ–∫: <b>{len(errors)}</b>" if errors else ""),
-                            marketplace="playerok",
-                            account_runtime=runtime,
-                        )
-                runtime.poll_failures = 0
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                runtime.poll_failures += 1
-                logger.exception("–û—à–∏–±–∫–∞ Playerok polling –¥–ª—è %s", runtime.telegram_id)
-                if runtime.poll_failures in {1, 15}:
-                    try:
-                        row = await self.db.get_user(runtime.telegram_id)
-                        if row and row["playerok_notify_system"]:
-                            await self.safe_notify(
-                                runtime.telegram_id,
-                                f"‚ö†Ô∏è –û—à–∏–±–∫–∞ –ø—Ä–æ–≤–µ—Ä–∫–∏ Playerok: {html.escape(clipped(exc, 400))}",
-                                marketplace="playerok",
-                                account_runtime=runtime,
-                            )
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception:
-                        logger.exception(
-                            "–ù–µ —É–¥–∞–ª–æ—Å—å –æ–±—Ä–∞–±–æ—Ç–∞—Ç—å –æ—à–∏–±–∫—É Playerok polling –¥–ª—è %s; "
-                            "—Ü–∏–∫–ª –ø—Ä–æ–¥–æ–ª–∂–∏—Ç —Ä–∞–±–æ—Ç—É",
-                            runtime.telegram_id,
-                        )
-            try:
-                await asyncio.wait_for(
-                    runtime.stop_event.wait(), timeout=PLAYEROK_POLL_SECONDS
-                )
-            except TimeoutError:
-                pass
-
-    async def start(
-        self,
-        telegram_id: int,
-        row: asyncpg.Record | None = None,
-        account: Account | None = None,
-        *,
-        make_active: bool = True,
-    ) -> AccountRuntime:
-        self.loop = asyncio.get_running_loop()
-        row = row or await self.db.get_active_marketplace_account(telegram_id, "funpay")
-        if not row or not row["proxy_enc"] or not row["credential_enc"]:
-            raise RuntimeError("–ê–∫–∫–∞—É–Ω—Ç –Ω–µ –Ω–∞—Å—Ç—Ä–æ–µ–Ω")
-        account_key = int(row["id"])
-        if account_key in self.funpay_account_runtimes:
-            await self.stop_funpay_account(account_key)
-        if account is None:
-            proxy = self.secrets.decrypt(row["proxy_enc"])
-            golden_key = self.secrets.decrypt(row["credential_enc"])
-            account = Account(
-                golden_key,
-                user_agent=USER_AGENT,
-                requests_timeout=20,
-                proxy=proxy_dict(proxy),
-                locale="ru",
-            )
-            await asyncio.wait_for(asyncio.to_thread(account.get), timeout=45)
-        settings = await self.db.get_user(telegram_id)
-        runner = Runner(account)
-        runtime = AccountRuntime(
-            telegram_id,
-            account,
-            runner,
-            account_key=account_key,
-            account_label=str(row["label"]),
-            keep_online_enabled=bool(settings and settings["keep_online_enabled"]),
-            auto_raise_enabled=bool(settings and settings["auto_raise_enabled"]),
-        )
-        self.funpay_account_runtimes[account_key] = runtime
-        if make_active or telegram_id not in self.runtimes:
-            self.runtimes[telegram_id] = runtime
-            await self._reload_funpay_plugins(telegram_id, runtime)
-        runtime.tasks = [
-            asyncio.create_task(asyncio.to_thread(runner.loop, runtime.stop_event)),
-            asyncio.create_task(asyncio.to_thread(self._listen, runtime)),
-            asyncio.create_task(self._auto_raise_loop(runtime)),
-        ]
-        logger.info(
-            "FunPay runtime –∑–∞–ø—É—â–µ–Ω: telegram=%s account=%s funpay=%s",
-            telegram_id,
-            account_key,
-            account.id,
-        )
-        return runtime
-
-    def _listen(self, runtime: AccountRuntime) -> None:
-        assert self.loop is not None
-        try:
-            for event in runtime.runner.listen(
-                requests_delay=4.0,
-                ignore_exceptions=True,
-                stop_event=runtime.stop_event,
-                refresh_interval=2700 if runtime.keep_online_enabled else float("inf"),
-            ):
-                if runtime.stop_event.is_set():
-                    break
-                future = asyncio.run_coroutine_threadsafe(
-                    self.handle_event(runtime, event), self.loop
-                )
-                try:
-                    future.result(timeout=30)
-                except Exception:
-                    logger.exception("–û—à–∏–±–∫–∞ –æ–±—Ä–∞–±–æ—Ç–∫–∏ —Å–æ–±—ã—Ç–∏—è FunPay")
-        except Exception:
-            logger.exception("Runner –ø–æ–ª—å–∑–æ–≤–∞—Ç–µ–ª—è %s –æ—Å—Ç–∞–Ω–æ–≤–∏–ª—Å—è", runtime.telegram_id)
-
-    async def _auto_raise_loop(self, runtime: AccountRuntime) -> None:
-        while not runtime.stop_event.is_set():
-            try:
-                row = await self.db.get_user(runtime.telegram_id)
-                enabled = bool(row and row["auto_raise_enabled"])
-                if enabled and asyncio.get_running_loop().time() >= runtime.next_raise_at:
-                    await self.raise_lots_now(
-                        runtime.telegram_id,
-                        notify=True,
-                        force=False,
-                        runtime_override=runtime,
-                    )
-            except Exception:
-                logger.exception("–û—à–∏–±–∫–∞ —Ü–∏–∫–ª–∞ –∞–≤—Ç–æ–ø–æ–¥–Ω—è—Ç–∏—è –¥–ª—è %s", runtime.telegram_id)
-            await asyncio.sleep(5)
-
-    async def raise_lots_now(
-        self,
-        telegram_id: int,
-        notify: bool = False,
-        force: bool = True,
-        runtime_override: AccountRuntime | None = None,
-    ) -> str:
-        runtime = runtime_override or self.get(telegram_id)
-        if not runtime:
-            raise RuntimeError("FunPay Runner –Ω–µ –∑–∞–ø—É—â–µ–Ω")
-        async with runtime.raise_lock:
-            profile = await asyncio.to_thread(runtime.account.get_user, runtime.account.id)
-            categories: dict[int, Any] = {}
-            for subcategory in profile.get_sorted_lots(2):
-                if subcategory.type is types.SubCategoryTypes.COMMON:
-                    categories[subcategory.category.id] = subcategory.category
-            if not categories:
-                raise RuntimeError("–í –ø—Ä–æ—Ñ–∏–ª–µ –Ω–µ—Ç –æ–±—ã—á–Ω—ã—Ö –ª–æ—Ç–æ–≤ –¥–ª—è –ø–æ–¥–Ω—è—Ç–∏—è")
-
-            results: list[str] = []
-            waits: list[int] = []
-            now = asyncio.get_running_loop().time()
-            plugin_runtime = (
-                self.plugins.runtimes.get(telegram_id)
-                if self.get(telegram_id) is runtime
-                else None
-            )
-            for category_id, category in categories.items():
-                category_name = category.name
-                scheduled = runtime.raise_schedule.get(category_id, 0)
-                if not force and scheduled > now:
-                    waits.append(max(int(scheduled - now), 1))
-                    continue
-                try:
-                    if plugin_runtime:
-                        await self.plugins.dispatch(
-                            telegram_id,
-                            "BIND_TO_PRE_LOTS_RAISE",
-                            plugin_runtime.adapter,
-                            category,
-                        )
-                    wait = await asyncio.to_thread(runtime.account.raise_lots, category_id)
-                    wait = max(int(wait or 3600), 60)
-                    waits.append(wait)
-                    runtime.raise_schedule[category_id] = now + wait
-                    results.append(f"‚úÖ {category_name}")
-                    if plugin_runtime:
-                        await self.plugins.dispatch(
-                            telegram_id,
-                            "BIND_TO_POST_LOTS_RAISE",
-                            plugin_runtime.adapter,
-                            category,
-                            f"–ü–æ–¥–æ–∂–¥–∏—Ç–µ {wait} —Å–µ–∫.",
-                        )
-                except fp_exceptions.RaiseError as exc:
-                    wait = int(exc.wait_time or 3600)
-                    wait = max(wait, 60)
-                    waits.append(wait)
-                    runtime.raise_schedule[category_id] = now + wait
-                    results.append(
-                        f"‚è≥ {category_name}: {clipped(exc.error_message or '–µ—â—ë —Ä–∞–Ω–æ', 160)}"
-                    )
-                except Exception as exc:
-                    logger.exception("–ù–µ —É–¥–∞–ª–æ—Å—å –ø–æ–¥–Ω—è—Ç—å –∫–∞—Ç–µ–≥–æ—Ä–∏—é %s", category_id)
-                    waits.append(300)
-                    runtime.raise_schedule[category_id] = now + 300
-                    results.append(f"‚ùå {category_name}: {clipped(exc, 160)}")
-                await asyncio.sleep(1)
-
-            wait_seconds = min(waits, default=3600)
-            runtime.next_raise_at = asyncio.get_running_loop().time() + wait_seconds
-            runtime.last_raise_at = datetime.now(timezone.utc).astimezone()
-            runtime.last_raise_summary = "\n".join(results) if results else "–ö–∞—Ç–µ–≥–æ—Ä–∏–∏ –æ–∂–∏–¥–∞—é—Ç —Å–≤–æ–µ–≥–æ —Ç–∞–π–º–µ—Ä–∞ FunPay"
-            text = "üÜô <b>–ü–æ–¥–Ω—è—Ç–∏–µ –ª–æ—Ç–æ–≤</b>\n" + html.escape(runtime.last_raise_summary)
-            row = await self.db.get_user(telegram_id)
-            if notify and row and row["notify_lots_raise"]:
-                await self.safe_notify(
-                    telegram_id, text, account_runtime=runtime
-                )
-            return text
-
-    async def stop(self, telegram_id: int) -> None:
-        runtime = self.runtimes.get(telegram_id)
-        if not runtime:
-            return
-        await self.stop_funpay_account(runtime.account_key)
-
-    async def stop_funpay_account(self, account_key: int) -> None:
-        runtime = self.funpay_account_runtimes.pop(account_key, None)
-        if not runtime:
-            return
-        if self.runtimes.get(runtime.telegram_id) is runtime:
-            self.runtimes.pop(runtime.telegram_id, None)
-            await self.plugins.stop_runtime(runtime.telegram_id)
-        runtime.stop_event.set()
-        for task in runtime.background_tasks:
-            task.cancel()
-        try:
-            await asyncio.wait_for(
-                asyncio.gather(
-                    *runtime.tasks,
-                    *runtime.background_tasks,
-                    return_exceptions=True,
-                ),
-                timeout=12,
-            )
-        except TimeoutError:
-            logger.warning(
-                "–ù–µ –≤—Å–µ –∑–∞–¥–∞—á–∏ runtime %s –∑–∞–≤–µ—Ä—à–∏–ª–∏—Å—å –≤–æ–≤—Ä–µ–º—è",
-                runtime.telegram_id,
-            )
-
-    async def stop_playerok(self, telegram_id: int) -> None:
-        runtime = self.playerok_runtimes.get(telegram_id)
-        if not runtime:
-            return
-        await self.stop_playerok_account(runtime.account_key)
-
-    async def stop_playerok_account(self, account_key: int) -> None:
-        runtime = self.playerok_account_runtimes.pop(account_key, None)
-        if not runtime:
-            return
-        if self.playerok_runtimes.get(runtime.telegram_id) is runtime:
-            self.playerok_runtimes.pop(runtime.telegram_id, None)
-            await self.playerok_plugins.stop_runtime(runtime.telegram_id)
-        runtime.stop_event.set()
-        if runtime.task:
-            runtime.task.cancel()
-            await asyncio.gather(runtime.task, return_exceptions=True)
-
-    async def close(self) -> None:
-        connection_tasks = list(self.connection_tasks.values())
-        for task in connection_tasks:
-            task.cancel()
-        if connection_tasks:
-            await asyncio.gather(*connection_tasks, return_exceptions=True)
-        self.connection_tasks.clear()
-        for account_key in list(self.funpay_account_runtimes):
-            await self.stop_funpay_account(account_key)
-        for account_key in list(self.playerok_account_runtimes):
-            await self.stop_playerok_account(account_key)
-        await self.telethon.close()
-
-    async def activate_account(
-        self, telegram_id: int, marketplace: str, account_id: int
-    ) -> AccountRuntime | PlayerokRuntime:
-        account_row = await self.db.set_active_account(
-            telegram_id, marketplace, account_id
-        )
-        if marketplace == "funpay":
-            runtime = self.funpay_account_runtimes.get(account_id)
-            if not runtime:
-                runtime = await self.start(
-                    telegram_id, row=account_row, make_active=False
-                )
-            self.runtimes[telegram_id] = runtime
-            await self._reload_funpay_plugins(telegram_id, runtime)
-            return runtime
-        runtime = self.playerok_account_runtimes.get(account_id)
-        if not runtime:
-            runtime = await self.start_playerok(
-                telegram_id, row=account_row, make_active=False
-            )
-        if telegram_id in self.playerok_plugins.runtimes:
-            await self.playerok_plugins.stop_runtime(telegram_id)
-        self.playerok_runtimes[telegram_id] = runtime
-        await self.playerok_plugins.load_runtime(telegram_id, runtime)
-        return runtime
-
-    def get(self, telegram_id: int) -> AccountRuntime | None:
-        return self.runtimes.get(telegram_id)
-
-    def get_playerok(self, telegram_id: int) -> PlayerokRuntime | None:
-        return self.playerok_runtimes.get(telegram_id)
-
-    async def safe_notify(
-        self,
-        telegram_id: int,
-        text: str,
-        *,
-        marketplace: str = "funpay",
-        account_runtime: AccountRuntime | PlayerokRuntime | None = None,
-        account_name: str | None = None,
-        account_external_id: str | int | None = None,
-        **kwargs: Any,
-    ) -> None:
-        label = "üü£ <b>FunPay</b>" if marketplace == "funpay" else "üîµ <b>Playerok</b>"
-        if account_runtime is None:
-            account_runtime = (
-                self.get(telegram_id)
-                if marketplace == "funpay"
-                else self.get_playerok(telegram_id)
-            )
-        if account_runtime is not None:
-            account_name = account_runtime.account_label or getattr(
-                account_runtime.account, "username", None
-            )
-            account_external_id = getattr(account_runtime.account, "id", None)
-        account_line = ""
-        if account_name or account_external_id:
-            account_line = (
-                "\nüë§ –ê–∫–∫–∞—É–Ω—Ç: "
-                f"<b>{html.escape(str(account_name or '‚Äî'))}</b>"
-                f" ¬∑ <code>{html.escape(str(account_external_id or '‚Äî'))}</code>"
-            )
-        body = f"{label}{account_line}\n{text}"
-        try:
-            await self.bot.send_message(telegram_id, body, **kwargs)
-        except Exception:
-            logger.exception("–ù–µ —É–¥–∞–ª–æ—Å—å –æ—Ç–ø—Ä–∞–≤–∏—Ç—å Telegram-—É–≤–µ–¥–æ–º–ª–µ–Ω–∏–µ –ø–æ–ª—å–∑–æ–≤–∞—Ç–µ–ª—é %s", telegram_id)
-        try:
-            targets = await self.db.list_notification_targets(telegram_id)
-        except Exception:
-            logger.exception("–ù–µ —É–¥–∞–ª–æ—Å—å –ø–æ–ª—É—á–∏—Ç—å –¥–æ–ø–æ–ª–Ω–∏—Ç–µ–ª—å–Ω—ã–µ —á–∞—Ç—ã —É–≤–µ–¥–æ–º–ª–µ–Ω–∏–π")
-            return
-        for target in targets:
-            if not target["enabled"] or int(target["chat_id"]) == telegram_id:
-                continue
-            try:
-                # –ö–Ω–æ–ø–∫–∏ —É–≤–µ–¥–æ–º–ª–µ–Ω–∏—è –ø—Ä–µ–¥–Ω–∞–∑–Ω–∞—á–µ–Ω—ã –≤–ª–∞–¥–µ–ª—å—Ü—É –∞–∫–∫–∞—É–Ω—Ç–∞. –í –≥—Ä—É–ø–ø–µ
-                # –æ–Ω–∏ –ø–æ–∑–≤–æ–ª—è–ª–∏ –±—ã —É—á–∞—Å—Ç–Ω–∏–∫—É –≤—ã–∑–≤–∞—Ç—å callback –æ—Ç —Å–≤–æ–µ–≥–æ Telegram ID.
-                target_kwargs = {
-                    key: value for key, value in kwargs.items() if key != "reply_markup"
-                }
-                await self.bot.send_message(
-                    int(target["chat_id"]), body, **target_kwargs
-                )
-            except Exception:
-                logger.warning(
-                    "–ù–µ –æ—Ç–ø—Ä–∞–≤–ª–µ–Ω–æ —É–≤–µ–¥–æ–º–ª–µ–Ω–∏–µ –≤ –¥–æ–ø–æ–ª–Ω–∏—Ç–µ–ª—å–Ω—ã–π —á–∞—Ç %s",
-                    target["chat_id"],
-                    exc_info=True,
-                )
-
-    async def _send_autoreply(
-        self, runtime: AccountRuntime, message: Any, row: asyncpg.Record
-    ) -> None:
-        delay = int(row["autoreply_delay_seconds"])
-        if delay:
-            await asyncio.sleep(delay)
-        if (
-            self.funpay_account_runtimes.get(runtime.account_key) is not runtime
-            or runtime.stop_event.is_set()
-        ):
-            return
-        try:
-            await asyncio.to_thread(
-                runtime.account.send_message,
-                message.chat_id,
-                render_template(
-                    row["autoreply_text"],
-                    message=message,
-                    account=runtime.account,
-                ),
-                message.chat_name,
-            )
-        except Exception:
-            logger.exception("–ê–≤—Ç–æ–æ—Ç–≤–µ—Ç –Ω–µ –æ—Ç–ø—Ä–∞–≤–ª–µ–Ω –≤ —á–∞—Ç %s", message.chat_id)
-            if row["notify_system"]:
-                await self.safe_notify(
-                    runtime.telegram_id,
-                    f"‚ö†Ô∏è –ù–µ —É–¥–∞–ª–æ—Å—å –æ—Ç–ø—Ä–∞–≤–∏—Ç—å –∞–≤—Ç–æ–æ—Ç–≤–µ—Ç –≤ —á–∞—Ç <code>{message.chat_id}</code>.",
-                    account_runtime=runtime,
-                )
-
-    async def _process_review(
-        self, runtime: AccountRuntime, message: Any, row: asyncpg.Record
-    ) -> None:
-        order_id = extract_order_id(message)
-        order = None
-        if order_id:
-            try:
-                order = await asyncio.to_thread(runtime.account.get_order, order_id)
-            except Exception:
-                logger.exception("–ù–µ —É–¥–∞–ª–æ—Å—å –ø–æ–ª—É—á–∏—Ç—å –∑–∞–∫–∞–∑ –¥–ª—è –æ—Ç–∑—ã–≤–∞ %s", order_id)
-        review = getattr(order, "review", None)
-        title = (
-            getattr(order, "title", None)
-            or getattr(order, "description", None)
-            or "–Ω–µ —É–¥–∞–ª–æ—Å—å –æ–ø—Ä–µ–¥–µ–ª–∏—Ç—å"
-        )
-        stars = int(getattr(review, "stars", 0) or 0)
-        comment = getattr(review, "text", None) or "–±–µ–∑ –∫–æ–º–º–µ–Ω—Ç–∞—Ä–∏—è"
-        reply_text = None
-        if (
-            order
-            and review
-            and stars in range(1, 6)
-            and order.seller_id == runtime.account.id
-            and row["review_reply_enabled"]
-        ):
-            template = row[f"review_reply_{stars}"]
-            reply_text = normalize_review_reply(
-                render_template(
-                    template,
-                    order=order,
-                    review=review,
-                    account=runtime.account,
-                )
-            )
-            if reply_text:
-                try:
-                    await asyncio.to_thread(
-                        runtime.account.send_review, order.id, reply_text
-                    )
-                except Exception:
-                    logger.exception("–ù–µ —É–¥–∞–ª–æ—Å—å –æ—Ç–≤–µ—Ç–∏—Ç—å –Ω–∞ –æ—Ç–∑—ã–≤ –∑–∞–∫–∞–∑–∞ %s", order.id)
-                    reply_text = None
-
-        if row["notify_reviews"]:
-            rating = f"{'‚≠ê' * stars} ({stars}/5)" if stars else "—É–¥–∞–ª—ë–Ω –∏–ª–∏ –Ω–µ –æ–ø—Ä–µ–¥–µ–ª—ë–Ω"
-            review_event_title = {
-                types.MessageTypes.NEW_FEEDBACK: "–ù–æ–≤—ã–π –æ—Ç–∑—ã–≤",
-                types.MessageTypes.FEEDBACK_CHANGED: "–û—Ç–∑—ã–≤ –∏–∑–º–µ–Ω—ë–Ω",
-                types.MessageTypes.FEEDBACK_DELETED: "–û—Ç–∑—ã–≤ —É–¥–∞–ª—ë–Ω",
-            }.get(message.type, "–°–æ–±—ã—Ç–∏–µ –æ—Ç–∑—ã–≤–∞")
-            text = (
-                f"‚≠ê <b>{review_event_title}</b>\n\n"
-                f"üì¶ –ó–∞–∫–∞–∑: <code>#{html.escape(order_id or '‚Äî')}</code>\n"
-                f"üè∑ –õ–æ—Ç: <b>{html.escape(clipped(title, 900))}</b>\n"
-                f"üåü –û—Ü–µ–Ω–∫–∞: <b>{rating}</b>\n\n"
-                "üí¨ <b>–ö–æ–º–º–µ–Ω—Ç–∞—Ä–∏–π –ø–æ–∫—É–ø–∞—Ç–µ–ª—è</b>\n"
-                f"<pre>{html.escape(clipped(comment, 1500))}</pre>"
-            )
-            if reply_text:
-                text += (
-                    "\nü§ñ <b>–ê–≤—Ç–æ–æ—Ç–≤–µ—Ç –æ—Ç–ø—Ä–∞–≤–ª–µ–Ω</b>\n"
-                    f"<pre>{html.escape(reply_text)}</pre>"
-                )
-            elif row["review_reply_enabled"]:
-                text += "\n‚ö†Ô∏è –ê–≤—Ç–æ–æ—Ç–≤–µ—Ç –Ω–µ –æ—Ç–ø—Ä–∞–≤–ª–µ–Ω: –æ—Ç–∑—ã–≤ —É–¥–∞–ª—ë–Ω, —É–∂–µ –æ—Ç–≤–µ—á–µ–Ω –∏–ª–∏ –¥–∞–Ω–Ω—ã–µ –∑–∞–∫–∞–∑–∞ –Ω–µ–¥–æ—Å—Ç—É–ø–Ω—ã."
-            active = self.get(runtime.telegram_id) is runtime
-            buttons = []
-            if order_id and active:
-                buttons.append(
-                    [("üì¶ –ó–∞–∫–∞–∑", f"order_view:{order_id}"), ("‚úçÔ∏è –û—Ç–≤–µ—Ç–∏—Ç—å", f"review_manual:{order_id}")]
-                )
-            if str(message.chat_id).isdigit() and active:
-                buttons.append([("üí¨ –û—Ç–∫—Ä—ã—Ç—å —á–∞—Ç", f"chat_full:{message.chat_id}:0")])
-            if not active:
-                buttons.append([(
-                    "üîÑ –ü–µ—Ä–µ–∫–ª—é—á–∏—Ç—å—Å—è –Ω–∞ –∞–∫–∫–∞—É–Ω—Ç",
-                    f"account_select:funpay:{runtime.account_key}",
-                )])
-            await self.safe_notify(
-                runtime.telegram_id,
-                text,
-                account_runtime=runtime,
-                reply_markup=keyboard(buttons) if buttons else None,
-            )
-
-    async def _process_command_reply(
-        self, runtime: AccountRuntime, message: Any
-    ) -> bool:
-        command = (message.text or "").casefold().strip()
-        if not command:
-            return False
-        rule = await self.db.find_command_reply(runtime.telegram_id, command)
-        if not rule:
-            return False
-        response = render_template(
-            rule["response"],
-            message=message,
-            account=runtime.account,
-        )
-        try:
-            await asyncio.to_thread(
-                runtime.account.send_message,
-                message.chat_id,
-                response,
-                message.chat_name,
-            )
-        except Exception:
-            logger.exception("–ù–µ –æ—Ç–ø—Ä–∞–≤–ª–µ–Ω –æ—Ç–≤–µ—Ç –Ω–∞ –∫–æ–º–∞–Ω–¥—É %s", command)
-            return False
-        if rule["notify"]:
-            await self.safe_notify(
-                runtime.telegram_id,
-                "‚å®Ô∏è <b>–°—Ä–∞–±–æ—Ç–∞–ª–∞ –∫–æ–º–∞–Ω–¥–∞</b>\n\n"
-                f"–ö–æ–º–∞–Ω–¥–∞: <code>{html.escape(command)}</code>\n"
-                f"–ü–æ–∫—É–ø–∞—Ç–µ–ª—å: <b>{html.escape(message.author or message.chat_name or '‚Äî')}</b>\n"
-                f"–ß–∞—Ç: <code>{html.escape(str(message.chat_id))}</code>",
-                account_runtime=runtime,
-            )
-        return True
-
-    async def _set_delivery_lot_state(
-        self, runtime: AccountRuntime, rule: asyncpg.Record, active: bool
-    ) -> bool:
-        try:
-            fields = await asyncio.to_thread(runtime.account.get_lot_fields, rule["lot_id"])
-            if bool(fields.active) == active:
-                return False
-            fields.active = active
-            await asyncio.to_thread(runtime.account.save_lot, fields)
-            return True
-        except Exception:
-            logger.exception("–ù–µ –∏–∑–º–µ–Ω–µ–Ω–æ —Å–æ—Å—Ç–æ—è–Ω–∏–µ –ª–æ—Ç–∞ –∞–≤—Ç–æ–≤—ã–¥–∞—á–∏ %s", rule["lot_id"])
-            return False
-
-    async def _process_delivery(
-        self, runtime: AccountRuntime, event: Any, row: asyncpg.Record
-    ) -> None:
-        order = event.order
-        rule = await self.db.find_delivery_rule(
-            runtime.telegram_id, order.description or ""
-        )
-        if not rule:
-            return
-        event.delivery_rule_id = rule["id"]
-        event.delivered = False
-        event.delivery_text = None
-        event.goods_delivered = 0
-        event.goods_left = len(rule["products"] or [])
-        event.error = 0
-        event.error_text = None
-
-        remaining = len(rule["products"] or [])
-        if row["auto_delivery_enabled"] and rule["enabled"]:
-            amount = max(int(order.amount or 1), 1) if row["multi_delivery_enabled"] else 1
-            claim = await self.db.claim_delivery(
-                runtime.telegram_id,
-                order.id,
-                order.description or "",
-                amount,
-            )
-            if claim:
-                claimed_rule, products, remaining, error = claim
-                event.goods_left = remaining
-                plugin_runtime = (
-                    self.plugins.runtimes.get(runtime.telegram_id)
-                    if self.get(runtime.telegram_id) is runtime
-                    else None
-                )
-                if plugin_runtime:
-                    await self.plugins.dispatch(
-                        runtime.telegram_id,
-                        "BIND_TO_PRE_DELIVERY",
-                        plugin_runtime.adapter,
-                        event,
-                    )
-                if error:
-                    event.error = 1
-                    event.error_text = error
-                else:
-                    delivery_text = render_template(
-                        claimed_rule["response"],
-                        order=order,
-                        account=runtime.account,
-                    ).replace("$product", "\n".join(products))
-                    try:
-                        result = await asyncio.to_thread(
-                            runtime.account.send_message,
-                            order.chat_id,
-                            delivery_text,
-                            order.buyer_username,
-                        )
-                        if not result:
-                            raise RuntimeError("FunPay –Ω–µ –ø–æ–¥—Ç–≤–µ—Ä–¥–∏–ª –æ—Ç–ø—Ä–∞–≤–∫—É —Å–æ–æ–±—â–µ–Ω–∏—è")
-                    except Exception as exc:  # noqa: BLE001 - FunPay may raise several request errors.
-                        await self.db.restore_delivery_products(
-                            runtime.telegram_id, claimed_rule["id"], products
-                        )
-                        await self.db.finish_delivery(
-                            runtime.telegram_id, order.id, "failed", clipped(exc, 600)
-                        )
-                        remaining += len(products)
-                        event.goods_left = remaining
-                        event.error = 1
-                        event.error_text = clipped(exc, 600)
-                    else:
-                        await self.db.finish_delivery(
-                            runtime.telegram_id, order.id, "sent", delivery_text
-                        )
-                        event.delivered = True
-                        event.delivery_text = delivery_text
-                        event.goods_delivered = amount
-                if plugin_runtime:
-                    await self.plugins.dispatch(
-                        runtime.telegram_id,
-                        "BIND_TO_POST_DELIVERY",
-                        plugin_runtime.adapter,
-                        event,
-                    )
-                if row["notify_delivery"]:
-                    if event.delivered:
-                        await self.safe_notify(
-                            runtime.telegram_id,
-                            "‚úÖ <b>–ê–≤—Ç–æ–≤—ã–¥–∞—á–∞ –≤—ã–ø–æ–ª–Ω–µ–Ω–∞</b>\n\n"
-                            f"–ó–∞–∫–∞–∑: <code>#{html.escape(order.id)}</code>\n"
-                            f"–õ–æ—Ç: <b>{html.escape(clipped(order.description, 700))}</b>\n"
-                            f"–í—ã–¥–∞–Ω–æ: <b>{event.goods_delivered}</b> ¬∑ –æ—Å—Ç–∞–ª–æ—Å—å: <b>{remaining}</b>\n\n"
-                            f"<pre>{html.escape(clipped(event.delivery_text, 1400))}</pre>",
-                            account_runtime=runtime,
-                        )
-                    elif event.error:
-                        await self.safe_notify(
-                            runtime.telegram_id,
-                            "‚ùå <b>–û—à–∏–±–∫–∞ –∞–≤—Ç–æ–≤—ã–¥–∞—á–∏</b>\n\n"
-                            f"–ó–∞–∫–∞–∑: <code>#{html.escape(order.id)}</code>\n"
-                            f"–õ–æ—Ç: <b>{html.escape(clipped(order.description, 700))}</b>\n"
-                            f"–ü—Ä–∏—á–∏–Ω–∞: <code>{html.escape(clipped(event.error_text, 800))}</code>",
-                            account_runtime=runtime,
-                        )
-
-        has_stock_source = "$product" in rule["response"]
-        should_disable = (
-            rule["enabled"]
-            and row["delivery_auto_disable"]
-            and not rule["disable_auto_disable"]
-            and has_stock_source
-            and remaining == 0
-        )
-        should_restore = (
-            rule["enabled"]
-            and row["delivery_auto_restore"]
-            and not rule["disable_auto_restore"]
-            and not should_disable
-        )
-        changed = False
-        if should_disable:
-            changed = await self._set_delivery_lot_state(runtime, rule, False)
-        elif should_restore:
-            changed = await self._set_delivery_lot_state(runtime, rule, True)
-        if changed and row["notify_delivery"]:
-            await self.safe_notify(
-                runtime.telegram_id,
-                ("üî¥ –õ–æ—Ç –¥–µ–∞–∫—Ç–∏–≤–∏—Ä–æ–≤–∞–Ω: –∑–∞–∫–æ–Ω—á–∏–ª–∏—Å—å —Ç–æ–≤–∞—Ä—ã.\n" if should_disable else "üü¢ –õ–æ—Ç –∞–≤—Ç–æ–º–∞—Ç–∏—á–µ—Å–∫–∏ –≤–æ—Å—Å—Ç–∞–Ω–æ–≤–ª–µ–Ω.\n")
-                + f"<b>{html.escape(clipped(rule['lot_title'], 1000))}</b>",
-                account_runtime=runtime,
-            )
-
-    async def handle_event(self, runtime: AccountRuntime, event: Any) -> None:
-        row = await self.db.get_user(runtime.telegram_id)
-        if not row or runtime.stop_event.is_set():
-            return
-        active = self.get(runtime.telegram_id) is runtime
-        if active:
-            await self.plugins.dispatch_event(runtime.telegram_id, event)
-        if isinstance(event, events.NewMessageEvent):
-            message = event.message
-            review_types = {
-                types.MessageTypes.NEW_FEEDBACK,
-                types.MessageTypes.FEEDBACK_CHANGED,
-                types.MessageTypes.FEEDBACK_DELETED,
-                types.MessageTypes.NEW_FEEDBACK_ANSWER,
-                types.MessageTypes.FEEDBACK_ANSWER_CHANGED,
-                types.MessageTypes.FEEDBACK_ANSWER_DELETED,
-            }
-            if message.type in review_types:
-                if message.type in {
-                    types.MessageTypes.NEW_FEEDBACK,
-                    types.MessageTypes.FEEDBACK_CHANGED,
-                    types.MessageTypes.FEEDBACK_DELETED,
-                }:
-                    await self._process_review(runtime, message, row)
-                return
-            incoming = (
-                message.author_id not in {0, runtime.account.id}
-                and not message.by_bot
-                and not message.by_vertex
-            )
-            if not incoming:
-                return
-            chat_id = str(message.chat_id)
-            chat_name = html.escape(message.chat_name or "–ù–µ–∏–∑–≤–µ—Å—Ç–Ω—ã–π –ø–æ–ª—å–∑–æ–≤–∞—Ç–µ–ª—å")
-            body = html.escape(clipped(message.text or "[–∏–∑–æ–±—Ä–∞–∂–µ–Ω–∏–µ]", 1200))
-            if row["notify_messages"]:
-                message_buttons = (
-                    InlineKeyboardMarkup(inline_keyboard=[
-                        [
-                            InlineKeyboardButton(text="‚Ü©Ô∏è –û—Ç–≤–µ—Ç–∏—Ç—å", callback_data=f"reply:{chat_id}"),
-                            InlineKeyboardButton(text="üí¨ –í–µ—Å—å —á–∞—Ç", callback_data=f"chat_full:{chat_id}:0"),
-                        ],
-                        [InlineKeyboardButton(text="üåê FunPay", url=f"https://funpay.com/chat/?node={chat_id}")],
-                    ])
-                    if active
-                    else keyboard([[(
-                        "üîÑ –ü–µ—Ä–µ–∫–ª—é—á–∏—Ç—å—Å—è –Ω–∞ –∞–∫–∫–∞—É–Ω—Ç",
-                        f"account_select:funpay:{runtime.account_key}",
-                    )]])
-                )
-                await self.safe_notify(
-                    runtime.telegram_id,
-                    "üí¨ <b>–ù–æ–≤–æ–µ —Å–æ–æ–±—â–µ–Ω–∏–µ</b>\n\n"
-                    f"üë§ –û—Ç: <b>{chat_name}</b>\n"
-                    f"üÜî –ß–∞—Ç: <code>{html.escape(chat_id)}</code>\n\n"
-                    f"<pre>{body}</pre>",
-                    account_runtime=runtime,
-                    reply_markup=message_buttons,
-                )
-            if (
-                (message.text or "").strip().casefold() == "#status"
-                and active
-                and self.plugins.is_enabled(runtime.telegram_id, STATUS_PLUGIN_UUID)
-            ):
-                status_text = await self.db.get_plugin_setting(
-                    runtime.telegram_id,
-                    STATUS_PLUGIN_UUID,
-                    "status_text",
-                    "üü¢ –ü—Ä–æ–¥–∞–≤–µ—Ü –Ω–∞ —Å–≤—è–∑–∏. –ú–æ–∂–µ—Ç–µ –æ—Ñ–æ—Ä–º–ª—è—Ç—å –∑–∞–∫–∞–∑.",
-                )
-                await asyncio.to_thread(
-                    runtime.account.send_message,
-                    message.chat_id,
-                    render_template(
-                        status_text,
-                        message=message,
-                        account=runtime.account,
-                    ),
-                    message.chat_name,
-                )
-                return
-            if await self._process_command_reply(runtime, message):
-                return
-            hour = datetime.now().astimezone().hour
-            if (
-                row["autoreply_enabled"]
-                and within_work_hours(
-                    row["autoreply_work_start"], row["autoreply_work_end"], hour
-                )
-                and await self.db.claim_autoreply(
-                    runtime.telegram_id,
-                    chat_id,
-                    row["autoreply_cooldown_minutes"],
-                    row["autoreply_new_chats_only"],
-                )
-            ):
-                task = asyncio.create_task(self._send_autoreply(runtime, message, row))
-                runtime.background_tasks.add(task)
-                task.add_done_callback(runtime.background_tasks.discard)
-        elif isinstance(event, events.NewOrderEvent):
-            order = event.order
-            await self._process_delivery(runtime, event, row)
-            if not row["notify_new_orders"]:
-                return
-            buttons = [[
-                InlineKeyboardButton(text="üì¶ –ü–æ–¥—Ä–æ–±–Ω–æ—Å—Ç–∏", callback_data=f"order_view:{order.id}"),
-                InlineKeyboardButton(text="üåê FunPay", url=f"https://funpay.com/orders/{order.id}/"),
-            ]] if active else []
-            if str(order.chat_id).isdigit() and active:
-                buttons.append([
-                    InlineKeyboardButton(
-                        text="‚Ü©Ô∏è –û—Ç–≤–µ—Ç–∏—Ç—å", callback_data=f"order_reply:{order.id}"
-                    ),
-                    InlineKeyboardButton(text="üí¨ –ß–∞—Ç", callback_data=f"chat_full:{order.chat_id}:0"),
-                ])
-            if active:
-                buttons.append([InlineKeyboardButton(text="üí∏ –í–µ—Ä–Ω—É—Ç—å –¥–µ–Ω—å–≥–∏", callback_data=f"refund_ask:{order.id}")])
-            else:
-                buttons.append([InlineKeyboardButton(
-                    text="üîÑ –ü–µ—Ä–µ–∫–ª—é—á–∏—Ç—å—Å—è –Ω–∞ –∞–∫–∫–∞—É–Ω—Ç",
-                    callback_data=f"account_select:funpay:{runtime.account_key}",
-                )])
-            await self.safe_notify(
-                runtime.telegram_id,
-                "üõí <b>–ù–æ–≤—ã–π –∑–∞–∫–∞–∑</b>\n\n"
-                f"üÜî –ó–∞–∫–∞–∑: <code>#{html.escape(order.id)}</code>\n"
-                f"üë§ –ü–æ–∫—É–ø–∞—Ç–µ–ª—å: <b>{html.escape(order.buyer_username or '‚Äî')}</b>\n"
-                f"üí∞ –°—É–º–º–∞: <b>{format_money(order.price)} {html.escape(str(order.currency))}</b>\n\n"
-                "üè∑ <b>–õ–æ—Ç</b>\n"
-                f"<blockquote>{html.escape(clipped(order.description, 1400))}</blockquote>",
-                account_runtime=runtime,
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
-            )
-        elif isinstance(event, events.OrderStatusChangedEvent) and row["notify_order_status"]:
-            order = event.order
-            await self.safe_notify(
-                runtime.telegram_id,
-                "üì¶ <b>–°—Ç–∞—Ç—É—Å –∑–∞–∫–∞–∑–∞ –∏–∑–º–µ–Ω—ë–Ω</b>\n\n"
-                f"üÜî –ó–∞–∫–∞–∑: <code>#{html.escape(order.id)}</code>\n"
-                f"üìå –ù–æ–≤—ã–π —Å—Ç–∞—Ç—É—Å: <b>{html.escape(order_status_label(order.status))}</b>\n\n"
-                "üè∑ <b>–õ–æ—Ç</b>\n"
-                f"<blockquote>{html.escape(clipped(order.description or '‚Äî', 1200))}</blockquote>",
-                account_runtime=runtime,
-                reply_markup=(
-                    InlineKeyboardMarkup(inline_keyboard=[[
-                        InlineKeyboardButton(text="üì¶ –ü–æ–¥—Ä–æ–±–Ω–æ—Å—Ç–∏", callback_data=f"order_view:{order.id}"),
-                        InlineKeyboardButton(text="üåê FunPay", url=f"https://funpay.com/orders/{order.id}/"),
-                    ]])
-                    if active
-                    else keyboard([[(
-                        "üîÑ –ü–µ—Ä–µ–∫–ª—é—á–∏—Ç—å—Å—è –Ω–∞ –∞–∫–∫–∞—É–Ω—Ç",
-                        f"account_select:funpay:{runtime.account_key}",
-                    )]])
-                ),
-            )
-
-
-class ConnectState(StatesGroup):
-    proxy = State()
-    golden_key = State()
-
-
-class PlayerokConnectState(StatesGroup):
-    proxy = State()
-    cookie = State()
-    email = State()
-    code = State()
-
-
-class PlayerokChatState(StatesGroup):
-    text = State()
-    image = State()
-
-
-class PlayerokAutoReplyState(StatesGroup):
-    text = State()
-    delay = State()
-    cooldown = State()
-    hours = State()
-
-
-class PlayerokCommandState(StatesGroup):
-    trigger = State()
-    response = State()
-
-
-class PlayerokDeliveryState(StatesGroup):
-    response = State()
-    products = State()
-
-
-class PlayerokItemCreateState(StatesGroup):
-    game_search = State()
-    name = State()
-    price = State()
-    description = State()
-    field_value = State()
-
-
-class PlayerokPluginState(StatesGroup):
-    file = State()
-    setting_value = State()
-
-
-class PlayerokCatalogPublishState(StatesGroup):
-    description = State()
-
-
-class AutoReplyState(StatesGroup):
-    text = State()
-    cooldown = State()
-    delay = State()
-    hours = State()
-    review_text = State()
-
-
-class DeliveryRuleState(StatesGroup):
-    response = State()
-    products = State()
-
-
-class CommandReplyState(StatesGroup):
-    trigger = State()
-    response = State()
-
-
-class NotificationTargetState(StatesGroup):
-    chat_id = State()
-
-
-class ReviewReplyState(StatesGroup):
-    text = State()
-
-
-class SendMessageState(StatesGroup):
-    chat_id = State()
-    text = State()
-
-
-class UploadImageState(StatesGroup):
-    chat_id = State()
-    chat_file = State()
-    lot_id = State()
-    lot_file = State()
-
-
-class OrderState(StatesGroup):
-    order_id = State()
-
-
-class PluginState(StatesGroup):
-    file = State()
-
-
-class AIPluginBuilderState(StatesGroup):
-    request = State()
-    edit_request = State()
-    api_base_url = State()
-    api_token = State()
-    model_id = State()
-
-
-class PluginTelethonState(StatesGroup):
-    phone = State()
-    code = State()
-    password = State()
-
-
-class CatalogPublishState(StatesGroup):
-    description = State()
-
-
-class StatusPluginState(StatesGroup):
-    text = State()
-
-
-def keyboard(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text=text, callback_data=data) for text, data in row]
-            for row in rows
-        ]
-    )
-
-
-def main_keyboard(
-    marketplace: str = "funpay",
-    account_label: str = "",
-    account_count: int = 0,
-) -> InlineKeyboardMarkup:
-    switch = [
-        (
-            "üîÑ –ü–ª–æ—â–∞–¥–∫–∞: FunPay" if marketplace == "funpay" else "üîÑ –ü–ª–æ—â–∞–¥–∫–∞: Playerok",
-            "marketplace_switch",
-        )
-    ]
-    account_switch = [(
-        f"üë• –ê–∫–∫–∞—É–Ω—Ç: {clipped(account_label or '‚Äî', 28)}"
-        + (f" ¬∑ {account_count}" if account_count else ""),
-        f"account_switch:{marketplace}",
-    )]
-    if marketplace == "playerok":
-        return keyboard([
-            switch,
-            account_switch,
-            [("üë§ –ü—Ä–æ—Ñ–∏–ª—å", "po_profile"), ("üí∞ –ë–∞–ª–∞–Ω—Å", "po_balance")],
-            [("üí¨ –ß–∞—Ç—ã", "po_chats"), ("üì¶ –°–¥–µ–ª–∫–∏", "po_deals")],
-            [("üì¢ –û–±—ä—è–≤–ª–µ–Ω–∏—è", "po_items"), ("‚ûï –°–æ–∑–¥–∞—Ç—å", "po_item_create")],
-            [("ü§ñ –ê–≤—Ç–æ–æ—Ç–≤–µ—Ç—á–∏–∫", "po_autoreply"), ("üì§ –ê–≤—Ç–æ–≤—ã–¥–∞—á–∞", "po_delivery")],
-            [("üß© –ü–ª–∞–≥–∏–Ω—ã", "po_plugins"), ("üîî –£–≤–µ–¥–æ–º–ª–µ–Ω–∏—è", "po_notifications")],
-            [("‚öôÔ∏è –ê–∫–∫–∞—É–Ω—Ç Playerok", "po_account")],
-        ])
-    return keyboard([
-        switch,
-        account_switch,
-        [("üë§ –ü–æ–¥—Ä–æ–±–Ω—ã–π –ø—Ä–æ—Ñ–∏–ª—å", "profile"), ("üí∞ –ë–∞–ª–∞–Ω—Å", "balance")],
-        [("üîî –£–≤–µ–¥–æ–º–ª–µ–Ω–∏—è", "notifications"), ("ü§ñ –ê–≤—Ç–æ–æ—Ç–≤–µ—Ç—á–∏–∫", "autoreply")],
-        [("üí¨ –ü–æ—Å–ª–µ–¥–Ω–∏–µ —á–∞—Ç—ã", "chats"), ("üì¶ –ó–∞–∫–∞–∑ –ø–æ ID", "order_lookup")],
-        [("üì§ –ê–≤—Ç–æ–≤—ã–¥–∞—á–∞", "delivery"), ("‚å®Ô∏è –ö–æ–º–∞–Ω–¥—ã", "command_replies")],
-        [("üÜô –ê–≤—Ç–æ–ø–æ–¥–Ω—è—Ç–∏–µ", "auto_raise"), ("üß© –ü–ª–∞–≥–∏–Ω—ã", "plugins")],
-        [("‚öôÔ∏è –ê–∫–∫–∞—É–Ω—Ç", "account")],
-    ])
-
-
-def conversation_actions_keyboard(chat_id: int | str) -> InlineKeyboardMarkup:
-    return keyboard([
-        [
-            ("‚úçÔ∏è –ù–∞–ø–∏—Å–∞—Ç—å –µ—â—ë", f"reply:{chat_id}"),
-            ("üí¨ –ü–µ—Ä–µ–π—Ç–∏ –∫ –¥–∏–∞–ª–æ–≥—É", f"chat_full:{chat_id}:0"),
-        ],
-        [("üì∑ –û—Ç–ø—Ä–∞–≤–∏—Ç—å —Ñ–æ—Ç–æ", f"image_chat:{chat_id}")],
-    ])
-
-
-def bool_icon(value: bool) -> str:
-    return "‚úÖ" if value else "‚ùå"
-
-
-def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> Router:
-    router = Router()
-    ai_builder_jobs: set[int] = set()
-    # –£—á–µ—Ç–Ω—ã–µ –¥–∞–Ω–Ω—ã–µ –ø—Ä–∏–Ω–∏–º–∞—é—Ç—Å—è —Ç–æ–ª—å–∫–æ –≤ –ª–∏—á–Ω–æ–π –ø–µ—Ä–µ–ø–∏—Å–∫–µ —Å –±–æ—Ç–æ–º.
-    router.message.filter(F.chat.type == ChatType.PRIVATE)
-    router.callback_query.filter(F.message.chat.type == ChatType.PRIVATE)
-
-    @router.errors()
-    async def isolate_update_error(event: ErrorEvent) -> bool:
-        """–ù–µ –ø–æ–∑–≤–æ–ª—è–µ—Ç –æ—à–∏–±–∫–µ –æ—Ç–¥–µ–ª—å–Ω–æ–≥–æ –≤—Ö–æ–¥–∞ –∏–ª–∏ callback –æ—Å—Ç–∞–Ω–æ–≤–∏—Ç—å polling –±–æ—Ç–∞."""
-        exc = event.exception
-        logger.error(
-            "–ù–µ–æ–±—Ä–∞–±–æ—Ç–∞–Ω–Ω–∞—è –æ—à–∏–±–∫–∞ Telegram update",
-            exc_info=(type(exc), exc, exc.__traceback__),
-        )
-        callback = event.update.callback_query
-        target = event.update.message or (callback.message if callback else None)
-        if callback:
-            try:
-                await callback.answer()
-            except Exception:
-                pass
-        if target and hasattr(target, "answer"):
-            try:
-                await target.answer(
-                    "‚ùå –û–ø–µ—Ä–∞—Ü–∏—è –∑–∞–≤–µ—Ä—à–∏–ª–∞—Å—å —Å –æ—à–∏–±–∫–æ–π, –Ω–æ –±–æ—Ç –ø—Ä–æ–¥–æ–ª–∂–∞–µ—Ç —Ä–∞–±–æ—Ç–∞—Ç—å. "
-                    "–ü—Ä–æ–≤–µ—Ä—å—Ç–µ –¥–∞–Ω–Ω—ã–µ –∏ –ø–æ–ø—Ä–æ–±—É–π—Ç–µ –µ—â—ë —Ä–∞–∑."
-                )
-            except Exception:
-                logger.warning(
-                    "–ù–µ —É–¥–∞–ª–æ—Å—å –æ—Ç–ø—Ä–∞–≤–∏—Ç—å –ø–æ–ª—å–∑–æ–≤–∞—Ç–µ–ª—é —Å–æ–æ–±—â–µ–Ω–∏–µ –æ–± –æ—à–∏–±–∫–µ update",
-                    exc_info=True,
-                )
-        return True
-
-    async def show_main(target: Message, user_id: int, text: str = "–í—ã–±–µ—Ä–∏—Ç–µ –¥–µ–π—Å—Ç–≤–∏–µ:") -> None:
-        row = await db.get_user(user_id)
-        funpay_accounts = await db.list_marketplace_accounts(user_id, "funpay")
-        playerok_accounts = await db.list_marketplace_accounts(user_id, "playerok")
-        if not row or not (funpay_accounts or playerok_accounts):
-            await target.answer(
-                "–í—ã–±–µ—Ä–∏—Ç–µ –ø–ª–æ—â–∞–¥–∫—É, –∫–æ—Ç–æ—Ä—É—é —Ö–æ—Ç–∏—Ç–µ –Ω–∞—Å—Ç—Ä–æ–∏—Ç—å –ø–µ—Ä–≤–æ–π:",
-                reply_markup=keyboard([
-                    [("üü£ –ù–∞—Å—Ç—Ä–æ–∏—Ç—å FunPay", "connect_funpay")],
-                    [("üîµ –ù–∞—Å—Ç—Ä–æ–∏—Ç—å Playerok", "connect_playerok")],
-                ]),
-            )
-            return
-        marketplace = row["active_marketplace"]
-        if marketplace == "playerok" and not playerok_accounts:
-            marketplace = "funpay"
-            await db.set_active_marketplace(user_id, marketplace)
-        elif marketplace == "funpay" and not funpay_accounts:
-            marketplace = "playerok"
-            await db.set_active_marketplace(user_id, marketplace)
-        accounts = playerok_accounts if marketplace == "playerok" else funpay_accounts
-        active_account = await db.get_active_marketplace_account(user_id, marketplace)
-        if marketplace == "playerok":
-            online = "üü¢" if manager.get_playerok(user_id) else "üî¥"
-            username = (active_account and active_account["label"]) or "Playerok"
-            label = "üîµ Playerok"
-        else:
-            online = "üü¢" if manager.get(user_id) else "üî¥"
-            username = (active_account and active_account["label"]) or "FunPay"
-            label = "üü£ FunPay"
-        await target.answer(
-            f"{label} ¬∑ {online} <b>{html.escape(username)}</b>\n{text}",
-            reply_markup=main_keyboard(marketplace, username, len(accounts)),
-        )
-
-    async def require_runtime(target: Message, user_id: int) -> AccountRuntime | None:
-        runtime = manager.get(user_id)
-        if runtime:
-            return runtime
-        account = await db.get_active_marketplace_account(user_id, "funpay")
-        if not account:
-            await target.answer("–°–Ω–∞—á–∞–ª–∞ –ø–æ–¥–∫–ª—é—á–∏—Ç–µ –∞–∫–∫–∞—É–Ω—Ç FunPay —á–µ—Ä–µ–∑ /start.")
-            return None
-        await target.answer("–ü–æ–¥–∫–ª—é—á–µ–Ω–∏–µ –Ω–µ–∞–∫—Ç–∏–≤–Ω–æ. –û—Ç–∫—Ä–æ–π—Ç–µ ¬´–ê–∫–∫–∞—É–Ω—Ç¬ª ‚Üí ¬´–ü–µ—Ä–µ–ø–æ–¥–∫–ª—é—á–∏—Ç—å¬ª.")
-        return None
-
-    async def require_playerok_runtime(
-        target: Message, user_id: int
-    ) -> PlayerokRuntime | None:
-        runtime = manager.get_playerok(user_id)
-        if runtime:
-            return runtime
-        account = await db.get_active_marketplace_account(user_id, "playerok")
-        if not account:
-            await target.answer(
-                "–°–Ω–∞—á–∞–ª–∞ –ø–æ–¥–∫–ª—é—á–∏—Ç–µ Playerok.",
-                reply_markup=keyboard([[("üîµ –ü–æ–¥–∫–ª—é—á–∏—Ç—å Playerok", "connect_playerok")]]),
-            )
-            return None
-        await target.answer("Playerok –Ω–µ–∞–∫—Ç–∏–≤–µ–Ω. –û—Ç–∫—Ä–æ–π—Ç–µ –Ω–∞—Å—Ç—Ä–æ–π–∫–∏ –∞–∫–∫–∞—É–Ω—Ç–∞ –∏ –ø–µ—Ä–µ–ø–æ–¥–∫–ª—é—á–∏—Ç–µ—Å—å.")
-        return None
-
-    async def begin_connect(target: Message, state: FSMContext) -> None:
-        await state.clear()
-        await state.set_state(ConnectState.proxy)
-        await target.answer(
-            "1/2. –û—Ç–ø—Ä–∞–≤—å—Ç–µ –ø—Ä–æ–∫—Å–∏. –ü–æ–¥–¥–µ—Ä–∂–∏–≤–∞–µ–º—ã–µ —Ñ–æ—Ä–º–∞—Ç—ã:\n"
-            "<code>http://user:password@host:port</code>\n"
-            "<code>socks5://user:password@host:port</code>\n\n"
-            "–°–æ–æ–±—â–µ–Ω–∏–µ –±—É–¥–µ—Ç —É–¥–∞–ª–µ–Ω–æ –ø–æ—Å–ª–µ –æ–±—Ä–∞–±–æ—Ç–∫–∏. –î–ª—è –æ—Ç–º–µ–Ω—ã: /cancel"
-        )
-
-    async def begin_playerok_connect(target: Message, state: FSMContext) -> None:
-        await state.clear()
-        await target.answer(
-            "üîµ <b>–ü–æ–¥–∫–ª—é—á–µ–Ω–∏–µ Playerok</b>\n\n"
-            "–í—ã–±–µ—Ä–∏—Ç–µ —Å–ø–æ—Å–æ–± –≤—Ö–æ–¥–∞. Email-–∫–æ–¥ —É–¥–æ–±–Ω–µ–µ, cookie –æ—Å—Ç–∞–≤–ª–µ–Ω—ã "
-            "–∫–∞–∫ —Ä–µ–∑–µ—Ä–≤–Ω—ã–π —Å–ø–æ—Å–æ–± –ø—Ä–∏ –∑–∞—â–∏—Ç–µ Playerok.",
-            reply_markup=keyboard([
-                [("üìß Email + –∫–æ–¥", "po_auth_email")],
-                [("üç™ Cookie", "po_auth_cookie")],
-                [("‚ùå –û—Ç–º–µ–Ω–∞", "menu")],
-            ]),
-        )
-
-    @router.message(CommandStart())
-    async def start(message: Message, state: FSMContext) -> None:
-        await state.clear()
-        await db.ensure_user(message.from_user.id)
-        active_accounts = await asyncio.gather(
-            db.get_active_marketplace_account(message.from_user.id, "funpay"),
-            db.get_active_marketplace_account(message.from_user.id, "playerok"),
-        )
-        await show_main(message, message.from_user.id)
-        for marketplace, runtimes, active in (
-            ("funpay", manager.funpay_account_runtimes, active_accounts[0]),
-            ("playerok", manager.playerok_account_runtimes, active_accounts[1]),
-        ):
-            if active and int(active["id"]) not in runtimes:
-                manager.start_account_in_background(
-                    message.from_user.id, marketplace, active
-                )
-
-    @router.message(Command("cancel"))
-    async def cancel(message: Message, state: FSMContext) -> None:
-        await state.clear()
-        await show_main(message, message.from_user.id, "–¢–µ–∫—É—â–µ–µ –¥–µ–π—Å—Ç–≤–∏–µ –æ—Ç–º–µ–Ω–µ–Ω–æ.")
-
-    @router.callback_query(F.data.in_({"connect", "connect_funpay"}))
-    async def connect_callback(callback: CallbackQuery, state: FSMContext) -> None:
-        await callback.answer()
-        await begin_connect(callback.message, state)
-
-    @router.callback_query(F.data == "connect_playerok")
-    async def connect_playerok_callback(callback: CallbackQuery, state: FSMContext) -> None:
-        await callback.answer()
-        await begin_playerok_connect(callback.message, state)
-
-    @router.callback_query(F.data.in_({"po_auth_email", "po_auth_cookie"}))
-    async def playerok_auth_method(callback: CallbackQuery, state: FSMContext) -> None:
-        method = "email" if callback.data == "po_auth_email" else "cookie"
-        await callback.answer()
-        await state.clear()
-        await state.update_data(playerok_auth_method=method)
-        await state.set_state(PlayerokConnectState.proxy)
-        await callback.message.answer(
-            f"üîµ <b>Playerok ¬∑ —à–∞–≥ 1/{'3' if method == 'email' else '2'}</b>\n\n"
-            "–û—Ç–ø—Ä–∞–≤—å—Ç–µ IPv4 HTTP/HTTPS-–ø—Ä–æ–∫—Å–∏:\n"
-            "<code>http://user:password@host:port</code>\n\n"
-            "–í–µ—Å—å –≤—Ö–æ–¥ –¥–æ–ª–∂–µ–Ω –ø—Ä–æ—Ö–æ–¥–∏—Ç—å —Å –æ–¥–Ω–æ–≥–æ IP. –°–æ–æ–±—â–µ–Ω–∏–µ –±—É–¥–µ—Ç —É–¥–∞–ª–µ–Ω–æ. "
-            "–î–ª—è –æ—Ç–º–µ–Ω—ã: /cancel"
-        )
-
-    @router.message(ConnectState.proxy, F.text)
-    async def accept_proxy(message: Message, state: FSMContext) -> None:
-        try:
-            proxy = normalize_proxy(message.text)
-        except ValueError as exc:
-            await message.answer(f"‚ùå {html.escape(str(exc))}. –ü–æ–ø—Ä–æ–±—É–π—Ç–µ –µ—â—ë —Ä–∞–∑ –∏–ª–∏ /cancel.")
-            return
-        try:
-            await message.delete()
-        except TelegramBadRequest:
-            pass
-        await state.update_data(proxy=proxy)
-        await state.set_state(ConnectState.golden_key)
-        await message.answer(
-            "2/2. –¢–µ–ø–µ—Ä—å –æ—Ç–ø—Ä–∞–≤—å—Ç–µ <b>golden_key</b> –∏–∑ cookie FunPay. "
-            "–ü–æ—Å–ª–µ –ø—Ä–æ–≤–µ—Ä–∫–∏ —ç—Ç–æ —Å–æ–æ–±—â–µ–Ω–∏–µ —Ç–æ–∂–µ –±—É–¥–µ—Ç —É–¥–∞–ª–µ–Ω–æ."
-        )
-
-    @router.message(ConnectState.golden_key, F.text)
-    async def accept_golden_key(message: Message, state: FSMContext) -> None:
-        golden_key = message.text.strip()
-        try:
-            await message.delete()
-        except TelegramBadRequest:
-            pass
-        if len(golden_key) < 16 or len(golden_key) > 512:
-            await message.answer("‚ùå golden_key –≤—ã–≥–ª—è–¥–∏—Ç –Ω–µ–∫–æ—Ä—Ä–µ–∫—Ç–Ω–æ. –û—Ç–ø—Ä–∞–≤—å—Ç–µ –µ–≥–æ –ø–æ–≤—Ç–æ—Ä–Ω–æ –∏–ª–∏ /cancel.")
-            return
-        data = await state.get_data()
-        proxy = data.get("proxy")
-        if not proxy:
-            await state.clear()
-            await begin_connect(message, state)
-            return
-        wait_message = await message.answer("‚è≥ –ü—Ä–æ–≤–µ—Ä—è—é –ø—Ä–æ–∫—Å–∏ –∏ –∞–≤—Ç–æ—Ä–∏–∑–∞—Ü–∏—é FunPay‚Ä¶")
-        account = Account(
-            golden_key,
-            user_agent=USER_AGENT,
-            requests_timeout=20,
-            proxy=proxy_dict(proxy),
-            locale="ru",
-        )
-        try:
-            await asyncio.wait_for(asyncio.to_thread(account.get), timeout=45)
-        except Exception as exc:  # noqa: BLE001 - FunPay/requests raises several unrelated network exceptions.
-            logger.warning("–ü—Ä–æ–≤–µ—Ä–∫–∞ –∞–∫–∫–∞—É–Ω—Ç–∞ –Ω–µ –ø—Ä–æ–π–¥–µ–Ω–∞: %s", type(exc).__name__)
-            await wait_message.edit_text(
-                f"‚ùå {funpay_connection_error_message(exc)}\n"
-                "–û—Ç–ø—Ä–∞–≤—å—Ç–µ golden_key –ø–æ–≤—Ç–æ—Ä–Ω–æ –ª–∏–±–æ –Ω–∞—á–Ω–∏—Ç–µ –∑–∞–Ω–æ–≤–æ —á–µ—Ä–µ–∑ /cancel –∏ /start."
-            )
-            return
-        try:
-            account_row = await db.save_account(
-                message.from_user.id,
-                secrets.encrypt(proxy),
-                secrets.encrypt(golden_key),
-                account,
-            )
-        except Exception:
-            logger.exception("FunPay-–∞–∫–∫–∞—É–Ω—Ç –ø—Ä–æ–≤–µ—Ä–µ–Ω, –Ω–æ –Ω–µ —Å–æ—Ö—Ä–∞–Ω—ë–Ω")
-            await state.clear()
-            await wait_message.edit_text(
-                "‚ùå –ê–≤—Ç–æ—Ä–∏–∑–∞—Ü–∏—è FunPay –ø—Ä–æ—à–ª–∞, –Ω–æ —Å–æ—Ö—Ä–∞–Ω–∏—Ç—å –∞–∫–∫–∞—É–Ω—Ç –Ω–µ —É–¥–∞–ª–æ—Å—å. "
-                "–ü–æ–ø—Ä–æ–±—É–π—Ç–µ –ø–æ–¥–∫–ª—é—á–∏—Ç—å –µ–≥–æ –µ—â—ë —Ä–∞–∑ —á–µ—Ä–µ–∑ /start."
-            )
-            return
-        try:
-            await manager.start(
-                message.from_user.id, row=account_row, account=account
-            )
-        except Exception:
-            logger.exception("–ù–µ —É–¥–∞–ª–æ—Å—å –∑–∞–ø—É—Å—Ç–∏—Ç—å runtime –ø–æ—Å–ª–µ —É—Å–ø–µ—à–Ω–æ–π –∞–≤—Ç–æ—Ä–∏–∑–∞—Ü–∏–∏")
-            await wait_message.edit_text("‚ö†Ô∏è –ê–∫–∫–∞—É–Ω—Ç —Å–æ—Ö—Ä–∞–Ω—ë–Ω, –Ω–æ —Å–ª–µ–∂–µ–Ω–∏–µ –Ω–µ –∑–∞–ø—É—Å—Ç–∏–ª–æ—Å—å. –ü–æ–ø—Ä–æ–±—É–π—Ç–µ –ø–µ—Ä–µ–ø–æ–¥–∫–ª—é—á–∏—Ç—å.")
-            await state.clear()
-            return
-        await state.clear()
-        await wait_message.edit_text(
-            f"‚úÖ –ü–æ–¥–∫–ª—é—á—ë–Ω FunPay-–∞–∫–∫–∞—É–Ω—Ç <b>{html.escape(account.username or '‚Äî')}</b> "
-            f"(<code>{account.id}</code>)."
-        )
-        await show_main(message, message.from_user.id)
-
-    @router.message(PlayerokConnectState.proxy, F.text)
-    async def accept_playerok_proxy(message: Message, state: FSMContext) -> None:
-        try:
-            proxy = normalize_proxy(message.text)
-            playerok_proxy_value(proxy)
-        except ValueError as exc:
-            await message.answer(f"‚ùå {html.escape(str(exc))}. –ü–æ–ø—Ä–æ–±—É–π—Ç–µ –µ—â—ë —Ä–∞–∑ –∏–ª–∏ /cancel.")
-            return
-        try:
-            await message.delete()
-        except TelegramBadRequest:
-            pass
-        await state.update_data(playerok_proxy=proxy)
-        data = await state.get_data()
-        if data.get("playerok_auth_method") == "email":
-            await state.set_state(PlayerokConnectState.email)
-            await message.answer(
-                "üîµ <b>Playerok ¬∑ —à–∞–≥ 2/3</b>\n\n"
-                "–û—Ç–ø—Ä–∞–≤—å—Ç–µ email, –ø—Ä–∏–≤—è–∑–∞–Ω–Ω—ã–π –∫ Playerok. –ë–æ—Ç –∑–∞–ø—Ä–æ—Å–∏—Ç –æ–¥–Ω–æ—Ä–∞–∑–æ–≤—ã–π –∫–æ–¥."
-            )
-        else:
-            await state.set_state(PlayerokConnectState.cookie)
-            await message.answer(
-                "üîµ <b>Playerok ¬∑ —à–∞–≥ 2/2</b>\n\n"
-                "–û—Ç–ø—Ä–∞–≤—å—Ç–µ –ø–æ–ª–Ω—ã–π –∑–∞–≥–æ–ª–æ–≤–æ–∫ cookie –∏–∑ –±—Ä–∞—É–∑–µ—Ä–∞, –Ω–∞–ø—Ä–∏–º–µ—Ä:\n"
-                "<code>__ddg5_=...; token=...</code>\n\n"
-                "–ú–æ–∂–Ω–æ –æ—Ç–ø—Ä–∞–≤–∏—Ç—å —Ç–æ–ª—å–∫–æ –∑–Ω–∞—á–µ–Ω–∏–µ <code>token</code>, –Ω–æ –ø—Ä–∏ –≤–∫–ª—é—á—ë–Ω–Ω–æ–π –∑–∞—â–∏—Ç–µ Playerok "
-                "–ø–æ–Ω–∞–¥–æ–±–∏—Ç—Å—è –ø–æ–ª–Ω—ã–π –Ω–∞–±–æ—Ä cookie. –°–æ–æ–±—â–µ–Ω–∏–µ –±—É–¥–µ—Ç —É–¥–∞–ª–µ–Ω–æ."
-            )
-
-    @router.message(PlayerokConnectState.cookie, F.text)
-    async def accept_playerok_cookie(message: Message, state: FSMContext) -> None:
-        cookie = message.text.strip()
-        try:
-            await message.delete()
-        except TelegramBadRequest:
-            pass
-        if not 16 <= len(cookie) <= 4096:
-            await message.answer("‚ùå Cookie –≤—ã–≥–ª—è–¥–∏—Ç –Ω–µ–∫–æ—Ä—Ä–µ–∫—Ç–Ω–æ. –û—Ç–ø—Ä–∞–≤—å—Ç–µ –µ–≥–æ —Å–Ω–æ–≤–∞ –∏–ª–∏ /cancel.")
-            return
-        data = await state.get_data()
-        proxy = data.get("playerok_proxy")
-        if not proxy:
-            await begin_playerok_connect(message, state)
-            return
-        wait_message = await message.answer("‚è≥ –ü—Ä–æ–≤–µ—Ä—è—é –ø—Ä–æ–∫—Å–∏ –∏ cookie Playerok‚Ä¶")
-        try:
-            account = create_playerok_account(cookie, proxy)
-            await asyncio.wait_for(asyncio.to_thread(account.get), timeout=50)
-        except Exception as exc:
-            logger.warning("–ü—Ä–æ–≤–µ—Ä–∫–∞ Playerok –Ω–µ –ø—Ä–æ–π–¥–µ–Ω–∞", exc_info=True)
-            await wait_message.edit_text(
-                "‚ùå Playerok –Ω–µ –ø—Ä–∏–Ω—è–ª –¥–∞–Ω–Ω—ã–µ. –ü—Ä–æ–≤–µ—Ä—å—Ç–µ, —á—Ç–æ cookie –∞–∫—Ç—É–∞–ª—å–Ω—ã, –ø—Ä–æ–∫—Å–∏ –∏–º–µ–µ—Ç —Ç–æ—Ç –∂–µ IP "
-                f"–∏ –∑–∞—â–∏—Ç–∞ –Ω–µ –∑–∞–ø—Ä–æ—Å–∏–ª–∞ –Ω–æ–≤—É—é __ddg5_.\n\n–û—à–∏–±–∫–∞: <code>{html.escape(clipped(exc, 500))}</code>"
-            )
-            return
-        try:
-            account_row = await db.save_playerok_account(
-                message.from_user.id,
-                secrets.encrypt(proxy),
-                secrets.encrypt(cookie),
-                account,
-            )
-            await manager.start_playerok(
-                message.from_user.id, row=account_row, account=account
-            )
-        except Exception:
-            logger.exception("–ü–æ–¥–∫–ª—é—á–µ–Ω–∏–µ Playerok –Ω–µ –∑–∞–≤–µ—Ä—à–µ–Ω–æ")
-            await wait_message.edit_text(
-                "‚ùå –ü–æ–¥–∫–ª—é—á–∏—Ç—å Playerok –Ω–µ —É–¥–∞–ª–æ—Å—å, –Ω–æ –±–æ—Ç –ø—Ä–æ–¥–æ–ª–∂–∞–µ—Ç —Ä–∞–±–æ—Ç–∞—Ç—å. "
-                "–ü—Ä–æ–≤–µ—Ä—å—Ç–µ –¥–∞–Ω–Ω—ã–µ –∏ –ø–æ–ø—Ä–æ–±—É–π—Ç–µ –µ—â—ë —Ä–∞–∑."
-            )
-            await state.clear()
-            return
-        await state.clear()
-        await wait_message.edit_text(
-            f"‚úÖ –ü–æ–¥–∫–ª—é—á—ë–Ω Playerok-–∞–∫–∫–∞—É–Ω—Ç <b>{html.escape(account.username or '‚Äî')}</b> "
-            f"(<code>{html.escape(str(account.id))}</code>)."
-        )
-        await show_main(message, message.from_user.id)
-
-    @router.message(PlayerokConnectState.email, F.text)
-    async def accept_playerok_email(message: Message, state: FSMContext) -> None:
-        email = message.text.strip().casefold()
-        try:
-            await message.delete()
-        except TelegramBadRequest:
-            pass
-        if not re.fullmatch(r"[^\s@]{1,128}@[^\s@.]{1,128}\.[^\s@]{2,63}", email):
-            await message.answer("‚ùå Email –≤—ã–≥–ª—è–¥–∏—Ç –Ω–µ–∫–æ—Ä—Ä–µ–∫—Ç–Ω–æ. –û—Ç–ø—Ä–∞–≤—å—Ç–µ –µ–≥–æ —Å–Ω–æ–≤–∞ –∏–ª–∏ /cancel.")
-            return
-        data = await state.get_data()
-        proxy = data.get("playerok_proxy")
-        if not proxy:
-            await begin_playerok_connect(message, state)
-            return
-        wait_message = await message.answer("‚è≥ –ó–∞–ø—Ä–∞—à–∏–≤–∞—é –∫–æ–¥ —É Playerok‚Ä¶")
-        try:
-            auth_cookie = await asyncio.wait_for(
-                asyncio.to_thread(request_playerok_email_code, email, proxy),
-                timeout=40,
-            )
-        except Exception as exc:
-            logger.warning("Playerok –Ω–µ –æ—Ç–ø—Ä–∞–≤–∏–ª email-–∫–æ–¥", exc_info=True)
-            await wait_message.edit_text(
-                "‚ùå Playerok –Ω–µ –ø—Ä–∏–Ω—è–ª –∑–∞–ø—Ä–æ—Å –∫–æ–¥–∞. –ü—Ä–æ–≤–µ—Ä—å—Ç–µ email –∏ –ø—Ä–æ–∫—Å–∏. "
-                "–ï—Å–ª–∏ Playerok –∑–∞–ø—Ä–æ—Å–∏–ª CAPTCHA, –∏—Å–ø–æ–ª—å–∑—É–π—Ç–µ –≤—Ö–æ–¥ –ø–æ cookie.\n\n"
-                f"–û—à–∏–±–∫–∞: <code>{html.escape(clipped(exc, 450))}</code>"
-            )
-            return
-        await state.update_data(
-            playerok_email=email,
-            playerok_auth_cookie=auth_cookie,
-        )
-        await state.set_state(PlayerokConnectState.code)
-        await wait_message.edit_text(
-            "üì® <b>Playerok ¬∑ —à–∞–≥ 3/3</b>\n\n"
-            "–ö–æ–¥ –æ—Ç–ø—Ä–∞–≤–ª–µ–Ω –Ω–∞ —É–∫–∞–∑–∞–Ω–Ω—É—é –ø–æ—á—Ç—É. –ü—Ä–∏—à–ª–∏—Ç–µ –µ–≥–æ –æ–¥–Ω–∏–º —Å–æ–æ–±—â–µ–Ω–∏–µ–º."
-        )
-
-    @router.message(PlayerokConnectState.code, F.text)
-    async def accept_playerok_email_code(message: Message, state: FSMContext) -> None:
-        code = re.sub(r"\s+", "", message.text)
-        try:
-            await message.delete()
-        except TelegramBadRequest:
-            pass
-        if not re.fullmatch(r"[A-Za-z0-9]{4,12}", code):
-            await message.answer("‚ùå –ö–æ–¥ –≤—ã–≥–ª—è–¥–∏—Ç –Ω–µ–∫–æ—Ä—Ä–µ–∫—Ç–Ω–æ. –û—Ç–ø—Ä–∞–≤—å—Ç–µ –µ–≥–æ —Å–Ω–æ–≤–∞ –∏–ª–∏ /cancel.")
-            return
-        data = await state.get_data()
-        proxy = data.get("playerok_proxy")
-        email = data.get("playerok_email")
-        auth_cookie = data.get("playerok_auth_cookie", "")
-        if not proxy or not email:
-            await begin_playerok_connect(message, state)
-            return
-        wait_message = await message.answer("‚è≥ –ü—Ä–æ–≤–µ—Ä—è—é –∫–æ–¥ –∏ –≤—Ö–æ–∂—É –≤ Playerok‚Ä¶")
-        try:
-            cookie, _viewer = await asyncio.wait_for(
-                asyncio.to_thread(
-                    verify_playerok_email_code,
-                    email,
-                    code,
-                    proxy,
-                    auth_cookie,
-                ),
-                timeout=45,
-            )
-            account = create_playerok_account(cookie, proxy)
-            await asyncio.wait_for(asyncio.to_thread(account.get), timeout=50)
-        except Exception as exc:
-            logger.warning("Playerok email-–∫–æ–¥ –Ω–µ –ø—Ä–∏–Ω—è—Ç", exc_info=True)
-            await wait_message.edit_text(
-                "‚ùå –ö–æ–¥ –Ω–µ –ø—Ä–∏–Ω—è—Ç –∏–ª–∏ Playerok –Ω–µ –≤—ã–¥–∞–ª —Å–µ—Å—Å–∏—é. –ó–∞–ø—Ä–æ—Å–∏—Ç–µ –Ω–æ–≤—ã–π –∫–æ–¥ —á–µ—Ä–µ–∑ /cancel –∏ /start "
-                "–ª–∏–±–æ –≤–æ–π–¥–∏—Ç–µ –ø–æ cookie.\n\n"
-                f"–û—à–∏–±–∫–∞: <code>{html.escape(clipped(exc, 450))}</code>"
-            )
-            return
-        try:
-            account_row = await db.save_playerok_account(
-                message.from_user.id,
-                secrets.encrypt(proxy),
-                secrets.encrypt(cookie),
-                account,
-                auth_method="email",
-            )
-            await manager.start_playerok(
-                message.from_user.id, row=account_row, account=account
-            )
-        except Exception:
-            logger.exception("–ü–æ–¥–∫–ª—é—á–µ–Ω–∏–µ Playerok –ø–æ email –Ω–µ –∑–∞–≤–µ—Ä—à–µ–Ω–æ")
-            await wait_message.edit_text(
-                "‚ùå –ü–æ–¥–∫–ª—é—á–∏—Ç—å Playerok –Ω–µ —É–¥–∞–ª–æ—Å—å, –Ω–æ –±–æ—Ç –ø—Ä–æ–¥–æ–ª–∂–∞–µ—Ç —Ä–∞–±–æ—Ç–∞—Ç—å. "
-                "–ü—Ä–æ–≤–µ—Ä—å—Ç–µ –¥–∞–Ω–Ω—ã–µ –∏ –ø–æ–ø—Ä–æ–±—É–π—Ç–µ –µ—â—ë —Ä–∞–∑."
-            )
-            await state.clear()
-            return
-        await state.clear()
-        await wait_message.edit_text(
-            f"‚úÖ –ü–æ email –ø–æ–¥–∫–ª—é—á—ë–Ω Playerok-–∞–∫–∫–∞—É–Ω—Ç <b>{html.escape(account.username or '‚Äî')}</b> "
-            f"(<code>{html.escape(str(account.id))}</code>)."
-        )
-        await show_main(message, message.from_user.id)
-
-    @router.callback_query(F.data == "marketplace_switch")
-    async def marketplace_switch(callback: CallbackQuery) -> None:
-        row = await db.get_user(callback.from_user.id)
-        if not row:
-            await callback.answer("–°–Ω–∞—á–∞–ª–∞ –≤—ã–±–µ—Ä–∏—Ç–µ –ø–ª–æ—â–∞–¥–∫—É", show_alert=True)
-            return
-        destination = "playerok" if row["active_marketplace"] == "funpay" else "funpay"
-        configured = bool(
-            await db.list_marketplace_accounts(callback.from_user.id, destination)
-        )
-        if not configured:
-            await callback.answer("–≠—Ç–∞ –ø–ª–æ—â–∞–¥–∫–∞ –µ—â—ë –Ω–µ –Ω–∞—Å—Ç—Ä–æ–µ–Ω–∞", show_alert=True)
-            await callback.message.answer(
-                f"–ü–æ–¥–∫–ª—é—á–∏—Ç–µ {'Playerok' if destination == 'playerok' else 'FunPay'}, —á—Ç–æ–±—ã –ø–µ—Ä–µ–∫–ª—é—á–∏—Ç—å—Å—è.",
-                reply_markup=keyboard([[(
-                    f"–ù–∞—Å—Ç—Ä–æ–∏—Ç—å {'Playerok' if destination == 'playerok' else 'FunPay'}",
-                    "connect_playerok" if destination == "playerok" else "connect_funpay",
-                )]]),
-            )
-            return
-        await db.set_active_marketplace(callback.from_user.id, destination)
-        await callback.answer("–ü–ª–æ—â–∞–¥–∫–∞ –ø–µ—Ä–µ–∫–ª—é—á–µ–Ω–∞")
-        await show_main(callback.message, callback.from_user.id)
-
-    async def show_account_switcher(
-        target: Message, user_id: int, marketplace: str
-    ) -> None:
-        accounts = await db.list_marketplace_accounts(user_id, marketplace)
-        row = await db.get_user(user_id)
-        active_id = int(
-            (row[
-                "active_funpay_account_id"
-                if marketplace == "funpay"
-                else "active_playerok_account_id"
-            ] if row else 0)
-            or 0
-        )
-        rows: list[list[tuple[str, str]]] = []
-        for account_row in accounts:
-            account_id = int(account_row["id"])
-            marker = "‚úÖ" if account_id == active_id else "‚ñ´Ô∏è"
-            status = (
-                account_id in manager.funpay_account_runtimes
-                if marketplace == "funpay"
-                else account_id in manager.playerok_account_runtimes
-            )
-            button_text = (
-                f"{marker} {'üü¢' if status else 'üî¥'} "
-                f"{clipped(account_row['label'], 30)} ¬∑ {account_row['external_id']}"
-            )
-            rows.append([(
-                button_text,
-                f"account_select:{marketplace}:{account_id}",
-            )])
-        rows.append([(
-            "‚ûï –î–æ–±–∞–≤–∏—Ç—å –∞–∫–∫–∞—É–Ω—Ç",
-            "connect_funpay" if marketplace == "funpay" else "connect_playerok",
-        )])
-        rows.append([(
-            "‚¨ÖÔ∏è –í –º–µ–Ω—é",
-            "menu",
-        )])
-        await target.answer(
-            f"üë• <b>–ê–∫–∫–∞—É–Ω—Ç—ã {'FunPay' if marketplace == 'funpay' else 'Playerok'}</b>\n\n"
-            "–ù–∞–∂–º–∏—Ç–µ –Ω–∞ –∞–∫–∫–∞—É–Ω—Ç, —á—Ç–æ–±—ã —Å–¥–µ–ª–∞—Ç—å –µ–≥–æ –∞–∫—Ç–∏–≤–Ω—ã–º. "
-            "–£–≤–µ–¥–æ–º–ª–µ–Ω–∏—è –ø—Ä–æ–¥–æ–ª–∂–∞—Ç –ø—Ä–∏—Ö–æ–¥–∏—Ç—å —Å–æ –≤—Å–µ—Ö –∑–∞–ø—É—â–µ–Ω–Ω—ã—Ö –∞–∫–∫–∞—É–Ω—Ç–æ–≤.",
-            reply_markup=keyboard(rows),
-        )
-
-    @router.callback_query(F.data.startswith("account_switch:"))
-    async def account_switch(callback: CallbackQuery) -> None:
-        marketplace = callback.data.split(":", 1)[1]
-        if marketplace not in {"funpay", "playerok"}:
-            await callback.answer("–ù–µ–∏–∑–≤–µ—Å—Ç–Ω–∞—è –ø–ª–æ—â–∞–¥–∫–∞", show_alert=True)
-            return
-        await callback.answer()
-        await show_account_switcher(
-            callback.message, callback.from_user.id, marketplace
-        )
-
-    @router.callback_query(F.data.startswith("account_select:"))
-    async def account_select(callback: CallbackQuery) -> None:
-        try:
-            _, marketplace, raw_account_id = callback.data.split(":", 2)
-            account_id = int(raw_account_id)
-        except (ValueError, TypeError):
-            await callback.answer("–ù–µ–∫–æ—Ä—Ä–µ–∫—Ç–Ω—ã–π –∞–∫–∫–∞—É–Ω—Ç", show_alert=True)
-            return
-        await callback.answer("–ü–µ—Ä–µ–∫–ª—é—á–∞—é‚Ä¶")
-        try:
-            runtime = await manager.activate_account(
-                callback.from_user.id, marketplace, account_id
-            )
-        except Exception as exc:
-            logger.exception("–ù–µ —É–¥–∞–ª–æ—Å—å –ø–µ—Ä–µ–∫–ª—é—á–∏—Ç—å –∞–∫–∫–∞—É–Ω—Ç")
-            await callback.message.answer(
-                f"‚ùå –ù–µ —É–¥–∞–ª–æ—Å—å –∞–∫—Ç–∏–≤–∏—Ä–æ–≤–∞—Ç—å –∞–∫–∫–∞—É–Ω—Ç: "
-                f"<code>{html.escape(clipped(exc, 450))}</code>"
-            )
-            return
-        await callback.message.answer(
-            f"‚úÖ –ê–∫—Ç–∏–≤–µ–Ω <b>{html.escape(runtime.account_label)}</b>."
-        )
-        await show_main(callback.message, callback.from_user.id)
-
-    @router.callback_query(F.data == "po_profile")
-    async def playerok_profile(callback: CallbackQuery) -> None:
-        await callback.answer("–ó–∞–≥—Ä—É–∂–∞—é‚Ä¶")
-        runtime = await require_playerok_runtime(callback.message, callback.from_user.id)
-        if not runtime:
-            return
-        try:
-            account = await asyncio.to_thread(runtime.account.get)
-            profile = account.profile
-        except Exception as exc:
-            logger.exception("–ù–µ —É–¥–∞–ª–æ—Å—å –ø–æ–ª—É—á–∏—Ç—å –ø—Ä–æ—Ñ–∏–ª—å Playerok")
-            await callback.message.answer(f"‚ùå Playerok –Ω–µ –æ—Ç–¥–∞–ª –ø—Ä–æ—Ñ–∏–ª—å: {html.escape(clipped(exc, 400))}")
-            return
-        stats = getattr(profile, "stats", None)
-        item_stats = getattr(stats, "items", None)
-        deal_stats = getattr(stats, "deals", None)
-        outgoing = getattr(deal_stats, "outgoing", None)
-        await callback.message.answer(
-            "üîµ <b>–ü—Ä–æ—Ñ–∏–ª—å Playerok</b>\n\n"
-            f"üë§ –ü–æ–ª—å–∑–æ–≤–∞—Ç–µ–ª—å: <b>{html.escape(account.username or '‚Äî')}</b>\n"
-            f"üÜî ID: <code>{html.escape(str(account.id))}</code>\n"
-            f"‚≠ê –†–µ–π—Ç–∏–Ω–≥: <b>{getattr(profile, 'rating', '‚Äî')}</b> ¬∑ –æ—Ç–∑—ã–≤–æ–≤: <b>{getattr(profile, 'reviews_count', 0)}</b>\n"
-            f"üì¢ –û–±—ä—è–≤–ª–µ–Ω–∏–π: <b>{getattr(item_stats, 'total', 0)}</b> ¬∑ –∑–∞–≤–µ—Ä—à–µ–Ω–æ: <b>{getattr(item_stats, 'finished', 0)}</b>\n"
-            f"üì¶ –ü—Ä–æ–¥–∞–∂: <b>{getattr(outgoing, 'total', 0)}</b> ¬∑ –∑–∞–≤–µ—Ä—à–µ–Ω–æ: <b>{getattr(outgoing, 'finished', 0)}</b>\n"
-            f"‚úÖ –í–µ—Ä–∏—Ñ–∏–∫–∞—Ü–∏—è: {bool_icon(bool(getattr(profile, 'is_verified', False)))}\n"
-            f"üì¢ –ú–æ–∂–Ω–æ –ø—É–±–ª–∏–∫–æ–≤–∞—Ç—å: {bool_icon(bool(account.can_publish_items))}\n"
-            f"üö´ –ë–ª–æ–∫–∏—Ä–æ–≤–∫–∞: {'‚ùå –µ—Å—Ç—å' if account.is_blocked else '‚úÖ –Ω–µ—Ç'}",
-            reply_markup=keyboard([[("üîÑ –û–±–Ω–æ–≤–∏—Ç—å", "po_profile"), ("‚¨ÖÔ∏è –ú–µ–Ω—é", "menu")]]),
-        )
-
-    @router.callback_query(F.data == "po_balance")
-    async def playerok_balance(callback: CallbackQuery) -> None:
-        await callback.answer("–ü—Ä–æ–≤–µ—Ä—è—é –±–∞–ª–∞–Ω—Å‚Ä¶")
-        runtime = await require_playerok_runtime(callback.message, callback.from_user.id)
-        if not runtime:
-            return
-        try:
-            account = await asyncio.to_thread(runtime.account.get)
-            balance = account.profile.balance
-        except Exception as exc:
-            logger.exception("–ù–µ —É–¥–∞–ª–æ—Å—å –ø–æ–ª—É—á–∏—Ç—å –±–∞–ª–∞–Ω—Å Playerok")
-            await callback.message.answer(f"‚ùå –ë–∞–ª–∞–Ω—Å –Ω–µ–¥–æ—Å—Ç—É–ø–µ–Ω: {html.escape(clipped(exc, 400))}")
-            return
-        await callback.message.answer(
-            "üîµ <b>–ë–∞–ª–∞–Ω—Å Playerok</b>\n\n"
-            f"üí∞ –í—Å–µ–≥–æ: <b>{format_money(balance.value)} ‚ÇΩ</b>\n"
-            f"‚úÖ –î–æ—Å—Ç—É–ø–Ω–æ: <b>{format_money(balance.available)} ‚ÇΩ</b>\n"
-            f"üè¶ –ú–æ–∂–Ω–æ –≤—ã–≤–µ—Å—Ç–∏: <b>{format_money(balance.withdrawable)} ‚ÇΩ</b>\n"
-            f"üßä –ó–∞–º–æ—Ä–æ–∂–µ–Ω–æ: <b>{format_money(balance.frozen)} ‚ÇΩ</b>\n"
-            f"‚è≥ –û–∂–∏–¥–∞–µ–º—ã–π –¥–æ—Ö–æ–¥: <b>{format_money(balance.pending_income)} ‚ÇΩ</b>",
-            reply_markup=keyboard([[("üîÑ –û–±–Ω–æ–≤–∏—Ç—å", "po_balance"), ("‚¨ÖÔ∏è –ú–µ–Ω—é", "menu")]]),
-        )
-
-    async def show_playerok_chat_carousel(target: Message, user_id: int, index: int) -> None:
-        runtime = await require_playerok_runtime(target, user_id)
-        if not runtime:
-            return
-        try:
-            page = await asyncio.to_thread(runtime.account.get_chats, count=24)
-            chats = list(getattr(page, "chats", []) or [])
-        except Exception as exc:
-            logger.exception("–ù–µ —É–¥–∞–ª–æ—Å—å –ø–æ–ª—É—á–∏—Ç—å —á–∞—Ç—ã Playerok")
-            await target.answer(f"‚ùå –ß–∞—Ç—ã –Ω–µ–¥–æ—Å—Ç—É–ø–Ω—ã: {html.escape(clipped(exc, 400))}")
-            return
-        if not chats:
-            await target.answer("–ß–∞—Ç–æ–≤ Playerok –ø–æ–∫–∞ –Ω–µ—Ç.", reply_markup=keyboard([[("‚¨ÖÔ∏è –ú–µ–Ω—é", "menu")]]))
-            return
-        index %= len(chats)
-        chat = chats[index]
-        message = getattr(chat, "last_message", None)
-        sender = getattr(message, "user", None)
-        author = getattr(sender, "username", None) or "‚Äî"
-        text = (
-            f"üí¨ <b>{html.escape(clipped(author, 160))}</b>\n"
-            f"–ß–∞—Ç: <code>{html.escape(str(chat.id))}</code> ¬∑ –Ω–µ–ø—Ä–æ—á–∏—Ç–∞–Ω–æ: <b>{getattr(chat, 'unread_messages_counter', 0)}</b>\n"
-            f"–ü–æ–∑–∏—Ü–∏—è: <b>{index + 1}/{len(chats)}</b>\n\n"
-            f"<pre>{html.escape(clipped(getattr(message, 'text', None) or '[–∏–∑–æ–±—Ä–∞–∂–µ–Ω–∏–µ / —Å–æ–±—ã—Ç–∏–µ]', 1700))}</pre>"
-        )
-        markup = keyboard([
-            [("‚¨ÖÔ∏è", f"po_chat_view:{(index - 1) % len(chats)}"), (f"{index + 1}/{len(chats)}", "noop"), ("‚û°Ô∏è", f"po_chat_view:{(index + 1) % len(chats)}")],
-            [("üìñ –û—Ç–∫—Ä—ã—Ç—å –¥–∏–∞–ª–æ–≥", f"po_chat_full:{chat.id}:{index}")],
-            [("‚Ü©Ô∏è –û—Ç–≤–µ—Ç–∏—Ç—å", f"po_reply:{chat.id}"), ("üì∑ –§–æ—Ç–æ", f"po_image:{chat.id}")],
-            [("‚úì –ü—Ä–æ—á–∏—Ç–∞—Ç—å", f"po_chat_read:{chat.id}"), ("‚¨ÖÔ∏è –ú–µ–Ω—é", "menu")],
-        ])
-        try:
-            await target.edit_text(text, reply_markup=markup)
-        except TelegramBadRequest:
-            await target.answer(text, reply_markup=markup)
-
-    @router.callback_query(F.data == "po_chats")
-    async def playerok_chats(callback: CallbackQuery) -> None:
-        await callback.answer("–ó–∞–≥—Ä—É–∂–∞—é‚Ä¶")
-        await show_playerok_chat_carousel(callback.message, callback.from_user.id, 0)
-
-    @router.callback_query(F.data.startswith("po_chat_view:"))
-    async def playerok_chat_view(callback: CallbackQuery) -> None:
-        await callback.answer()
-        await show_playerok_chat_carousel(
-            callback.message, callback.from_user.id, int(callback.data.split(":", 1)[1])
-        )
-
-    @router.callback_query(F.data.startswith("po_chat_full:"))
-    async def playerok_chat_full(callback: CallbackQuery) -> None:
-        await callback.answer("–ó–∞–≥—Ä—É–∂–∞—é –∏—Å—Ç–æ—Ä–∏—é‚Ä¶")
-        _, chat_id, raw_index = callback.data.split(":", 2)
-        runtime = await require_playerok_runtime(callback.message, callback.from_user.id)
-        if not runtime:
-            return
-        try:
-            messages: list[Any] = []
-            cursor = None
-            for _ in range(10):  # –ó–∞—â–∏—Ç–Ω—ã–π –ø—Ä–µ–¥–µ–ª: –¥–æ 240 —Å–æ–æ–±—â–µ–Ω–∏–π.
-                page = await asyncio.to_thread(
-                    runtime.account.get_chat_messages, chat_id, count=24, after_cursor=cursor
-                )
-                batch = list(getattr(page, "messages", []) or [])
-                messages.extend(batch)
-                page_info = getattr(page, "page_info", None)
-                cursor = getattr(page_info, "end_cursor", None)
-                if not batch or not getattr(page_info, "has_next_page", False) or not cursor:
-                    break
-        except Exception as exc:
-            logger.exception("–ù–µ —É–¥–∞–ª–æ—Å—å –∑–∞–≥—Ä—É–∑–∏—Ç—å —á–∞—Ç Playerok %s", chat_id)
-            await callback.message.answer(f"‚ùå –ò—Å—Ç–æ—Ä–∏—è –Ω–µ–¥–æ—Å—Ç—É–ø–Ω–∞: {html.escape(clipped(exc, 400))}")
-            return
-        lines = [f"üí¨ <b>–ß–∞—Ç Playerok</b> ¬∑ <code>{html.escape(chat_id)}</code>\n"]
-        for item in reversed(messages):
-            sender = getattr(item, "user", None)
-            author = getattr(sender, "username", None) or "–°–∏—Å—Ç–µ–º–∞"
-            own = str(getattr(sender, "id", "")) == str(runtime.account.id)
-            prefix = "–í—ã" if own else author
-            lines.append(
-                f"<b>{html.escape(clipped(prefix, 100))}</b>\n"
-                f"<pre>{html.escape(clipped(getattr(item, 'text', None) or '[–∏–∑–æ–±—Ä–∞–∂–µ–Ω–∏–µ / —Å–æ–±—ã—Ç–∏–µ]', 1200))}</pre>"
-            )
-        text = "\n".join(lines)
-        for part in [text[i:i + 3500] for i in range(0, len(text), 3500)] or ["–°–æ–æ–±—â–µ–Ω–∏–π –Ω–µ—Ç."]:
-            await callback.message.answer(part)
-        await callback.message.answer(
-            "–ü–æ–∫–∞–∑–∞–Ω–æ –¥–æ 240 –ø–æ—Å–ª–µ–¥–Ω–∏—Ö —Å–æ–æ–±—â–µ–Ω–∏–π ‚Äî —ç—Ç–æ –∑–∞—â–∏—Ç–Ω—ã–π –ø—Ä–µ–¥–µ–ª –¥–ª—è –¥–ª–∏–Ω–Ω—ã—Ö –¥–∏–∞–ª–æ–≥–æ–≤.",
-            reply_markup=keyboard([
-                [("‚Ü©Ô∏è –û—Ç–≤–µ—Ç–∏—Ç—å", f"po_reply:{chat_id}"), ("üì∑ –§–æ—Ç–æ", f"po_image:{chat_id}")],
-                [("‚¨ÖÔ∏è –ö —á–∞—Ç–∞–º", f"po_chat_view:{raw_index}")],
-            ]),
-        )
-
-    @router.callback_query(F.data.startswith("po_chat_read:"))
-    async def playerok_chat_read(callback: CallbackQuery) -> None:
-        chat_id = callback.data.split(":", 1)[1]
-        runtime = await require_playerok_runtime(callback.message, callback.from_user.id)
-        if not runtime:
-            return
-        try:
-            await asyncio.to_thread(runtime.account.mark_chat_as_read, chat_id)
-        except Exception as exc:  # noqa: BLE001 - PlayerokAPI exposes heterogeneous errors.
-            await callback.answer(f"–ù–µ —É–¥–∞–ª–æ—Å—å: {clipped(exc, 120)}", show_alert=True)
-            return
-        await callback.answer("–ß–∞—Ç –æ—Ç–º–µ—á–µ–Ω –ø—Ä–æ—á–∏—Ç–∞–Ω–Ω—ã–º")
-
-    @router.callback_query(F.data.startswith("po_reply:"))
-    async def playerok_reply(callback: CallbackQuery, state: FSMContext) -> None:
-        await callback.answer()
-        if not await require_playerok_runtime(callback.message, callback.from_user.id):
-            return
-        await state.clear()
-        await state.set_state(PlayerokChatState.text)
-        await state.update_data(playerok_chat_id=callback.data.split(":", 1)[1])
-        await callback.message.answer("–í–≤–µ–¥–∏—Ç–µ –æ—Ç–≤–µ—Ç –¥–æ 4000 —Å–∏–º–≤–æ–ª–æ–≤ –∏–ª–∏ /cancel.")
-
-    @router.message(PlayerokChatState.text, F.text)
-    async def playerok_reply_text(message: Message, state: FSMContext) -> None:
-        text = message.text.strip()
-        if not 1 <= len(text) <= 4000:
-            await message.answer("–°–æ–æ–±—â–µ–Ω–∏–µ –¥–æ–ª–∂–Ω–æ –±—ã—Ç—å –æ—Ç 1 –¥–æ 4000 —Å–∏–º–≤–æ–ª–æ–≤.")
-            return
-        runtime = await require_playerok_runtime(message, message.from_user.id)
-        if not runtime:
-            await state.clear()
-            return
-        chat_id = str((await state.get_data()).get("playerok_chat_id") or "")
-        if not chat_id:
-            await state.clear()
-            return
-        try:
-            await asyncio.to_thread(runtime.account.send_message, chat_id, text)
-        except Exception as exc:  # noqa: BLE001 - PlayerokAPI exposes heterogeneous errors.
-            await message.answer(f"‚ùå Playerok –Ω–µ –æ—Ç–ø—Ä–∞–≤–∏–ª —Å–æ–æ–±—â–µ–Ω–∏–µ: {html.escape(clipped(exc, 400))}")
-            return
-        await state.clear()
-        await message.answer(
-            "‚úÖ –°–æ–æ–±—â–µ–Ω–∏–µ –æ—Ç–ø—Ä–∞–≤–ª–µ–Ω–æ.",
-            reply_markup=keyboard([[("‚úçÔ∏è –ù–∞–ø–∏—Å–∞—Ç—å –µ—â—ë", f"po_reply:{chat_id}"), ("üí¨ –û—Ç–∫—Ä—ã—Ç—å —á–∞—Ç", f"po_chat_full:{chat_id}:0")]]),
-        )
-
-    @router.callback_query(F.data.startswith("po_image:"))
-    async def playerok_image(callback: CallbackQuery, state: FSMContext) -> None:
-        await callback.answer()
-        if not await require_playerok_runtime(callback.message, callback.from_user.id):
-            return
-        await state.clear()
-        await state.set_state(PlayerokChatState.image)
-        await state.update_data(playerok_chat_id=callback.data.split(":", 1)[1])
-        await callback.message.answer("–û—Ç–ø—Ä–∞–≤—å—Ç–µ —Ñ–æ—Ç–æ –∏–ª–∏ –∏–∑–æ–±—Ä–∞–∂–µ–Ω–∏–µ-—Ñ–∞–π–ª –¥–æ 20 –ú–ë. –î–ª—è –æ—Ç–º–µ–Ω—ã: /cancel")
-
-    @router.message(PlayerokChatState.image)
-    async def playerok_image_send(message: Message, state: FSMContext) -> None:
-        runtime = await require_playerok_runtime(message, message.from_user.id)
-        if not runtime:
-            await state.clear()
-            return
-        image = await download_telegram_image(message)
-        if image is None:
-            return
-        chat_id = str((await state.get_data()).get("playerok_chat_id") or "")
-        try:
-            await asyncio.to_thread(runtime.account.send_message, chat_id, None, [image])
-        except Exception as exc:  # noqa: BLE001 - PlayerokAPI exposes heterogeneous errors.
-            await message.answer(f"‚ùå –ù–µ —É–¥–∞–ª–æ—Å—å –æ—Ç–ø—Ä–∞–≤–∏—Ç—å –∏–∑–æ–±—Ä–∞–∂–µ–Ω–∏–µ: {html.escape(clipped(exc, 400))}")
-            return
-        await state.clear()
-        await message.answer("‚úÖ –ò–∑–æ–±—Ä–∞–∂–µ–Ω–∏–µ –æ—Ç–ø—Ä–∞–≤–ª–µ–Ω–æ.", reply_markup=keyboard([[("üí¨ –ß–∞—Ç", f"po_chat_full:{chat_id}:0")]]))
-
-    async def show_playerok_deals(target: Message, user_id: int) -> None:
-        runtime = await require_playerok_runtime(target, user_id)
-        if not runtime:
-            return
-        try:
-            page = await asyncio.to_thread(
-                runtime.account.get_deals, direction=PlayerokItemDealDirections.OUT, count=24
-            )
-            deals = list(getattr(page, "deals", []) or [])
-        except Exception as exc:  # noqa: BLE001 - PlayerokAPI may fail at the request/parser layer.
-            await target.answer(f"‚ùå –°–¥–µ–ª–∫–∏ –Ω–µ–¥–æ—Å—Ç—É–ø–Ω—ã: {html.escape(clipped(exc, 400))}")
-            return
-        rows = [[(
-            f"{getattr(getattr(deal, 'status', None), 'name', '‚Äî')} ¬∑ {clipped(getattr(getattr(deal, 'item', None), 'name', '‚Äî'), 26)}",
-            f"po_deal:{deal.id}",
-        )] for deal in deals]
-        rows.append([("‚¨ÖÔ∏è –ú–µ–Ω—é", "menu")])
-        await target.answer(
-            f"üì¶ <b>–ü—Ä–æ–¥–∞–∂–∏ Playerok</b>\n\n–ü–æ–∫–∞–∑–∞–Ω–æ: <b>{len(deals)}</b>.",
-            reply_markup=keyboard(rows),
-        )
-
-    @router.callback_query(F.data == "po_deals")
-    async def playerok_deals(callback: CallbackQuery) -> None:
-        await callback.answer("–ó–∞–≥—Ä—É–∂–∞—é‚Ä¶")
-        await show_playerok_deals(callback.message, callback.from_user.id)
-
-    async def show_playerok_deal(target: Message, user_id: int, deal_id: str) -> None:
-        runtime = await require_playerok_runtime(target, user_id)
-        if not runtime:
-            return
-        try:
-            deal = await asyncio.to_thread(runtime.account.get_deal, deal_id)
-        except Exception as exc:  # noqa: BLE001 - PlayerokAPI exposes heterogeneous errors.
-            await target.answer(f"‚ùå –°–¥–µ–ª–∫–∞ –Ω–µ–¥–æ—Å—Ç—É–ø–Ω–∞: {html.escape(clipped(exc, 400))}")
-            return
-        item = getattr(deal, "item", None)
-        buyer = getattr(deal, "user", None)
-        chat = getattr(deal, "chat", None)
-        status = getattr(getattr(deal, "status", None), "name", "‚Äî")
-        rows = []
-        if status in {"PENDING", "PAID"}:
-            rows.append([("‚úÖ –û—Ç–º–µ—Ç–∏—Ç—å –≤—ã–ø–æ–ª–Ω–µ–Ω–Ω—ã–º", f"po_deal_sent_ask:{deal_id}")])
-        if getattr(chat, "id", None):
-            rows.append([("üí¨ –û—Ç–∫—Ä—ã—Ç—å —á–∞—Ç", f"po_chat_full:{chat.id}:0")])
-        rows.append([("‚¨ÖÔ∏è –°–¥–µ–ª–∫–∏", "po_deals")])
-        await target.answer(
-            "üì¶ <b>–°–¥–µ–ª–∫–∞ Playerok</b>\n\n"
-            f"ID: <code>{html.escape(str(deal.id))}</code>\n"
-            f"–°—Ç–∞—Ç—É—Å: <b>{html.escape(status)}</b>\n"
-            f"–ü–æ–∫—É–ø–∞—Ç–µ–ª—å: <b>{html.escape(clipped(getattr(buyer, 'username', '‚Äî'), 160))}</b>\n"
-            f"–û–±—ä—è–≤–ª–µ–Ω–∏–µ: <b>{html.escape(clipped(getattr(item, 'name', '‚Äî'), 700))}</b>\n"
-            f"–¶–µ–Ω–∞: <b>{format_money(getattr(item, 'price', 0))} ‚ÇΩ</b>\n"
-            f"–ö–æ–º–º–µ–Ω—Ç–∞—Ä–∏–π: <pre>{html.escape(clipped(getattr(deal, 'comment_from_buyer', None) or '‚Äî', 1200))}</pre>",
-            reply_markup=keyboard(rows),
-        )
-
-    @router.callback_query(F.data.startswith("po_deal:"))
-    async def playerok_deal(callback: CallbackQuery) -> None:
-        await callback.answer()
-        await show_playerok_deal(callback.message, callback.from_user.id, callback.data.split(":", 1)[1])
-
-    @router.callback_query(F.data.startswith("po_deal_sent_ask:"))
-    async def playerok_deal_sent_ask(callback: CallbackQuery) -> None:
-        deal_id = callback.data.split(":", 1)[1]
-        await callback.answer()
-        await callback.message.answer(
-            "–û—Ç–º–µ—Ç–∏—Ç—å —Å–¥–µ–ª–∫—É –≤—ã–ø–æ–ª–Ω–µ–Ω–Ω–æ–π? –≠—Ç–æ –¥–µ–π—Å—Ç–≤–∏–µ –º–µ–Ω—è–µ—Ç —Å—Ç–∞—Ç—É—Å —Å–¥–µ–ª–∫–∏ –Ω–∞ Playerok.",
-            reply_markup=keyboard([[("–î–∞, –≤—ã–ø–æ–ª–Ω–∏—Ç—å", f"po_deal_sent:{deal_id}"), ("–û—Ç–º–µ–Ω–∞", f"po_deal:{deal_id}")]]),
-        )
-
-    @router.callback_query(F.data.startswith("po_deal_sent:"))
-    async def playerok_deal_sent(callback: CallbackQuery) -> None:
-        deal_id = callback.data.split(":", 1)[1]
-        runtime = await require_playerok_runtime(callback.message, callback.from_user.id)
-        if not runtime or PlayerokItemDealStatuses is None:
-            return
-        try:
-            await asyncio.to_thread(runtime.account.update_deal, deal_id, PlayerokItemDealStatuses.SENT)
-        except Exception as exc:  # noqa: BLE001 - Playerok may reject a status transition.
-            await callback.answer(f"–ù–µ —É–¥–∞–ª–æ—Å—å: {clipped(exc, 120)}", show_alert=True)
-            return
-        await callback.answer("–°–¥–µ–ª–∫–∞ –æ—Ç–º–µ—á–µ–Ω–∞ –≤—ã–ø–æ–ª–Ω–µ–Ω–Ω–æ–π")
-        await show_playerok_deal(callback.message, callback.from_user.id, deal_id)
-
-    async def show_playerok_autoreply(target: Message, user_id: int) -> None:
-        row = await db.get_user(user_id)
-        await target.answer(
-            "ü§ñ <b>–ê–≤—Ç–æ–æ—Ç–≤–µ—Ç—á–∏–∫ Playerok</b>\n\n"
-            f"–†–∞–±–æ—á–µ–µ –≤—Ä–µ–º—è: <b>{row['playerok_autoreply_work_start']:02d}:00‚Äì{row['playerok_autoreply_work_end']:02d}:00</b>\n"
-            f"–ó–∞–¥–µ—Ä–∂–∫–∞: <b>{row['playerok_autoreply_delay_seconds']} —Å–µ–∫.</b> ¬∑ –ø–æ–≤—Ç–æ—Ä: <b>{row['playerok_autoreply_cooldown_minutes']} –º–∏–Ω.</b>\n\n"
-            f"–¢–µ–∫—Å—Ç:\n<pre>{html.escape(clipped(row['playerok_autoreply_text'], 1200))}</pre>",
-            reply_markup=keyboard([
-                [(f"{bool_icon(row['playerok_autoreply_enabled'])} –í–∫–ª—é—á—ë–Ω", "po_toggle:playerok_autoreply_enabled")],
-                [("‚úèÔ∏è –¢–µ–∫—Å—Ç", "po_ar_text"), ("‚å®Ô∏è –ö–æ–º–∞–Ω–¥—ã", "po_commands")],
-                [("‚è± –ó–∞–¥–µ—Ä–∂–∫–∞", "po_ar_delay"), ("üîÅ –ò–Ω—Ç–µ—Ä–≤–∞–ª", "po_ar_cooldown")],
-                [("üïí –†–∞–±–æ—á–µ–µ –≤—Ä–µ–º—è", "po_ar_hours")],
-                [("‚¨ÖÔ∏è –ú–µ–Ω—é", "menu")],
-            ]),
-        )
-
-    @router.callback_query(F.data == "po_autoreply")
-    async def playerok_autoreply(callback: CallbackQuery) -> None:
-        await callback.answer()
-        await show_playerok_autoreply(callback.message, callback.from_user.id)
-
-    @router.callback_query(F.data == "po_ar_text")
-    async def playerok_autoreply_text(callback: CallbackQuery, state: FSMContext) -> None:
-        await callback.answer()
-        await state.clear()
-        await state.set_state(PlayerokAutoReplyState.text)
-        await callback.message.answer("–û—Ç–ø—Ä–∞–≤—å—Ç–µ —Ç–µ–∫—Å—Ç –∞–≤—Ç–æ–æ—Ç–≤–µ—Ç–∞ –¥–æ 1500 —Å–∏–º–≤–æ–ª–æ–≤ –∏–ª–∏ /cancel.")
-
-    @router.message(PlayerokAutoReplyState.text, F.text)
-    async def playerok_autoreply_text_save(message: Message, state: FSMContext) -> None:
-        text = message.text.strip()
-        if not 1 <= len(text) <= 1500:
-            await message.answer("–¢–µ–∫—Å—Ç –¥–æ–ª–∂–µ–Ω –±—ã—Ç—å –æ—Ç 1 –¥–æ 1500 —Å–∏–º–≤–æ–ª–æ–≤.")
-            return
-        await db.set_playerok_autoreply_text(message.from_user.id, text)
-        await state.clear()
-        await show_playerok_autoreply(message, message.from_user.id)
-
-    @router.callback_query(F.data.in_({"po_ar_delay", "po_ar_cooldown"}))
-    async def playerok_autoreply_number(callback: CallbackQuery, state: FSMContext) -> None:
-        await callback.answer()
-        await state.clear()
-        is_delay = callback.data == "po_ar_delay"
-        await state.set_state(PlayerokAutoReplyState.delay if is_delay else PlayerokAutoReplyState.cooldown)
-        await callback.message.answer(
-            "–í–≤–µ–¥–∏—Ç–µ –∑–∞–¥–µ—Ä–∂–∫—É –æ—Ç 0 –¥–æ 300 —Å–µ–∫—É–Ω–¥." if is_delay else "–í–≤–µ–¥–∏—Ç–µ –∏–Ω—Ç–µ—Ä–≤–∞–ª –æ—Ç 0 –¥–æ 1440 –º–∏–Ω—É—Ç."
-        )
-
-    @router.message(PlayerokAutoReplyState.delay, F.text)
-    async def playerok_autoreply_delay_save(message: Message, state: FSMContext) -> None:
-        value = message.text.strip()
-        if not value.isdigit() or not 0 <= int(value) <= 300:
-            await message.answer("–í–≤–µ–¥–∏—Ç–µ —Ü–µ–ª–æ–µ —á–∏—Å–ª–æ –æ—Ç 0 –¥–æ 300.")
-            return
-        await db.set_integer_setting(message.from_user.id, "playerok_autoreply_delay_seconds", int(value))
-        await state.clear()
-        await show_playerok_autoreply(message, message.from_user.id)
-
-    @router.message(PlayerokAutoReplyState.cooldown, F.text)
-    async def playerok_autoreply_cooldown_save(message: Message, state: FSMContext) -> None:
-        value = message.text.strip()
-        if not value.isdigit() or not 0 <= int(value) <= 1440:
-            await message.answer("–í–≤–µ–¥–∏—Ç–µ —Ü–µ–ª–æ–µ —á–∏—Å–ª–æ –æ—Ç 0 –¥–æ 1440.")
-            return
-        await db.set_integer_setting(message.from_user.id, "playerok_autoreply_cooldown_minutes", int(value))
-        await state.clear()
-        await show_playerok_autoreply(message, message.from_user.id)
-
-    @router.callback_query(F.data == "po_ar_hours")
-    async def playerok_autoreply_hours(callback: CallbackQuery, state: FSMContext) -> None:
-        await callback.answer()
-        await state.clear()
-        await state.set_state(PlayerokAutoReplyState.hours)
-        await callback.message.answer("–í–≤–µ–¥–∏—Ç–µ —Ä–∞–±–æ—á–µ–µ –≤—Ä–µ–º—è –≤ —Ñ–æ—Ä–º–∞—Ç–µ <code>9-22</code> –∏–ª–∏ <code>0-24</code>.")
-
-    @router.message(PlayerokAutoReplyState.hours, F.text)
-    async def playerok_autoreply_hours_save(message: Message, state: FSMContext) -> None:
-        match = re.fullmatch(r"\s*(\d{1,2})\s*[-:]\s*(\d{1,2})\s*", message.text)
-        if not match:
-            await message.answer("–ò—Å–ø–æ–ª—å–∑—É–π—Ç–µ —Ñ–æ—Ä–º–∞—Ç 9-22 –∏–ª–∏ 0-24.")
-            return
-        start, end = map(int, match.groups())
-        if not 0 <= start <= 23 or not 1 <= end <= 24 or start == end:
-            await message.answer("–ù–∞—á–∞–ª–æ: 0‚Äì23, –æ–∫–æ–Ω—á–∞–Ω–∏–µ: 1‚Äì24; –∑–Ω–∞—á–µ–Ω–∏—è –Ω–µ –¥–æ–ª–∂–Ω—ã —Å–æ–≤–ø–∞–¥–∞—Ç—å.")
-            return
-        await db.set_integer_setting(message.from_user.id, "playerok_autoreply_work_start", start)
-        await db.set_integer_setting(message.from_user.id, "playerok_autoreply_work_end", end)
-        await state.clear()
-        await show_playerok_autoreply(message, message.from_user.id)
-
-    async def show_playerok_commands(target: Message, user_id: int) -> None:
-        items = await db.list_playerok_command_replies(user_id)
-        rows = [[(
-            f"{'‚úÖ' if item['enabled'] else '‚ùå'} {clipped(item['trigger'], 35)}",
-            f"po_command:{item['id']}",
-        )] for item in items[:50]]
-        rows.extend([[("‚ûï –î–æ–±–∞–≤–∏—Ç—å", "po_command_add")], [("‚¨ÖÔ∏è –ê–≤—Ç–æ–æ—Ç–≤–µ—Ç—á–∏–∫", "po_autoreply")]])
-        await target.answer(
-            "‚å®Ô∏è <b>–ö–æ–º–∞–Ω–¥—ã Playerok</b>\n\n"
-            "–û—Ç–≤–µ—Ç –æ—Ç–ø—Ä–∞–≤–ª—è–µ—Ç—Å—è, –∫–æ–≥–¥–∞ —Å–æ–æ–±—â–µ–Ω–∏–µ –ø–æ–∫—É–ø–∞—Ç–µ–ª—è –ø–æ–ª–Ω–æ—Å—Ç—å—é —Å–æ–≤–ø–∞–¥–∞–µ—Ç —Å –∫–æ–º–∞–Ω–¥–æ–π –±–µ–∑ —É—á—ë—Ç–∞ —Ä–µ–≥–∏—Å—Ç—Ä–∞.",
-            reply_markup=keyboard(rows),
-        )
-
-    @router.callback_query(F.data == "po_commands")
-    async def playerok_commands(callback: CallbackQuery) -> None:
-        await callback.answer()
-        await show_playerok_commands(callback.message, callback.from_user.id)
-
-    @router.callback_query(F.data == "po_command_add")
-    async def playerok_command_add(callback: CallbackQuery, state: FSMContext) -> None:
-        await callback.answer()
-        await state.clear()
-        await state.set_state(PlayerokCommandState.trigger)
-        await callback.message.answer("–û—Ç–ø—Ä–∞–≤—å—Ç–µ –∫–æ–º–∞–Ω–¥—É –¥–æ 100 —Å–∏–º–≤–æ–ª–æ–≤, –Ω–∞–ø—Ä–∏–º–µ—Ä <code>#status</code>.")
-
-    @router.message(PlayerokCommandState.trigger, F.text)
-    async def playerok_command_trigger(message: Message, state: FSMContext) -> None:
-        trigger = message.text.casefold().strip()
-        if not 1 <= len(trigger) <= 100 or "\n" in trigger:
-            await message.answer("–ö–æ–º–∞–Ω–¥–∞ –¥–æ–ª–∂–Ω–∞ –±—ã—Ç—å –æ–¥–Ω–æ–π —Å—Ç—Ä–æ–∫–æ–π –æ—Ç 1 –¥–æ 100 —Å–∏–º–≤–æ–ª–æ–≤.")
-            return
-        await state.update_data(playerok_command_trigger=trigger)
-        await state.set_state(PlayerokCommandState.response)
-        await message.answer("–¢–µ–ø–µ—Ä—å –æ—Ç–ø—Ä–∞–≤—å—Ç–µ –æ—Ç–≤–µ—Ç –¥–æ 3000 —Å–∏–º–≤–æ–ª–æ–≤.")
-
-    @router.message(PlayerokCommandState.response, F.text)
-    async def playerok_command_response(message: Message, state: FSMContext) -> None:
-        response = message.text.strip()
-        trigger = (await state.get_data()).get("playerok_command_trigger")
-        if not trigger or not 1 <= len(response) <= 3000:
-            await message.answer("–û—Ç–≤–µ—Ç –¥–æ–ª–∂–µ–Ω –±—ã—Ç—å –æ—Ç 1 –¥–æ 3000 —Å–∏–º–≤–æ–ª–æ–≤.")
-            return
-        item = await db.save_playerok_command_reply(message.from_user.id, trigger, response)
-        await state.clear()
-        await show_playerok_command(message, message.from_user.id, int(item["id"]))
-
-    async def show_playerok_command(target: Message, user_id: int, reply_id: int) -> None:
-        item = await db.get_playerok_command_reply(user_id, reply_id)
-        if not item:
-            await target.answer("–ö–æ–º–∞–Ω–¥–∞ –Ω–µ –Ω–∞–π–¥–µ–Ω–∞.")
-            return
-        await target.answer(
-            f"‚å®Ô∏è <b>{html.escape(item['trigger'])}</b>\n\n"
-            f"–°–æ—Å—Ç–æ—è–Ω–∏–µ: {bool_icon(item['enabled'])}\n\n<pre>{html.escape(clipped(item['response'], 2200))}</pre>",
-            reply_markup=keyboard([
-                [("–í—ã–∫–ª—é—á–∏—Ç—å" if item["enabled"] else "–í–∫–ª—é—á–∏—Ç—å", f"po_command_toggle:{reply_id}")],
-                [("üóë –£–¥–∞–ª–∏—Ç—å", f"po_command_delete_ask:{reply_id}")],
-                [("‚¨ÖÔ∏è –ö–æ–º–∞–Ω–¥—ã", "po_commands")],
-            ]),
-        )
-
-    @router.callback_query(F.data.startswith("po_command:"))
-    async def playerok_command(callback: CallbackQuery) -> None:
-        await callback.answer()
-        await show_playerok_command(callback.message, callback.from_user.id, int(callback.data.split(":", 1)[1]))
-
-    @router.callback_query(F.data.startswith("po_command_toggle:"))
-    async def playerok_command_toggle(callback: CallbackQuery) -> None:
-        reply_id = int(callback.data.split(":", 1)[1])
-        await db.toggle_playerok_command_reply(callback.from_user.id, reply_id)
-        await callback.answer("–°–æ—Ö—Ä–∞–Ω–µ–Ω–æ")
-        await show_playerok_command(callback.message, callback.from_user.id, reply_id)
-
-    @router.callback_query(F.data.startswith("po_command_delete_ask:"))
-    async def playerok_command_delete_ask(callback: CallbackQuery) -> None:
-        reply_id = int(callback.data.split(":", 1)[1])
-        await callback.answer()
-        await callback.message.answer(
-            "–£–¥–∞–ª–∏—Ç—å –∫–æ–º–∞–Ω–¥—É –±–µ–∑ –≤–æ–∑–º–æ–∂–Ω–æ—Å—Ç–∏ –≤–æ—Å—Å—Ç–∞–Ω–æ–≤–ª–µ–Ω–∏—è?",
-            reply_markup=keyboard([[("–î–∞, —É–¥–∞–ª–∏—Ç—å", f"po_command_delete:{reply_id}"), ("–û—Ç–º–µ–Ω–∞", f"po_command:{reply_id}")]]),
-        )
-
-    @router.callback_query(F.data.startswith("po_command_delete:"))
-    async def playerok_command_delete(callback: CallbackQuery) -> None:
-        reply_id = int(callback.data.split(":", 1)[1])
-        await db.delete_playerok_command_reply(callback.from_user.id, reply_id)
-        await callback.answer("–ö–æ–º–∞–Ω–¥–∞ —É–¥–∞–ª–µ–Ω–∞")
-        await show_playerok_commands(callback.message, callback.from_user.id)
-
-    async def show_playerok_delivery(target: Message, user_id: int) -> None:
-        runtime = await require_playerok_runtime(target, user_id)
-        if not runtime:
-            return
-        row = await db.get_user(user_id)
-        rules = await db.list_playerok_delivery_rules(user_id)
-        rows = [[(
-            f"{'‚úÖ' if rule['enabled'] else '‚ùå'} {clipped(rule['item_title'], 28)} ¬∑ {len(rule['products'])}",
-            f"po_delivery_rule:{rule['id']}",
-        )] for rule in rules[:30]]
-        rows.extend([
-            [("‚ûï –î–æ–±–∞–≤–∏—Ç—å –∏–∑ –æ–±—ä—è–≤–ª–µ–Ω–∏–π", "po_delivery_add")],
-            [(f"{bool_icon(row['playerok_auto_delivery_enabled'])} –ê–≤—Ç–æ–≤—ã–¥–∞—á–∞", "po_toggle:playerok_auto_delivery_enabled")],
-            [(f"{bool_icon(row['playerok_auto_confirm_enabled'])} –û—Ç–º–µ—á–∞—Ç—å –≤—ã–ø–æ–ª–Ω–µ–Ω–Ω—ã–º", "po_toggle:playerok_auto_confirm_enabled")],
-            [(f"{bool_icon(row['playerok_notify_delivery'])} –£–≤–µ–¥–æ–º–ª—è—Ç—å", "po_toggle:playerok_notify_delivery")],
-            [("‚¨ÖÔ∏è –ú–µ–Ω—é", "menu")],
-        ])
-        await target.answer(
-            "üì§ <b>–ê–≤—Ç–æ–≤—ã–¥–∞—á–∞ Playerok</b>\n\n"
-            "–ü—Ä–∞–≤–∏–ª–æ –ø—Ä–∏–≤—è–∑–∞–Ω–æ –∫ –æ–¥–Ω–æ–º—É –æ–±—ä—è–≤–ª–µ–Ω–∏—é. –í —à–∞–±–ª–æ–Ω–µ –∏—Å–ø–æ–ª—å–∑—É–π—Ç–µ <code>$product</code>, "
-            "—á—Ç–æ–±—ã –≤—ã–¥–∞—Ç—å –æ–¥–Ω—É —Å—Ç—Ä–æ–∫—É –∑–∞–ø–∞—Å–∞. –í–∫–ª—é—á–µ–Ω–∏–µ ¬´–û—Ç–º–µ—á–∞—Ç—å –≤—ã–ø–æ–ª–Ω–µ–Ω–Ω—ã–º¬ª –ø–µ—Ä–µ–≤–æ–¥–∏—Ç —Å–¥–µ–ª–∫—É –≤ "
-            "<code>SENT</code> —Ç–æ–ª—å–∫–æ –ø–æ—Å–ª–µ —É—Å–ø–µ—à–Ω–æ–π –≤—ã–¥–∞—á–∏.",
-            reply_markup=keyboard(rows),
-        )
-
-    @router.callback_query(F.data == "po_delivery")
-    async def playerok_delivery(callback: CallbackQuery) -> None:
-        await callback.answer()
-        await show_playerok_delivery(callback.message, callback.from_user.id)
-
-    @router.callback_query(F.data == "po_delivery_add")
-    async def playerok_delivery_add(callback: CallbackQuery) -> None:
-        runtime = await require_playerok_runtime(callback.message, callback.from_user.id)
-        if not runtime or PlayerokItemStatuses is None:
-            return
-        await callback.answer("–ü–æ–ª—É—á–∞—é –æ–±—ä—è–≤–ª–µ–Ω–∏—è‚Ä¶")
-        try:
-            page = await asyncio.to_thread(
-                runtime.account.get_my_items, statuses=list(PlayerokItemStatuses), count=24
-            )
-            items = list(getattr(page, "items", []) or [])
-        except Exception as exc:  # noqa: BLE001 - PlayerokAPI may fail at the request/parser layer.
-            await callback.message.answer(f"‚ùå –ù–µ —É–¥–∞–ª–æ—Å—å –∑–∞–≥—Ä—É–∑–∏—Ç—å –æ–±—ä—è–≤–ª–µ–Ω–∏—è: {html.escape(clipped(exc, 400))}")
-            return
-        rows = [[(clipped(item.name, 38), f"po_delivery_pick:{item.id}")] for item in items]
-        rows.append([("‚¨ÖÔ∏è –ê–≤—Ç–æ–≤—ã–¥–∞—á–∞", "po_delivery")])
-        await callback.message.answer("–í—ã–±–µ—Ä–∏—Ç–µ –æ–±—ä—è–≤–ª–µ–Ω–∏–µ –¥–ª—è –∞–≤—Ç–æ–≤—ã–¥–∞—á–∏:", reply_markup=keyboard(rows))
-
-    @router.callback_query(F.data.startswith("po_delivery_pick:"))
-    async def playerok_delivery_pick(callback: CallbackQuery, state: FSMContext) -> None:
-        item_id = callback.data.split(":", 1)[1]
-        runtime = await require_playerok_runtime(callback.message, callback.from_user.id)
-        if not runtime:
-            return
-        try:
-            item = await asyncio.to_thread(runtime.account.get_item, id=item_id)
-        except Exception as exc:  # noqa: BLE001 - PlayerokAPI exposes heterogeneous errors.
-            await callback.answer(f"–ù–µ —É–¥–∞–ª–æ—Å—å: {clipped(exc, 120)}", show_alert=True)
-            return
-        await callback.answer()
-        await state.clear()
-        await state.set_state(PlayerokDeliveryState.response)
-        await state.update_data(playerok_delivery_item_id=item_id, playerok_delivery_item_title=item.name)
-        await callback.message.answer(
-            f"–û–±—ä—è–≤–ª–µ–Ω–∏–µ: <b>{html.escape(clipped(item.name, 800))}</b>\n\n"
-            "–û—Ç–ø—Ä–∞–≤—å—Ç–µ —à–∞–±–ª–æ–Ω –≤—ã–¥–∞—á–∏ –¥–æ 3000 —Å–∏–º–≤–æ–ª–æ–≤. –ò—Å–ø–æ–ª—å–∑—É–π—Ç–µ <code>$product</code> –¥–ª—è —Å—Ç—Ä–æ–∫ –∏–∑ –∑–∞–ø–∞—Å–∞."
-        )
-
-    @router.message(PlayerokDeliveryState.response, F.text)
-    async def playerok_delivery_response(message: Message, state: FSMContext) -> None:
-        response = message.text.strip()
-        data = await state.get_data()
-        if not 1 <= len(response) <= 3000:
-            await message.answer("–®–∞–±–ª–æ–Ω –¥–æ–ª–∂–µ–Ω –±—ã—Ç—å –æ—Ç 1 –¥–æ 3000 —Å–∏–º–≤–æ–ª–æ–≤.")
-            return
-        rule_id = data.get("playerok_delivery_rule_id")
-        if rule_id:
-            rule = await db.get_playerok_delivery_rule(message.from_user.id, int(rule_id))
-            if not rule:
-                await state.clear()
-                await message.answer("–ü—Ä–∞–≤–∏–ª–æ –Ω–µ –Ω–∞–π–¥–µ–Ω–æ.")
-                return
-            saved = await db.save_playerok_delivery_rule(message.from_user.id, rule["item_id"], rule["item_title"], response)
-        else:
-            item_id = data.get("playerok_delivery_item_id")
-            title = data.get("playerok_delivery_item_title")
-            if not item_id or not title:
-                await state.clear()
-                await message.answer("–°–µ—Å—Å–∏—è –Ω–∞—Å—Ç—Ä–æ–π–∫–∏ –∏—Å—Ç–µ–∫–ª–∞.")
-                return
-            saved = await db.save_playerok_delivery_rule(message.from_user.id, item_id, title, response)
-        await state.clear()
-        await show_playerok_delivery_rule(message, message.from_user.id, int(saved["id"]))
-
-    async def show_playerok_delivery_rule(target: Message, user_id: int, rule_id: int) -> None:
-        rule = await db.get_playerok_delivery_rule(user_id, rule_id)
-        if not rule:
-            await target.answer("–ü—Ä–∞–≤–∏–ª–æ –Ω–µ –Ω–∞–π–¥–µ–Ω–æ.")
-            return
-        stock = list(rule["products"] or [])
-        await target.answer(
-            f"üì¶ <b>{html.escape(clipped(rule['item_title'], 900))}</b>\n\n"
-            f"ID –æ–±—ä—è–≤–ª–µ–Ω–∏—è: <code>{html.escape(rule['item_id'])}</code>\n"
-            f"–°–æ—Å—Ç–æ—è–Ω–∏–µ: {bool_icon(rule['enabled'])} ¬∑ –∑–∞–ø–∞—Å: <b>{len(stock)}</b>\n"
-            f"–®–∞–±–ª–æ–Ω:\n<pre>{html.escape(clipped(rule['response'], 1600))}</pre>"
-            + (f"\n–ü–µ—Ä–≤—ã–µ —Ç–æ–≤–∞—Ä—ã:\n<pre>{html.escape(chr(10).join(stock[:5]))}</pre>" if stock else ""),
-            reply_markup=keyboard([
-                [("‚ûï –î–æ–±–∞–≤–∏—Ç—å —Ç–æ–≤–∞—Ä—ã", f"po_delivery_stock:{rule_id}"), ("‚úèÔ∏è –®–∞–±–ª–æ–Ω", f"po_delivery_edit:{rule_id}")],
-                [("üßπ –û—á–∏—Å—Ç–∏—Ç—å –∑–∞–ø–∞—Å", f"po_delivery_clear_ask:{rule_id}")],
-                [("–í—ã–∫–ª—é—á–∏—Ç—å" if rule["enabled"] else "–í–∫–ª—é—á–∏—Ç—å", f"po_delivery_toggle:{rule_id}")],
-                [("üóë –£–¥–∞–ª–∏—Ç—å", f"po_delivery_delete_ask:{rule_id}")],
-                [("‚¨ÖÔ∏è –ê–≤—Ç–æ–≤—ã–¥–∞—á–∞", "po_delivery")],
-            ]),
-        )
-
-    @router.callback_query(F.data.startswith("po_delivery_rule:"))
-    async def playerok_delivery_rule(callback: CallbackQuery) -> None:
-        await callback.answer()
-        await show_playerok_delivery_rule(callback.message, callback.from_user.id, int(callback.data.split(":", 1)[1]))
-
-    @router.callback_query(F.data.startswith("po_delivery_stock:"))
-    async def playerok_delivery_stock(callback: CallbackQuery, state: FSMContext) -> None:
-        rule_id = int(callback.data.split(":", 1)[1])
-        if not await db.get_playerok_delivery_rule(callback.from_user.id, rule_id):
-            await callback.answer("–ü—Ä–∞–≤–∏–ª–æ –Ω–µ –Ω–∞–π–¥–µ–Ω–æ", show_alert=True)
-            return
-        await callback.answer()
-        await state.clear()
-        await state.set_state(PlayerokDeliveryState.products)
-        await state.update_data(playerok_delivery_rule_id=rule_id)
-        await callback.message.answer("–û—Ç–ø—Ä–∞–≤—å—Ç–µ –¥–æ 500 —Ç–æ–≤–∞—Ä–æ–≤: –æ–¥–∏–Ω –∫–ª—é—á –∏–ª–∏ —Ç–æ–≤–∞—Ä –Ω–∞ —Å—Ç—Ä–æ–∫—É.")
-
-    @router.message(PlayerokDeliveryState.products, F.text)
-    async def playerok_delivery_stock_save(message: Message, state: FSMContext) -> None:
-        products = [line.strip() for line in message.text.splitlines() if line.strip()]
-        if not products or len(products) > 500 or any(len(product) > 1000 for product in products):
-            await message.answer("–ù—É–∂–Ω–æ –æ—Ç 1 –¥–æ 500 –Ω–µ–ø—É—Å—Ç—ã—Ö —Å—Ç—Ä–æ–∫ –¥–æ 1000 —Å–∏–º–≤–æ–ª–æ–≤ –∫–∞–∂–¥–∞—è.")
-            return
-        rule_id = int((await state.get_data()).get("playerok_delivery_rule_id") or 0)
-        await db.add_playerok_delivery_products(message.from_user.id, rule_id, products)
-        await state.clear()
-        await show_playerok_delivery_rule(message, message.from_user.id, rule_id)
-
-    @router.callback_query(F.data.startswith("po_delivery_edit:"))
-    async def playerok_delivery_edit(callback: CallbackQuery, state: FSMContext) -> None:
-        rule_id = int(callback.data.split(":", 1)[1])
-        rule = await db.get_playerok_delivery_rule(callback.from_user.id, rule_id)
-        if not rule:
-            await callback.answer("–ü—Ä–∞–≤–∏–ª–æ –Ω–µ –Ω–∞–π–¥–µ–Ω–æ", show_alert=True)
-            return
-        await callback.answer()
-        await state.clear()
-        await state.set_state(PlayerokDeliveryState.response)
-        await state.update_data(playerok_delivery_rule_id=rule_id)
-        await callback.message.answer(f"–û—Ç–ø—Ä–∞–≤—å—Ç–µ –Ω–æ–≤—ã–π —à–∞–±–ª–æ–Ω. –°–µ–π—á–∞—Å:\n<pre>{html.escape(clipped(rule['response'], 1600))}</pre>")
-
-    @router.callback_query(F.data.startswith("po_delivery_toggle:"))
-    async def playerok_delivery_toggle(callback: CallbackQuery) -> None:
-        rule_id = int(callback.data.split(":", 1)[1])
-        await db.toggle_playerok_delivery_rule(callback.from_user.id, rule_id)
-        await callback.answer("–°–æ—Ö—Ä–∞–Ω–µ–Ω–æ")
-        await show_playerok_delivery_rule(callback.message, callback.from_user.id, rule_id)
-
-    @router.callback_query(F.data.startswith("po_delivery_clear_ask:"))
-    async def playerok_delivery_clear_ask(callback: CallbackQuery) -> None:
-        rule_id = int(callback.data.split(":", 1)[1])
-        await callback.answer()
-        await callback.message.answer("–û—á–∏—Å—Ç–∏—Ç—å –≤–µ—Å—å –∑–∞–ø–∞—Å?", reply_markup=keyboard([[("–î–∞, –æ—á–∏—Å—Ç–∏—Ç—å", f"po_delivery_clear:{rule_id}"), ("–û—Ç–º–µ–Ω–∞", f"po_delivery_rule:{rule_id}")]]))
-
-    @router.callback_query(F.data.startswith("po_delivery_clear:"))
-    async def playerok_delivery_clear(callback: CallbackQuery) -> None:
-        rule_id = int(callback.data.split(":", 1)[1])
-        await db.clear_playerok_delivery_products(callback.from_user.id, rule_id)
-        await callback.answer("–ó–∞–ø–∞—Å –æ—á–∏—â–µ–Ω")
-        await show_playerok_delivery_rule(callback.message, callback.from_user.id, rule_id)
-
-    @router.callback_query(F.data.startswith("po_delivery_delete_ask:"))
-    async def playerok_delivery_delete_ask(callback: CallbackQuery) -> None:
-        rule_id = int(callback.data.split(":", 1)[1])
-        await callback.answer()
-        await callback.message.answer("–£–¥–∞–ª–∏—Ç—å –ø—Ä–∞–≤–∏–ª–æ –∏ –∑–∞–ø–∞—Å?", reply_markup=keyboard([[("–î–∞, —É–¥–∞–ª–∏—Ç—å", f"po_delivery_delete:{rule_id}"), ("–û—Ç–º–µ–Ω–∞", f"po_delivery_rule:{rule_id}")]]))
-
-    @router.callback_query(F.data.startswith("po_delivery_delete:"))
-    async def playerok_delivery_delete(callback: CallbackQuery) -> None:
-        rule_id = int(callback.data.split(":", 1)[1])
-        await db.delete_playerok_delivery_rule(callback.from_user.id, rule_id)
-        await callback.answer("–ü—Ä–∞–≤–∏–ª–æ —É–¥–∞–ª–µ–Ω–æ")
-        await show_playerok_delivery(callback.message, callback.from_user.id)
-
-    async def show_playerok_item_options(target: Message, state: FSMContext, runtime: PlayerokRuntime) -> None:
-        data = await state.get_data()
-        category = await asyncio.to_thread(runtime.account.get_game_category, id=data["playerok_category_id"])
-        options = list(getattr(category, "options", []) or [])[:40]
-        selected = set(data.get("playerok_option_ids", []))
-        rows = [[(
-            f"{'‚úÖ' if str(option.id) in selected else '‚¨ú'} {clipped(getattr(option, 'label', option.value), 30)}",
-            f"po_new_option:{option.id}",
-        )] for option in options]
-        rows.append([("–ü—Ä–æ–¥–æ–ª–∂–∏—Ç—å", "po_new_options_done")])
-        await target.answer(
-            "–í—ã–±–µ—Ä–∏—Ç–µ –Ω—É–∂–Ω—ã–µ –æ–ø—Ü–∏–∏ –∫–∞—Ç–µ–≥–æ—Ä–∏–∏. –ï—Å–ª–∏ –¥–ª—è –æ–±—ä—è–≤–ª–µ–Ω–∏—è –æ–ø—Ü–∏–∏ –Ω–µ —Ç—Ä–µ–±—É—é—Ç—Å—è ‚Äî —Å—Ä–∞–∑—É –Ω–∞–∂–º–∏—Ç–µ ¬´–ü—Ä–æ–¥–æ–ª–∂–∏—Ç—å¬ª. "
-            "Playerok –ø—Ä–æ–≤–µ—Ä–∏—Ç –æ–±—è–∑–∞—Ç–µ–ª—å–Ω—ã–µ –æ–≥—Ä–∞–Ω–∏—á–µ–Ω–∏—è –ø—Ä–∏ —Å–æ–∑–¥–∞–Ω–∏–∏ —á–µ—Ä–Ω–æ–≤–∏–∫–∞.",
-            reply_markup=keyboard(rows),
-        )
-
-    async def ask_playerok_item_field(target: Message, state: FSMContext) -> None:
-        data = await state.get_data()
-        fields = data.get("playerok_item_fields", [])
-        index = int(data.get("playerok_item_field_index", 0))
-        if index >= len(fields):
-            await target.answer(
-                "üßæ <b>–ü—Ä–æ–≤–µ—Ä—å—Ç–µ —á–µ—Ä–Ω–æ–≤–∏–∫ –æ–±—ä—è–≤–ª–µ–Ω–∏—è</b>\n\n"
-                f"–ù–∞–∑–≤–∞–Ω–∏–µ: <b>{html.escape(data['playerok_item_name'])}</b>\n"
-                f"–¶–µ–Ω–∞: <b>{data['playerok_item_price']} ‚ÇΩ</b>\n"
-                f"–û–ø–∏—Å–∞–Ω–∏–µ: <pre>{html.escape(clipped(data['playerok_item_description'], 1200))}</pre>\n"
-                f"–û–ø—Ü–∏–π: <b>{len(data.get('playerok_option_ids', []))}</b> ¬∑ –ø–æ–ª–µ–π: <b>{len(fields)}</b>\n\n"
-                "–ü–æ—Å–ª–µ –ø–æ–¥—Ç–≤–µ—Ä–∂–¥–µ–Ω–∏—è –±—É–¥–µ—Ç —Å–æ–∑–¥–∞–Ω —á–µ—Ä–Ω–æ–≤–∏–∫. –ü—É–±–ª–∏–∫–∞—Ü–∏—è –æ—Å—Ç–∞—ë—Ç—Å—è –æ—Ç–¥–µ–ª—å–Ω—ã–º –¥–µ–π—Å—Ç–≤–∏–µ–º.",
-                reply_markup=keyboard([[("‚úÖ –°–æ–∑–¥–∞—Ç—å —á–µ—Ä–Ω–æ–≤–∏–∫", "po_new_create"), ("–û—Ç–º–µ–Ω–∞", "po_items")]]),
-            )
-            return
-        field = fields[index]
-        await state.set_state(PlayerokItemCreateState.field_value)
-        await target.answer(
-            f"–ü–æ–ª–µ <b>{html.escape(field['label'])}</b> ({index + 1}/{len(fields)}).\n"
-            "–û—Ç–ø—Ä–∞–≤—å—Ç–µ –∑–Ω–∞—á–µ–Ω–∏–µ –¥–æ 1000 —Å–∏–º–≤–æ–ª–æ–≤. –î–ª—è –æ—Ç–º–µ–Ω—ã: /cancel"
-        )
-
-    @router.callback_query(F.data == "po_item_create")
-    async def playerok_item_create(callback: CallbackQuery, state: FSMContext) -> None:
-        await callback.answer()
-        if not await require_playerok_runtime(callback.message, callback.from_user.id):
-            return
-        await state.clear()
-        await state.set_state(PlayerokItemCreateState.game_search)
-        await callback.message.answer("–í–≤–µ–¥–∏—Ç–µ –Ω–∞–∑–≤–∞–Ω–∏–µ –∏–≥—Ä—ã –∏–ª–∏ –ø—Ä–∏–ª–æ–∂–µ–Ω–∏—è Playerok –¥–ª—è –ø–æ–∏—Å–∫–∞.")
-
-    @router.message(PlayerokItemCreateState.game_search, F.text)
-    async def playerok_item_game_search(message: Message, state: FSMContext) -> None:
-        query = message.text.strip()
-        if not 2 <= len(query) <= 100:
-            await message.answer("–í–≤–µ–¥–∏—Ç–µ –æ—Ç 2 –¥–æ 100 —Å–∏–º–≤–æ–ª–æ–≤ –Ω–∞–∑–≤–∞–Ω–∏—è.")
-            return
-        runtime = await require_playerok_runtime(message, message.from_user.id)
-        if not runtime:
-            await state.clear()
-            return
-        try:
-            page = await asyncio.to_thread(runtime.account.get_games, name=query, count=24)
-            games = list(getattr(page, "games", []) or [])
-        except Exception as exc:  # noqa: BLE001 - PlayerokAPI may fail at the request/parser layer.
-            await message.answer(f"‚ùå –ù–µ —É–¥–∞–ª–æ—Å—å –Ω–∞–π—Ç–∏ –∏–≥—Ä—É: {html.escape(clipped(exc, 400))}")
-            return
-        if not games:
-            await message.answer("–ù–∏—á–µ–≥–æ –Ω–µ –Ω–∞–π–¥–µ–Ω–æ. –ü–æ–ø—Ä–æ–±—É–π—Ç–µ –¥—Ä—É–≥–æ–µ –Ω–∞–∑–≤–∞–Ω–∏–µ.")
-            return
-        await message.answer(
-            "–í—ã–±–µ—Ä–∏—Ç–µ –∏–≥—Ä—É –∏–ª–∏ –ø—Ä–∏–ª–æ–∂–µ–Ω–∏–µ:",
-            reply_markup=keyboard([[(clipped(game.name, 48), f"po_new_game:{game.id}")] for game in games]),
-        )
-
-    @router.callback_query(F.data.startswith("po_new_game:"))
-    async def playerok_item_game_pick(callback: CallbackQuery, state: FSMContext) -> None:
-        game_id = callback.data.split(":", 1)[1]
-        runtime = await require_playerok_runtime(callback.message, callback.from_user.id)
-        if not runtime:
-            return
-        try:
-            game = await asyncio.to_thread(runtime.account.get_game, id=game_id)
-            categories = list(getattr(game, "categories", []) or [])
-        except Exception as exc:  # noqa: BLE001 - PlayerokAPI exposes heterogeneous errors.
-            await callback.answer(f"–ù–µ —É–¥–∞–ª–æ—Å—å: {clipped(exc, 120)}", show_alert=True)
-            return
-        if not categories:
-            await callback.answer("–£ –∏–≥—Ä—ã –Ω–µ—Ç –¥–æ—Å—Ç—É–ø–Ω—ã—Ö –∫–∞—Ç–µ–≥–æ—Ä–∏–π", show_alert=True)
-            return
-        await callback.answer()
-        await state.update_data(playerok_game_id=game_id)
-        await callback.message.answer(
-            "–í—ã–±–µ—Ä–∏—Ç–µ –∫–∞—Ç–µ–≥–æ—Ä–∏—é:",
-            reply_markup=keyboard([[(clipped(category.name, 48), f"po_new_category:{category.id}")] for category in categories[:40]]),
-        )
-
-    @router.callback_query(F.data.startswith("po_new_category:"))
-    async def playerok_item_category_pick(callback: CallbackQuery, state: FSMContext) -> None:
-        category_id = callback.data.split(":", 1)[1]
-        runtime = await require_playerok_runtime(callback.message, callback.from_user.id)
-        if not runtime:
-            return
-        try:
-            page = await asyncio.to_thread(runtime.account.get_game_category_obtaining_types, category_id)
-            obtaining_types = list(getattr(page, "obtaining_types", []) or [])
-        except Exception as exc:  # noqa: BLE001 - PlayerokAPI exposes heterogeneous errors.
-            await callback.answer(f"–ù–µ —É–¥–∞–ª–æ—Å—å: {clipped(exc, 120)}", show_alert=True)
-            return
-        if not obtaining_types:
-            await callback.answer("–î–ª—è –∫–∞—Ç–µ–≥–æ—Ä–∏–∏ –Ω–µ—Ç —Å–ø–æ—Å–æ–±–æ–≤ –ø–æ–ª—É—á–µ–Ω–∏—è", show_alert=True)
-            return
-        await callback.answer()
-        await state.update_data(playerok_category_id=category_id)
-        await callback.message.answer(
-            "–í—ã–±–µ—Ä–∏—Ç–µ —Å–ø–æ—Å–æ–± –ø–æ–ª—É—á–µ–Ω–∏—è:",
-            reply_markup=keyboard([[(clipped(item.name, 48), f"po_new_obtain:{item.id}")] for item in obtaining_types[:40]]),
-        )
-
-    @router.callback_query(F.data.startswith("po_new_obtain:"))
-    async def playerok_item_obtaining_pick(callback: CallbackQuery, state: FSMContext) -> None:
-        await callback.answer()
-        await state.update_data(playerok_obtaining_type_id=callback.data.split(":", 1)[1], playerok_option_ids=[])
-        await state.set_state(PlayerokItemCreateState.name)
-        await callback.message.answer("–í–≤–µ–¥–∏—Ç–µ –Ω–∞–∑–≤–∞–Ω–∏–µ –æ–±—ä—è–≤–ª–µ–Ω–∏—è: –æ—Ç 3 –¥–æ 120 —Å–∏–º–≤–æ–ª–æ–≤.")
-
-    @router.message(PlayerokItemCreateState.name, F.text)
-    async def playerok_item_name(message: Message, state: FSMContext) -> None:
-        value = message.text.strip()
-        if not 3 <= len(value) <= 120:
-            await message.answer("–ù–∞–∑–≤–∞–Ω–∏–µ –¥–æ–ª–∂–Ω–æ –±—ã—Ç—å –æ—Ç 3 –¥–æ 120 —Å–∏–º–≤–æ–ª–æ–≤.")
-            return
-        await state.update_data(playerok_item_name=value)
-        await state.set_state(PlayerokItemCreateState.price)
-        await message.answer("–í–≤–µ–¥–∏—Ç–µ —Ü–µ–Ω—É –≤ —Ä—É–±–ª—è—Ö: —Ü–µ–ª–æ–µ —á–∏—Å–ª–æ –æ—Ç 1 –¥–æ 10 000 000.")
-
-    @router.message(PlayerokItemCreateState.price, F.text)
-    async def playerok_item_price(message: Message, state: FSMContext) -> None:
-        value = message.text.strip()
-        if not value.isdigit() or not 1 <= int(value) <= 10_000_000:
-            await message.answer("–í–≤–µ–¥–∏—Ç–µ —Ü–µ–ª—É—é —Ü–µ–Ω—É –æ—Ç 1 –¥–æ 10 000 000.")
-            return
-        await state.update_data(playerok_item_price=int(value))
-        await state.set_state(PlayerokItemCreateState.description)
-        await message.answer("–í–≤–µ–¥–∏—Ç–µ –æ–ø–∏—Å–∞–Ω–∏–µ –æ–±—ä—è–≤–ª–µ–Ω–∏—è: –æ—Ç 1 –¥–æ 3000 —Å–∏–º–≤–æ–ª–æ–≤.")
-
-    @router.message(PlayerokItemCreateState.description, F.text)
-    async def playerok_item_description(message: Message, state: FSMContext) -> None:
-        value = message.text.strip()
-        if not 1 <= len(value) <= 3000:
-            await message.answer("–û–ø–∏—Å–∞–Ω–∏–µ –¥–æ–ª–∂–Ω–æ –±—ã—Ç—å –æ—Ç 1 –¥–æ 3000 —Å–∏–º–≤–æ–ª–æ–≤.")
-            return
-        runtime = await require_playerok_runtime(message, message.from_user.id)
-        if not runtime:
-            await state.clear()
-            return
-        await state.update_data(playerok_item_description=value)
-        try:
-            await show_playerok_item_options(message, state, runtime)
-        except Exception as exc:  # noqa: BLE001 - PlayerokAPI may fail at the request/parser layer.
-            await message.answer(f"‚ùå –ù–µ —É–¥–∞–ª–æ—Å—å –∑–∞–≥—Ä—É–∑–∏—Ç—å –æ–ø—Ü–∏–∏: {html.escape(clipped(exc, 400))}")
-
-    @router.callback_query(F.data.startswith("po_new_option:"))
-    async def playerok_item_option_toggle(callback: CallbackQuery, state: FSMContext) -> None:
-        option_id = callback.data.split(":", 1)[1]
-        data = await state.get_data()
-        selected = set(data.get("playerok_option_ids", []))
-        if option_id in selected:
-            selected.remove(option_id)
-        else:
-            selected.add(option_id)
-        await state.update_data(playerok_option_ids=list(selected))
-        runtime = await require_playerok_runtime(callback.message, callback.from_user.id)
-        if not runtime:
-            return
-        await callback.answer("–í—ã–±—Ä–∞–Ω–æ" if option_id in selected else "–°–Ω—è—Ç–æ")
-        await show_playerok_item_options(callback.message, state, runtime)
-
-    @router.callback_query(F.data == "po_new_options_done")
-    async def playerok_item_options_done(callback: CallbackQuery, state: FSMContext) -> None:
-        runtime = await require_playerok_runtime(callback.message, callback.from_user.id)
-        if not runtime:
-            return
-        data = await state.get_data()
-        try:
-            page = await asyncio.to_thread(
-                runtime.account.get_game_category_data_fields,
-                data["playerok_category_id"],
-                data["playerok_obtaining_type_id"],
-            )
-            fields = [
-                {"id": str(field.id), "label": str(field.label)}
-                for field in list(getattr(page, "data_fields", []) or [])
-                if getattr(field, "required", False)
-                and getattr(getattr(field, "type", None), "name", "") == "ITEM_DATA"
-            ]
-        except Exception as exc:  # noqa: BLE001 - PlayerokAPI may fail at the request/parser layer.
-            await callback.answer(f"–ù–µ —É–¥–∞–ª–æ—Å—å: {clipped(exc, 120)}", show_alert=True)
-            return
-        await callback.answer()
-        await state.update_data(playerok_item_fields=fields, playerok_item_field_index=0, playerok_item_field_values={})
-        await ask_playerok_item_field(callback.message, state)
-
-    @router.message(PlayerokItemCreateState.field_value, F.text)
-    async def playerok_item_field_value(message: Message, state: FSMContext) -> None:
-        value = message.text.strip()
-        if not 1 <= len(value) <= 1000:
-            await message.answer("–í–≤–µ–¥–∏—Ç–µ –∑–Ω–∞—á–µ–Ω–∏–µ –æ—Ç 1 –¥–æ 1000 —Å–∏–º–≤–æ–ª–æ–≤.")
-            return
-        data = await state.get_data()
-        index = int(data.get("playerok_item_field_index", 0))
-        fields = data.get("playerok_item_fields", [])
-        if index >= len(fields):
-            await state.clear()
-            return
-        values = dict(data.get("playerok_item_field_values", {}))
-        values[fields[index]["id"]] = value
-        await state.update_data(playerok_item_field_values=values, playerok_item_field_index=index + 1)
-        await ask_playerok_item_field(message, state)
-
-    @router.callback_query(F.data == "po_new_create")
-    async def playerok_item_create_confirm(callback: CallbackQuery, state: FSMContext) -> None:
-        runtime = await require_playerok_runtime(callback.message, callback.from_user.id)
-        if not runtime:
-            return
-        data = await state.get_data()
-        required = {"playerok_category_id", "playerok_obtaining_type_id", "playerok_item_name", "playerok_item_price", "playerok_item_description"}
-        if not required <= set(data):
-            await callback.answer("–°–µ—Å—Å–∏—è —Å–æ–∑–¥–∞–Ω–∏—è –∏—Å—Ç–µ–∫–ª–∞", show_alert=True)
-            await state.clear()
-            return
-        await callback.answer("–°–æ–∑–¥–∞—é —á–µ—Ä–Ω–æ–≤–∏–∫‚Ä¶")
-        try:
-            category = await asyncio.to_thread(runtime.account.get_game_category, id=data["playerok_category_id"])
-            fields_page = await asyncio.to_thread(
-                runtime.account.get_game_category_data_fields,
-                data["playerok_category_id"],
-                data["playerok_obtaining_type_id"],
-            )
-            values = data.get("playerok_item_field_values", {})
-            fields = []
-            for field in list(getattr(fields_page, "data_fields", []) or []):
-                if str(field.id) in values:
-                    field.value = values[str(field.id)]
-                    fields.append(field)
-            selected = set(data.get("playerok_option_ids", []))
-            options = [option for option in list(getattr(category, "options", []) or []) if str(option.id) in selected]
-            item = await asyncio.to_thread(
-                runtime.account.create_item,
-                data["playerok_category_id"],
-                data["playerok_obtaining_type_id"],
-                data["playerok_item_name"],
-                data["playerok_item_price"],
-                data["playerok_item_description"],
-                options,
-                fields,
-            )
-        except Exception as exc:
-            logger.exception("Playerok: –Ω–µ —Å–æ–∑–¥–∞–Ω —á–µ—Ä–Ω–æ–≤–∏–∫")
-            await callback.message.answer(
-                "‚ùå Playerok –Ω–µ —Å–æ–∑–¥–∞–ª —á–µ—Ä–Ω–æ–≤–∏–∫. –û–±—ã—á–Ω–æ –Ω–µ —Ö–≤–∞—Ç–∞–µ—Ç –æ–±—è–∑–∞—Ç–µ–ª—å–Ω–æ–π –æ–ø—Ü–∏–∏ –∏–ª–∏ –ø–æ–ª—è –∫–∞—Ç–µ–≥–æ—Ä–∏–∏.\n\n"
-                f"<code>{html.escape(clipped(exc, 700))}</code>"
-            )
-            return
-        await state.clear()
-        await callback.message.answer(
-            f"‚úÖ –°–æ–∑–¥–∞–Ω —á–µ—Ä–Ω–æ–≤–∏–∫ <b>{html.escape(clipped(getattr(item, 'name', data['playerok_item_name']), 700))}</b>\n"
-            f"ID: <code>{html.escape(str(item.id))}</code>",
-            reply_markup=keyboard([[("üì¢ –û–±—ä—è–≤–ª–µ–Ω–∏—è", "po_items"), ("‚ûï –°–æ–∑–¥–∞—Ç—å –µ—â—ë", "po_item_create")]]),
-        )
-
-    async def show_playerok_items(target: Message, user_id: int) -> None:
-        runtime = await require_playerok_runtime(target, user_id)
-        if not runtime or PlayerokItemStatuses is None:
-            return
-        row = await db.get_user(user_id)
-        try:
-            page = await asyncio.to_thread(
-                runtime.account.get_my_items,
-                statuses=list(PlayerokItemStatuses),
-                count=24,
-            )
-        except Exception as exc:
-            logger.exception("–ù–µ —É–¥–∞–ª–æ—Å—å –ø–æ–ª—É—á–∏—Ç—å –æ–±—ä—è–≤–ª–µ–Ω–∏—è Playerok")
-            await target.answer(f"‚ùå –û–±—ä—è–≤–ª–µ–Ω–∏—è –Ω–µ–¥–æ—Å—Ç—É–ø–Ω—ã: {html.escape(clipped(exc, 400))}")
-            return
-        items = list(getattr(page, "items", []) or [])
-        statuses = Counter(
-            getattr(getattr(item, "status", None), "name", "UNKNOWN") for item in items
-        )
-        preview = "\n".join(
-            f"‚Ä¢ <b>{html.escape(clipped(item.name, 55))}</b> ‚Äî {format_money(item.price)} ‚ÇΩ "
-            f"(<code>{html.escape(getattr(item.status, 'name', '‚Äî'))}</code>)"
-            for item in items[:10]
-        ) or "–û–±—ä—è–≤–ª–µ–Ω–∏–π –ø–æ–∫–∞ –Ω–µ—Ç."
-        await target.answer(
-            "üì¢ <b>–û–±—ä—è–≤–ª–µ–Ω–∏—è Playerok</b>\n\n"
-            f"–ù–∞–π–¥–µ–Ω–æ –Ω–∞ –ø–µ—Ä–≤–æ–π —Å—Ç—Ä–∞–Ω–∏—Ü–µ: <b>{len(items)}</b> –∏–∑ <b>{getattr(page, 'total_count', len(items))}</b>\n"
-            f"–ß–µ—Ä–Ω–æ–≤–∏–∫–æ–≤: <b>{statuses.get('DRAFT', 0)}</b> ¬∑ –∞–∫—Ç–∏–≤–Ω—ã—Ö: <b>{statuses.get('APPROVED', 0)}</b>\n\n"
-            f"{preview}\n\n"
-            "–ê–≤—Ç–æ–≤—ã—Å—Ç–∞–≤–ª–µ–Ω–∏–µ –∫–∞–∂–¥—ã–µ 5 –º–∏–Ω—É—Ç –ø—É–±–ª–∏–∫—É–µ—Ç –¥–æ 24 —á–µ—Ä–Ω–æ–≤–∏–∫–æ–≤ —Å –±–µ—Å–ø–ª–∞—Ç–Ω—ã–º –ø—Ä–∏–æ—Ä–∏—Ç–µ—Ç–æ–º. "
-            "–°–æ–∑–¥–∞–≤–∞—Ç—å —É–Ω–∏–≤–µ—Ä—Å–∞–ª—å–Ω—ã–µ –æ–±—ä—è–≤–ª–µ–Ω–∏—è –∞–≤—Ç–æ–º–∞—Ç–∏—á–µ—Å–∫–∏ –Ω–µ–ª—å–∑—è: –æ–±—è–∑–∞—Ç–µ–ª—å–Ω—ã–µ –ø–æ–ª—è —Ä–∞–∑–ª–∏—á–∞—é—Ç—Å—è –ø–æ –∫–∞—Ç–µ–≥–æ—Ä–∏—è–º.",
-            reply_markup=keyboard([
-                [("üöÄ –ü–ª–∞—Ç–Ω–æ–µ –ø—Ä–æ–¥–≤–∏–∂–µ–Ω–∏–µ", "po_promotion")],
-                [(f"{bool_icon(row['playerok_auto_publish_enabled'])} –ê–≤—Ç–æ–≤—ã—Å—Ç–∞–≤–ª–µ–Ω–∏–µ", "po_auto_publish_toggle")],
-                [("üì§ –í—ã—Å—Ç–∞–≤–∏—Ç—å —á–µ—Ä–Ω–æ–≤–∏–∫–∏ —Å–µ–π—á–∞—Å", "po_publish_drafts")],
-                [("üîÑ –û–±–Ω–æ–≤–∏—Ç—å", "po_items"), ("‚¨ÖÔ∏è –ú–µ–Ω—é", "menu")],
-            ]),
-        )
-
-    @router.callback_query(F.data == "po_items")
-    async def playerok_items(callback: CallbackQuery) -> None:
-        await callback.answer("–ó–∞–≥—Ä—É–∂–∞—é‚Ä¶")
-        await show_playerok_items(callback.message, callback.from_user.id)
-
-    async def load_playerok_promotion_data(
-        runtime: PlayerokRuntime, item_id: str
-    ) -> tuple[Any, list[Any]]:
-        if PlayerokItemStatuses is None:
-            raise RuntimeError("PlayerokAPI –Ω–µ –∑–∞–≥—Ä—É–∑–∏–ª —Å—Ç–∞—Ç—É—Å—ã –æ–±—ä—è–≤–ª–µ–Ω–∏–π")
-        page = await asyncio.to_thread(
-            runtime.account.get_my_items,
-            statuses=[PlayerokItemStatuses.APPROVED],
-            count=24,
-        )
-        item = next(
-            (
-                candidate
-                for candidate in list(getattr(page, "items", []) or [])
-                if str(candidate.id) == item_id
-            ),
-            None,
-        )
-        if not item:
-            raise RuntimeError(
-                "–∞–∫—Ç–∏–≤–Ω–æ–µ –æ–±—ä—è–≤–ª–µ–Ω–∏–µ –Ω–µ –Ω–∞–π–¥–µ–Ω–æ –Ω–∞ –ø–µ—Ä–≤–æ–π —Å—Ç—Ä–∞–Ω–∏—Ü–µ"
-            )
-        priorities = await asyncio.to_thread(
-            runtime.account.get_item_priority_statuses,
-            str(item.id),
-            int(item.price),
-        )
-        return item, playerok_paid_priorities(list(priorities or []))
-
-    async def show_playerok_promotion(target: Message, user_id: int) -> None:
-        runtime = await require_playerok_runtime(target, user_id)
-        if not runtime or PlayerokItemStatuses is None:
-            return
-        try:
-            page = await asyncio.to_thread(
-                runtime.account.get_my_items,
-                statuses=[PlayerokItemStatuses.APPROVED],
-                count=24,
-            )
-        except Exception as exc:
-            logger.exception("Playerok: –Ω–µ –∑–∞–≥—Ä—É–∂–µ–Ω—ã –æ–±—ä—è–≤–ª–µ–Ω–∏—è –¥–ª—è –ø—Ä–æ–¥–≤–∏–∂–µ–Ω–∏—è")
-            await target.answer(
-                f"‚ùå –ü—Ä–æ–¥–≤–∏–∂–µ–Ω–∏–µ –Ω–µ–¥–æ—Å—Ç—É–ø–Ω–æ: {html.escape(clipped(exc, 500))}"
-            )
-            return
-        items = list(getattr(page, "items", []) or [])
-        rows = [
-            [(
-                f"üì¢ {clipped(item.name, 31)} ¬∑ {format_money(item.price)} ‚ÇΩ",
-                f"po_promo_item:{item.id}",
-            )]
-            for item in items
-        ]
-        rows.append([(
-            "‚¨ÖÔ∏è –û–±—ä—è–≤–ª–µ–Ω–∏—è",
-            "po_items",
-        )])
-        await target.answer(
-            "üöÄ <b>–ü–ª–∞—Ç–Ω–æ–µ –ø—Ä–æ–¥–≤–∏–∂–µ–Ω–∏–µ Playerok</b>\n\n"
-            "–í—ã–±–µ—Ä–∏—Ç–µ –∞–∫—Ç–∏–≤–Ω–æ–µ –æ–±—ä—è–≤–ª–µ–Ω–∏–µ. –î–µ–Ω—å–≥–∏ –Ω–µ —Å–ø–∏—à—É—Ç—Å—è –¥–æ –æ—Ç–¥–µ–ª—å–Ω–æ–≥–æ –ø–æ–¥—Ç–≤–µ—Ä–∂–¥–µ–Ω–∏—è.\n\n"
-            f"–ù–∞–π–¥–µ–Ω–æ: <b>{len(items)}</b> –∏–∑ <b>{getattr(page, 'total_count', len(items))}</b>.",
-            reply_markup=keyboard(rows),
-        )
-
-    @router.callback_query(F.data == "po_promotion")
-    async def playerok_promotion(callback: CallbackQuery) -> None:
-        await callback.answer("–ó–∞–≥—Ä—É–∂–∞—é‚Ä¶")
-        await show_playerok_promotion(callback.message, callback.from_user.id)
-
-    @router.callback_query(F.data.startswith("po_promo_item:"))
-    async def playerok_promotion_item(callback: CallbackQuery) -> None:
-        item_id = callback.data.split(":", 1)[1]
-        runtime = await require_playerok_runtime(
-            callback.message, callback.from_user.id
-        )
-        if not runtime:
-            return
-        await callback.answer("–ó–∞–≥—Ä—É–∂–∞—é —Ç–∞—Ä–∏—Ñ—ã‚Ä¶")
-        try:
-            item, priorities = await load_playerok_promotion_data(runtime, item_id)
-        except Exception as exc:
-            logger.exception("Playerok: –Ω–µ –∑–∞–≥—Ä—É–∂–µ–Ω—ã —Ç–∞—Ä–∏—Ñ—ã –ø—Ä–æ–¥–≤–∏–∂–µ–Ω–∏—è")
-            await callback.message.answer(
-                f"‚ùå –ù–µ —É–¥–∞–ª–æ—Å—å –∑–∞–≥—Ä—É–∑–∏—Ç—å —Ç–∞—Ä–∏—Ñ—ã: {html.escape(clipped(exc, 500))}"
-            )
-            return
-        if not priorities:
-            await callback.message.answer(
-                "–î–ª—è —ç—Ç–æ–≥–æ –æ–±—ä—è–≤–ª–µ–Ω–∏—è Playerok –Ω–µ –≤–µ—Ä–Ω—É–ª –ø–ª–∞—Ç–Ω—ã—Ö —Ç–∞—Ä–∏—Ñ–æ–≤.",
-                reply_markup=keyboard([[("‚¨ÖÔ∏è –ö –æ–±—ä—è–≤–ª–µ–Ω–∏—è–º", "po_promotion")]]),
-            )
-            return
-        rows = [
-            [(
-                f"üí≥ {clipped(playerok_priority_label(priority), 52)}",
-                f"po_promo_ask:{item.id}:{index}",
-            )]
-            for index, priority in enumerate(priorities)
-        ]
-        rows.append([(
-            "‚¨ÖÔ∏è –î—Ä—É–≥–æ–µ –æ–±—ä—è–≤–ª–µ–Ω–∏–µ",
-            "po_promotion",
-        )])
-        current_priority = getattr(
-            getattr(item, "priority", None), "name", "DEFAULT"
-        )
-        await callback.message.answer(
-            f"üì¢ <b>{html.escape(clipped(item.name, 900))}</b>\n"
-            f"–¶–µ–Ω–∞ —Ç–æ–≤–∞—Ä–∞: <b>{format_money(item.price)} ‚ÇΩ</b>\n"
-            f"–¢–µ–∫—É—â–∏–π –ø—Ä–∏–æ—Ä–∏—Ç–µ—Ç: <code>{html.escape(str(current_priority))}</code>\n\n"
-            "–í—ã–±–µ—Ä–∏—Ç–µ —Ç–∞—Ä–∏—Ñ:",
-            reply_markup=keyboard(rows),
-        )
-
-    @router.callback_query(F.data.startswith("po_promo_ask:"))
-    async def playerok_promotion_ask(callback: CallbackQuery) -> None:
-        try:
-            _, item_id, raw_index = callback.data.split(":", 2)
-            index = int(raw_index)
-        except (TypeError, ValueError):
-            await callback.answer("–ù–µ–∫–æ—Ä—Ä–µ–∫—Ç–Ω—ã–π —Ç–∞—Ä–∏—Ñ", show_alert=True)
-            return
-        runtime = await require_playerok_runtime(
-            callback.message, callback.from_user.id
-        )
-        if not runtime:
-            return
-        await callback.answer("–ü—Ä–æ–≤–µ—Ä—è—é‚Ä¶")
-        try:
-            item, priorities = await load_playerok_promotion_data(runtime, item_id)
-            priority = priorities[index]
-            account = await asyncio.to_thread(runtime.account.get)
-            balance = account.profile.balance
-            available_value = getattr(balance, "available", None)
-            if available_value is None:
-                available_value = getattr(balance, "value", 0)
-            available = float(available_value or 0)
-        except Exception as exc:
-            logger.exception("Playerok: –Ω–µ –ø–æ–¥–≥–æ—Ç–æ–≤–ª–µ–Ω–æ –ø–æ–¥—Ç–≤–µ—Ä–∂–¥–µ–Ω–∏–µ –ø—Ä–æ–¥–≤–∏–∂–µ–Ω–∏—è")
-            await callback.message.answer(
-                f"‚ùå –ù–µ —É–¥–∞–ª–æ—Å—å –ø—Ä–æ–≤–µ—Ä–∏—Ç—å —Ç–∞—Ä–∏—Ñ: {html.escape(clipped(exc, 500))}"
-            )
-            return
-        price = int(priority.price)
-        if available < price:
-            await callback.message.answer(
-                "‚ùå <b>–ù–µ–¥–æ—Å—Ç–∞—Ç–æ—á–Ω–æ —Å—Ä–µ–¥—Å—Ç–≤</b>\n\n"
-                f"–¢–∞—Ä–∏—Ñ: <b>{html.escape(playerok_priority_label(priority))}</b>\n"
-                f"–î–æ—Å—Ç—É–ø–Ω–æ: <b>{format_money(available)} ‚ÇΩ</b>",
-                reply_markup=keyboard([[("‚¨ÖÔ∏è –ö —Ç–∞—Ä–∏—Ñ–∞–º", f"po_promo_item:{item_id}")]]),
-            )
-            return
-        request = await db.create_playerok_promotion_request(
-            callback.from_user.id,
-            runtime.account_key,
-            str(item.id),
-            str(item.name),
-            str(priority.id),
-            str(priority.name),
-            price,
-            int(getattr(priority, "period", 0) or 0),
-        )
-        await callback.message.answer(
-            "‚ö†Ô∏è <b>–ü–æ–¥—Ç–≤–µ—Ä–¥–∏—Ç–µ –ø–ª–∞—Ç–Ω–æ–µ –ø—Ä–æ–¥–≤–∏–∂–µ–Ω–∏–µ</b>\n\n"
-            f"–ê–∫–∫–∞—É–Ω—Ç: <b>{html.escape(runtime.account_label)}</b>\n"
-            f"–û–±—ä—è–≤–ª–µ–Ω–∏–µ: <b>{html.escape(clipped(item.name, 700))}</b>\n"
-            f"–¢–∞—Ä–∏—Ñ: <b>{html.escape(playerok_priority_label(priority))}</b>\n"
-            f"–ë–∞–ª–∞–Ω—Å: <b>{format_money(available)} ‚ÇΩ</b>\n\n"
-            f"–ü–æ—Å–ª–µ –Ω–∞–∂–∞—Ç–∏—è Playerok —Å–ø–∏—à–µ—Ç <b>{format_money(price)} ‚ÇΩ</b> —Å –±–∞–ª–∞–Ω—Å–∞. "
-            "–ü–æ–¥—Ç–≤–µ—Ä–∂–¥–µ–Ω–∏–µ –¥–µ–π—Å—Ç–≤—É–µ—Ç 15 –º–∏–Ω—É—Ç.",
-            reply_markup=keyboard([
-                [("üí≥ –û–ø–ª–∞—Ç–∏—Ç—å –∏ –ø—Ä–æ–¥–≤–∏–Ω—É—Ç—å", f"po_promo_do:{request['token']}")],
-                [("‚ùå –û—Ç–º–µ–Ω–∞", f"po_promo_item:{item_id}")],
-            ]),
-        )
-
-    @router.callback_query(F.data.startswith("po_promo_do:"))
-    async def playerok_promotion_do(callback: CallbackQuery) -> None:
-        token = callback.data.split(":", 1)[1]
-        request = await db.get_playerok_promotion_request(
-            callback.from_user.id, token
-        )
-        if not request:
-            await callback.answer("–ó–∞–ø—Ä–æ—Å –Ω–µ –Ω–∞–π–¥–µ–Ω", show_alert=True)
-            return
-        runtime = await require_playerok_runtime(
-            callback.message, callback.from_user.id
-        )
-        if not runtime:
-            return
-        if runtime.account_key != int(request["account_id"]):
-            await callback.answer("–í—ã–±–µ—Ä–∞–Ω –¥—Ä—É–≥–æ–π –∞–∫–∫–∞—É–Ω—Ç", show_alert=True)
-            await callback.message.answer(
-                "–ü–µ—Ä–µ–∫–ª—é—á–∏—Ç–µ—Å—å –Ω–∞ –∞–∫–∫–∞—É–Ω—Ç, –¥–ª—è –∫–æ—Ç–æ—Ä–æ–≥–æ —Å–æ–∑–¥–∞–Ω–æ –ø–æ–¥—Ç–≤–µ—Ä–∂–¥–µ–Ω–∏–µ.",
-                reply_markup=keyboard([[(
-                    "üîÑ –ü–µ—Ä–µ–∫–ª—é—á–∏—Ç—å –∞–∫–∫–∞—É–Ω—Ç",
-                    f"account_select:playerok:{request['account_id']}",
-                )]]),
-            )
-            return
-        claimed = await db.claim_playerok_promotion_request(
-            callback.from_user.id, token
-        )
-        if not claimed:
-            await callback.answer(
-                "–£–∂–µ –æ–±—Ä–∞–±–æ—Ç–∞–Ω–æ –∏–ª–∏ –∏—Å—Ç–µ–∫–ª–æ",
-                show_alert=True,
-            )
-            return
-        await callback.answer("–û–ø–ª–∞—á–∏–≤–∞—é‚Ä¶")
-        try:
-            await callback.message.edit_reply_markup(reply_markup=None)
-        except TelegramBadRequest:
-            pass
-        try:
-            item, priorities = await load_playerok_promotion_data(
-                runtime, str(claimed["item_id"])
-            )
-            priority = next(
-                (
-                    candidate
-                    for candidate in priorities
-                    if str(candidate.id) == str(claimed["priority_status_id"])
-                ),
-                None,
-            )
-            if not priority:
-                raise RuntimeError("—Ç–∞—Ä–∏—Ñ –±–æ–ª—å—à–µ –Ω–µ–¥–æ—Å—Ç—É–ø–µ–Ω")
-            if int(priority.price) != int(claimed["expected_price"]):
-                raise RuntimeError(
-                    "—Å—Ç–æ–∏–º–æ—Å—Ç—å —Ç–∞—Ä–∏—Ñ–∞ –∏–∑–º–µ–Ω–∏–ª–∞—Å—å; —Å–æ–∑–¥–∞–π—Ç–µ –Ω–æ–≤–æ–µ –ø–æ–¥—Ç–≤–µ—Ä–∂–¥–µ–Ω–∏–µ"
-                )
-            account = await asyncio.to_thread(runtime.account.get)
-            balance = account.profile.balance
-            available_value = getattr(balance, "available", None)
-            if available_value is None:
-                available_value = getattr(balance, "value", 0)
-            available = float(available_value or 0)
-            if available < int(claimed["expected_price"]):
-                raise RuntimeError("–Ω–∞ –±–∞–ª–∞–Ω—Å–µ –±–æ–ª—å—à–µ –Ω–µ–¥–æ—Å—Ç–∞—Ç–æ—á–Ω–æ —Å—Ä–µ–¥—Å—Ç–≤")
-            result = await asyncio.to_thread(
-                runtime.account.increase_item_priority_status,
-                str(item.id),
-                str(priority.id),
-            )
-        except Exception as exc:
-            logger.exception("Playerok: –ø–ª–∞—Ç–Ω–æ–µ –ø—Ä–æ–¥–≤–∏–∂–µ–Ω–∏–µ –Ω–µ –≤—ã–ø–æ–ª–Ω–µ–Ω–æ")
-            await db.finish_playerok_promotion_request(
-                callback.from_user.id, token, "failed", str(exc)
-            )
-            await callback.message.answer(
-                "‚ùå <b>–ü—Ä–æ–¥–≤–∏–∂–µ–Ω–∏–µ –Ω–µ –≤—ã–ø–æ–ª–Ω–µ–Ω–æ</b>\n\n"
-                f"<code>{html.escape(clipped(exc, 700))}</code>",
-                reply_markup=keyboard([[("üîÑ –í—ã–±—Ä–∞—Ç—å —Ç–∞—Ä–∏—Ñ –∑–∞–Ω–æ–≤–æ", f"po_promo_item:{claimed['item_id']}")]]),
-            )
-            return
-        await db.finish_playerok_promotion_request(
-            callback.from_user.id, token, "succeeded"
-        )
-        expiration = getattr(result, "status_expiration_date", None)
-        await callback.message.answer(
-            "‚úÖ <b>–û–±—ä—è–≤–ª–µ–Ω–∏–µ –ø—Ä–æ–¥–≤–∏–Ω—É—Ç–æ</b>\n\n"
-            f"üì¢ {html.escape(clipped(claimed['item_title'], 800))}\n"
-            f"üöÄ –¢–∞—Ä–∏—Ñ: <b>{html.escape(claimed['priority_name'])}</b>\n"
-            f"üí≥ –°–ø–∏—Å–∞–Ω–æ: <b>{format_money(claimed['expected_price'])} ‚ÇΩ</b>"
-            + (f"\nüìÖ –î–æ: <code>{html.escape(str(expiration))}</code>" if expiration else ""),
-            reply_markup=keyboard([
-                [("üöÄ –ü—Ä–æ–¥–≤–∏–Ω—É—Ç—å –¥—Ä—É–≥–æ–µ", "po_promotion")],
-                [("‚¨ÖÔ∏è –û–±—ä—è–≤–ª–µ–Ω–∏—è", "po_items")],
-            ]),
-        )
-
-    @router.callback_query(F.data == "po_auto_publish_toggle")
-    async def playerok_auto_publish_toggle(callback: CallbackQuery) -> None:
-        row = await db.get_user(callback.from_user.id)
-        if not row or not row["playerok_active"]:
-            await callback.answer("Playerok –Ω–µ –ø–æ–¥–∫–ª—é—á—ë–Ω", show_alert=True)
-            return
-        enabled = not row["playerok_auto_publish_enabled"]
-        await db.set_flag(callback.from_user.id, "playerok_auto_publish_enabled", enabled)
-        runtime = manager.get_playerok(callback.from_user.id)
-        if runtime and enabled:
-            runtime.next_auto_publish_at = 0
-        await callback.answer("–ê–≤—Ç–æ–≤—ã—Å—Ç–∞–≤–ª–µ–Ω–∏–µ –≤–∫–ª—é—á–µ–Ω–æ" if enabled else "–ê–≤—Ç–æ–≤—ã—Å—Ç–∞–≤–ª–µ–Ω–∏–µ –≤—ã–∫–ª—é—á–µ–Ω–æ")
-        await show_playerok_items(callback.message, callback.from_user.id)
-
-    @router.callback_query(F.data == "po_publish_drafts")
-    async def playerok_publish_drafts(callback: CallbackQuery) -> None:
-        await callback.answer("–ü—É–±–ª–∏–∫—É—é‚Ä¶")
-        try:
-            published, total, errors = await manager.publish_playerok_drafts(callback.from_user.id)
-        except Exception as exc:  # noqa: BLE001 - API raises heterogeneous network errors.
-            await callback.message.answer(f"‚ùå –ü—É–±–ª–∏–∫–∞—Ü–∏—è –Ω–µ –≤—ã–ø–æ–ª–Ω–µ–Ω–∞: {html.escape(clipped(exc, 500))}")
-            return
-        error_text = "\n".join(f"‚Ä¢ {html.escape(error)}" for error in errors[:8])
-        await callback.message.answer(
-            f"‚úÖ –û–ø—É–±–ª–∏–∫–æ–≤–∞–Ω–æ —á–µ—Ä–Ω–æ–≤–∏–∫–æ–≤: <b>{published}/{total}</b>"
-            + (f"\n\n–û—à–∏–±–∫–∏:\n{error_text}" if errors else ""),
-            reply_markup=keyboard([[('‚¨ÖÔ∏è –û–±—ä—è–≤–ª–µ–Ω–∏—è', 'po_items')]]),
-        )
-
-    async def show_playerok_notifications(target: Message, user_id: int) -> None:
-        row = await db.get_user(user_id)
-        await target.answer(
-            "üîµ <b>–£–≤–µ–¥–æ–º–ª–µ–Ω–∏—è Playerok</b>\n\n"
-            "–ü—Ä–æ–≤–µ—Ä–∫–∞ –≤—ã–ø–æ–ª–Ω—è–µ—Ç—Å—è –∫–∞–∂–¥—ã–µ 20 —Å–µ–∫—É–Ω–¥; –≤—Å–µ —Å–æ–æ–±—â–µ–Ω–∏—è –ø–æ–º–µ—á–∞—é—Ç—Å—è –ø–ª–æ—â–∞–¥–∫–æ–π.",
-            reply_markup=keyboard([
-                [(f"{bool_icon(row['playerok_notify_messages'])} –°–æ–æ–±—â–µ–Ω–∏—è", "po_toggle:playerok_notify_messages")],
-                [(f"{bool_icon(row['playerok_notify_deals'])} –°–¥–µ–ª–∫–∏ –∏ —Å—Ç–∞—Ç—É—Å—ã", "po_toggle:playerok_notify_deals")],
-                [(f"{bool_icon(row['playerok_notify_reviews'])} –û—Ç–∑—ã–≤—ã", "po_toggle:playerok_notify_reviews")],
-                [(f"{bool_icon(row['playerok_notify_delivery'])} –ê–≤—Ç–æ–≤—ã–¥–∞—á–∞", "po_toggle:playerok_notify_delivery")],
-                [(f"{bool_icon(row['playerok_notify_system'])} –û—à–∏–±–∫–∏ –ø–æ–¥–∫–ª—é—á–µ–Ω–∏—è", "po_toggle:playerok_notify_system")],
-                [("‚¨ÖÔ∏è –ú–µ–Ω—é", "menu")],
-            ]),
-        )
-
-    @router.callback_query(F.data == "po_notifications")
-    async def playerok_notifications(callback: CallbackQuery) -> None:
-        await callback.answer()
-        await show_playerok_notifications(callback.message, callback.from_user.id)
-
-    @router.callback_query(F.data.startswith("po_toggle:"))
-    async def playerok_toggle(callback: CallbackQuery) -> None:
-        column = callback.data.split(":", 1)[1]
-        allowed = {
-            "playerok_notify_messages",
-            "playerok_notify_deals",
-            "playerok_notify_reviews",
-            "playerok_notify_system",
-            "playerok_notify_delivery",
-            "playerok_autoreply_enabled",
-            "playerok_auto_delivery_enabled",
-            "playerok_auto_confirm_enabled",
-        }
-        row = await db.get_user(callback.from_user.id)
-        if not row or column not in allowed:
-            await callback.answer("–ù–µ–∏–∑–≤–µ—Å—Ç–Ω–∞—è –Ω–∞—Å—Ç—Ä–æ–π–∫–∞", show_alert=True)
-            return
-        await db.set_flag(callback.from_user.id, column, not row[column])
-        await callback.answer("–°–æ—Ö—Ä–∞–Ω–µ–Ω–æ")
-        if column == "playerok_autoreply_enabled":
-            await show_playerok_autoreply(callback.message, callback.from_user.id)
-        elif column in {"playerok_auto_delivery_enabled", "playerok_auto_confirm_enabled"}:
-            await show_playerok_delivery(callback.message, callback.from_user.id)
-        else:
-            await show_playerok_notifications(callback.message, callback.from_user.id)
-
-    async def show_playerok_account(target: Message, user_id: int) -> None:
-        row = await db.get_user(user_id)
-        account_row = await db.get_active_marketplace_account(user_id, "playerok")
-        accounts = await db.list_marketplace_accounts(user_id, "playerok")
-        if not row or not account_row:
-            await target.answer(
-                "Playerok –Ω–µ –ø–æ–¥–∫–ª—é—á—ë–Ω.",
-                reply_markup=keyboard([[("üîµ –ü–æ–¥–∫–ª—é—á–∏—Ç—å", "connect_playerok")]]),
-            )
-            return
-        try:
-            proxy = proxy_label(secrets.decrypt(account_row["proxy_enc"]))
-        except (InvalidToken, ValueError, TypeError):
-            proxy = "–Ω–µ —É–¥–∞–ª–æ—Å—å —Ä–∞—Å—à–∏—Ñ—Ä–æ–≤–∞—Ç—å"
-        status = "üü¢ —Ä–∞–±–æ—Ç–∞–µ—Ç" if manager.get_playerok(user_id) else "üî¥ –æ—Å—Ç–∞–Ω–æ–≤–ª–µ–Ω"
-        await target.answer(
-            "‚öôÔ∏è <b>–ê–∫–∫–∞—É–Ω—Ç Playerok</b>\n\n"
-            f"–ü–æ–ª—å–∑–æ–≤–∞—Ç–µ–ª—å: <b>{html.escape(account_row['username'] or '‚Äî')}</b>\n"
-            f"ID: <code>{html.escape(str(account_row['external_id'] or '‚Äî'))}</code>\n"
-            f"–í—Ö–æ–¥: <b>{'email + –∫–æ–¥' if account_row['auth_method'] == 'email' else 'cookie'}</b>\n"
-            f"–í—Å–µ–≥–æ –∞–∫–∫–∞—É–Ω—Ç–æ–≤: <b>{len(accounts)}</b>\n"
-            f"–ü—Ä–æ–∫—Å–∏: <code>{html.escape(proxy)}</code>\n"
-            f"–°–ª–µ–∂–µ–Ω–∏–µ: {status}",
-            reply_markup=keyboard([
-                [("üë• –ü–µ—Ä–µ–∫–ª—é—á–∏—Ç—å –∞–∫–∫–∞—É–Ω—Ç", "account_switch:playerok")],
-                [("‚ûï –î–æ–±–∞–≤–∏—Ç—å", "connect_playerok"), ("üîÑ –ü–µ—Ä–µ–ø–æ–¥–∫–ª—é—á–∏—Ç—å", "po_reconnect")],
-                [("üîê –ò–∑–º–µ–Ω–∏—Ç—å –≤—Ö–æ–¥", "connect_playerok")],
-                [("üóë –û—Ç–∫–ª—é—á–∏—Ç—å Playerok", "po_disconnect_ask")],
-                [("‚¨ÖÔ∏è –ú–µ–Ω—é", "menu")],
-            ]),
-        )
-
-    @router.callback_query(F.data == "po_account")
-    async def playerok_account(callback: CallbackQuery) -> None:
-        await callback.answer()
-        await show_playerok_account(callback.message, callback.from_user.id)
-
-    @router.callback_query(F.data == "po_reconnect")
-    async def playerok_reconnect(callback: CallbackQuery) -> None:
-        await callback.answer("–ü–µ—Ä–µ–ø–æ–¥–∫–ª—é—á–∞—é‚Ä¶")
-        try:
-            account_row = await db.get_active_marketplace_account(
-                callback.from_user.id, "playerok"
-            )
-            if not account_row:
-                raise RuntimeError("–∞–∫–∫–∞—É–Ω—Ç –Ω–µ –Ω–∞–π–¥–µ–Ω")
-            await manager.start_playerok(callback.from_user.id, row=account_row)
-        except Exception as exc:
-            logger.exception("–ü–µ—Ä–µ–ø–æ–¥–∫–ª—é—á–µ–Ω–∏–µ Playerok –Ω–µ —É–¥–∞–ª–æ—Å—å")
-            await callback.message.answer(f"‚ùå –ù–µ —É–¥–∞–ª–æ—Å—å: {html.escape(clipped(exc, 500))}")
-            return
-        await show_playerok_account(callback.message, callback.from_user.id)
-
-    @router.callback_query(F.data == "po_disconnect_ask")
-    async def playerok_disconnect_ask(callback: CallbackQuery) -> None:
-        await callback.answer()
-        await callback.message.answer(
-            "–£–¥–∞–ª–∏—Ç—å —Å–æ—Ö—Ä–∞–Ω—ë–Ω–Ω—ã–µ cookie –∏ –ø—Ä–æ–∫—Å–∏ Playerok –∏ –æ—Å—Ç–∞–Ω–æ–≤–∏—Ç—å —É–≤–µ–¥–æ–º–ª–µ–Ω–∏—è?",
-            reply_markup=keyboard([[("–î–∞, –æ—Ç–∫–ª—é—á–∏—Ç—å", "po_disconnect"), ("–ù–µ—Ç", "po_account")]]),
-        )
-
-    @router.callback_query(F.data == "po_disconnect")
-    async def playerok_disconnect(callback: CallbackQuery, state: FSMContext) -> None:
-        await callback.answer()
-        account_row = await db.get_active_marketplace_account(
-            callback.from_user.id, "playerok"
-        )
-        if account_row:
-            account_id = int(account_row["id"])
-            await manager.stop_playerok_account(account_id)
-            replacement = await db.delete_marketplace_account(
-                callback.from_user.id, "playerok", account_id
-            )
-            if replacement:
-                await manager.activate_account(
-                    callback.from_user.id, "playerok", int(replacement["id"])
-                )
-        await state.clear()
-        await callback.message.answer("–¢–µ–∫—É—â–∏–π Playerok-–∞–∫–∫–∞—É–Ω—Ç –∏ –µ–≥–æ —É—á—ë—Ç–Ω—ã–µ –¥–∞–Ω–Ω—ã–µ —É–¥–∞–ª–µ–Ω—ã.")
-        await show_main(callback.message, callback.from_user.id)
-
-    @router.callback_query(F.data == "menu")
-    async def menu_callback(callback: CallbackQuery) -> None:
-        await callback.answer()
-        await show_main(callback.message, callback.from_user.id)
-
-    @router.callback_query(F.data == "profile")
-    async def profile(callback: CallbackQuery) -> None:
-        await callback.answer("–ó–∞–≥—Ä—É–∂–∞—é‚Ä¶")
-        runtime = await require_runtime(callback.message, callback.from_user.id)
-        if not runtime:
-            return
-        try:
-            await asyncio.to_thread(runtime.account.get, True)
-            profile_obj = await asyncio.to_thread(runtime.account.get_user, runtime.account.id)
-            lots = profile_obj.get_lots()
-        except Exception:
-            logger.exception("–ù–µ —É–¥–∞–ª–æ—Å—å –ø–æ–ª—É—á–∏—Ç—å –ø—Ä–æ—Ñ–∏–ª—å")
-            await callback.message.answer("‚ùå –ù–µ —É–¥–∞–ª–æ—Å—å –∑–∞–≥—Ä—É–∑–∏—Ç—å –ø—Ä–æ—Ñ–∏–ª—å FunPay.")
-            return
-        common_lots = [lot for lot in lots if lot.subcategory.type is types.SubCategoryTypes.COMMON]
-        currency_lots = [lot for lot in lots if lot.subcategory.type is types.SubCategoryTypes.CURRENCY]
-        auto_delivery = sum(bool(lot.auto) for lot in lots)
-        subcategories = {lot.subcategory.id for lot in lots}
-        categories = {lot.subcategory.category.id for lot in lots}
-        buttons = [
-            [InlineKeyboardButton(text="üìä –°—Ç–∞—Ç–∏—Å—Ç–∏–∫–∞", callback_data="statistics")],
-            [
-                InlineKeyboardButton(text="üîÑ –û–±–Ω–æ–≤–∏—Ç—å", callback_data="profile"),
-                InlineKeyboardButton(
-                    text="üåê –ü—Ä–æ—Ñ–∏–ª—å FunPay",
-                    url=f"https://funpay.com/users/{profile_obj.id}/",
-                ),
-            ],
-            [InlineKeyboardButton(text="‚¨ÖÔ∏è –ú–µ–Ω—é", callback_data="menu")],
-        ]
-        if profile_obj.profile_photo:
-            buttons.insert(
-                2,
-                [
-                    InlineKeyboardButton(
-                        text="üñº –ê–≤–∞—Ç–∞—Ä –ø—Ä–æ—Ñ–∏–ª—è", url=profile_obj.profile_photo
-                    )
-                ],
-            )
-        await callback.message.answer(
-            "üë§ <b>–ü–æ–¥—Ä–æ–±–Ω—ã–π –ø—Ä–æ—Ñ–∏–ª—å</b>\n"
-            f"–ù–∏–∫: <b>{html.escape(profile_obj.username)}</b>\n"
-            f"ID: <code>{profile_obj.id}</code>\n"
-            f"–û–Ω–ª–∞–π–Ω: {bool_icon(profile_obj.online)}\n"
-            f"–ó–∞–±–ª–æ–∫–∏—Ä–æ–≤–∞–Ω: {'–¥–∞' if profile_obj.banned else '–Ω–µ—Ç'}\n"
-            f"–ê–∫—Ç–∏–≤–Ω—ã—Ö –ø—Ä–æ–¥–∞–∂: <b>{runtime.account.active_sales}</b>\n"
-            f"–ê–∫—Ç–∏–≤–Ω—ã—Ö –ø–æ–∫—É–ø–æ–∫: <b>{runtime.account.active_purchases}</b>\n"
-            f"–û–ø—É–±–ª–∏–∫–æ–≤–∞–Ω–æ –ª–æ—Ç–æ–≤: <b>{len(lots)}</b>\n"
-            f"„ÄÄ–û–±—ã—á–Ω—ã—Ö: <b>{len(common_lots)}</b>\n"
-            f"„ÄÄ–í–∞–ª—é—Ç–Ω—ã—Ö: <b>{len(currency_lots)}</b>\n"
-            f"„ÄÄ–° –∞–≤—Ç–æ–≤—ã–¥–∞—á–µ–π FunPay: <b>{auto_delivery}</b>\n"
-            f"–†–∞–∑–¥–µ–ª–æ–≤: <b>{len(subcategories)}</b> ¬∑ –∏–≥—Ä: <b>{len(categories)}</b>\n"
-            f"Runner: {'üü¢ —Ä–∞–±–æ—Ç–∞–µ—Ç' if manager.get(callback.from_user.id) else 'üî¥ –æ—Å—Ç–∞–Ω–æ–≤–ª–µ–Ω'}",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
-        )
-
-    @router.callback_query(F.data == "statistics")
-    async def statistics(callback: CallbackQuery) -> None:
-        await callback.answer()
-        await callback.message.answer(
-            "üìä <b>–ü–µ—Ä–∏–æ–¥ —Å—Ç–∞—Ç–∏—Å—Ç–∏–∫–∏ –ø—Ä–æ–¥–∞–∂</b>\n"
-            "–í—ã—Ä—É—á–∫–∞ —Å—á–∏—Ç–∞–µ—Ç—Å—è —Ç–æ–ª—å–∫–æ –ø–æ –∑–∞–∫—Ä—ã—Ç—ã–º –∑–∞–∫–∞–∑–∞–º.",
-            reply_markup=keyboard([
-                [("24 —á–∞—Å–∞", "stats:1"), ("7 –¥–Ω–µ–π", "stats:7"), ("30 –¥–Ω–µ–π", "stats:30")],
-                [("90 –¥–Ω–µ–π", "stats:90"), ("–ì–æ–¥", "stats:365"), ("–í—Å—ë –≤—Ä–µ–º—è", "stats:all")],
-                [("‚¨ÖÔ∏è –ü—Ä–æ—Ñ–∏–ª—å", "profile")],
-            ]),
-        )
-
-    @router.callback_query(F.data.startswith("stats:"))
-    async def statistics_period(callback: CallbackQuery) -> None:
-        await callback.answer("–°–æ–±–∏—Ä–∞—é –∑–∞–∫–∞–∑—ã‚Ä¶")
-        runtime = await require_runtime(callback.message, callback.from_user.id)
-        if not runtime:
-            return
-        raw_period = callback.data.split(":", 1)[1]
-        days = None if raw_period == "all" else int(raw_period)
-        try:
-            stats = await asyncio.to_thread(load_sales_stats, runtime.account, days)
-        except Exception:
-            logger.exception("–ù–µ —É–¥–∞–ª–æ—Å—å —Å–æ–±—Ä–∞—Ç—å —Å—Ç–∞—Ç–∏—Å—Ç–∏–∫—É –ø—Ä–æ–¥–∞–∂")
-            await callback.message.answer("‚ùå FunPay –Ω–µ –æ—Ç–¥–∞–ª —Å—Ç–∞—Ç–∏—Å—Ç–∏–∫—É –ø—Ä–æ–¥–∞–∂.")
-            return
-        await callback.message.answer(
-            format_sales_stats(stats),
-            reply_markup=keyboard([
-                [("üìÖ –î—Ä—É–≥–æ–π –ø–µ—Ä–∏–æ–¥", "statistics"), ("‚¨ÖÔ∏è –ü—Ä–æ—Ñ–∏–ª—å", "profile")],
-            ]),
-        )
-
-    @router.callback_query(F.data == "balance")
-    async def balance(callback: CallbackQuery) -> None:
-        await callback.answer("–ü—Ä–æ–≤–µ—Ä—è—é‚Ä¶")
-        runtime = await require_runtime(callback.message, callback.from_user.id)
-        if not runtime:
-            return
-        try:
-            await asyncio.to_thread(runtime.account.get, True)
-            detailed = await asyncio.to_thread(load_detailed_balance, runtime.account)
-        except Exception:
-            logger.exception("–ù–µ —É–¥–∞–ª–æ—Å—å –æ–±–Ω–æ–≤–∏—Ç—å –±–∞–ª–∞–Ω—Å")
-            await callback.message.answer("‚ùå –ù–µ —É–¥–∞–ª–æ—Å—å –ø—Ä–æ–≤–µ—Ä–∏—Ç—å –±–∞–ª–∞–Ω—Å FunPay.")
-            return
-        await callback.message.answer(
-            "üí∞ <b>–ë–∞–ª–∞–Ω—Å FunPay</b>\n\n"
-            f"üá∑üá∫ –í—Å–µ–≥–æ: <b>{format_money(detailed.total_rub)} ‚ÇΩ</b>\n"
-            f"„ÄÄ–ú–æ–∂–Ω–æ –≤—ã–≤–µ—Å—Ç–∏: <b>{format_money(detailed.available_rub)} ‚ÇΩ</b>\n"
-            f"„ÄÄ–û–∂–∏–¥–∞–µ—Ç —Ä–∞–∑–±–ª–æ–∫–∏—Ä–æ–≤–∫–∏: {format_money(detailed.total_rub - detailed.available_rub)} ‚ÇΩ\n\n"
-            f"üá∫üá∏ –í—Å–µ–≥–æ: <b>{format_money(detailed.total_usd)} $</b>\n"
-            f"„ÄÄ–ú–æ–∂–Ω–æ –≤—ã–≤–µ—Å—Ç–∏: <b>{format_money(detailed.available_usd)} $</b>\n"
-            f"„ÄÄ–û–∂–∏–¥–∞–µ—Ç —Ä–∞–∑–±–ª–æ–∫–∏—Ä–æ–≤–∫–∏: {format_money(detailed.total_usd - detailed.available_usd)} $\n\n"
-            f"üá™üá∫ –í—Å–µ–≥–æ: <b>{format_money(detailed.total_eur)} ‚Ç¨</b>\n"
-            f"„ÄÄ–ú–æ–∂–Ω–æ –≤—ã–≤–µ—Å—Ç–∏: <b>{format_money(detailed.available_eur)} ‚Ç¨</b>\n"
-            f"„ÄÄ–û–∂–∏–¥–∞–µ—Ç —Ä–∞–∑–±–ª–æ–∫–∏—Ä–æ–≤–∫–∏: {format_money(detailed.total_eur - detailed.available_eur)} ‚Ç¨\n\n"
-            f"–ê–∫—Ç–∏–≤–Ω—ã—Ö –ø—Ä–æ–¥–∞–∂: {runtime.account.active_sales}\n"
-            f"–ê–∫—Ç–∏–≤–Ω—ã—Ö –ø–æ–∫—É–ø–æ–∫: {runtime.account.active_purchases}",
-            reply_markup=keyboard([[("üîÑ –û–±–Ω–æ–≤–∏—Ç—å", "balance"), ("‚¨ÖÔ∏è –ú–µ–Ω—é", "menu")]]),
-        )
-
-    async def show_notifications(target: Message, user_id: int) -> None:
-        row = await db.get_user(user_id)
-        await target.answer(
-            "üîî <b>–ù–∞—Å—Ç—Ä–æ–π–∫–∏ —É–≤–µ–¥–æ–º–ª–µ–Ω–∏–π</b>",
-            reply_markup=keyboard([
-                [(f"{bool_icon(row['notify_messages'])} –°–æ–æ–±—â–µ–Ω–∏—è", "toggle:notify_messages")],
-                [(f"{bool_icon(row['notify_new_orders'])} –ù–æ–≤—ã–µ –∑–∞–∫–∞–∑—ã", "toggle:notify_new_orders")],
-                [(f"{bool_icon(row['notify_order_status'])} –°—Ç–∞—Ç—É—Å—ã –∑–∞–∫–∞–∑–æ–≤", "toggle:notify_order_status")],
-                [(f"{bool_icon(row['notify_reviews'])} –û—Ç–∑—ã–≤—ã", "toggle:notify_reviews")],
-                [(f"{bool_icon(row['notify_lots_raise'])} –ü–æ–¥–Ω—è—Ç–∏–µ –ª–æ—Ç–æ–≤", "toggle:notify_lots_raise")],
-                [(f"{bool_icon(row['notify_delivery'])} –ê–≤—Ç–æ–≤—ã–¥–∞—á–∞", "toggle:notify_delivery")],
-                [("üì° –î–æ–ø–æ–ª–Ω–∏—Ç–µ–ª—å–Ω—ã–µ —á–∞—Ç—ã", "notification_targets")],
-                [(f"{bool_icon(row['notify_system'])} –ó–∞–ø—É—Å–∫ –∏ –æ—à–∏–±–∫–∏", "toggle:notify_system")],
-                [("‚¨ÖÔ∏è –ú–µ–Ω—é", "menu")],
-            ]),
-        )
-
-    @router.callback_query(F.data == "notifications")
-    async def notifications(callback: CallbackQuery) -> None:
-        await callback.answer()
-        await show_notifications(callback.message, callback.from_user.id)
-
-    @router.callback_query(F.data.startswith("toggle:"))
-    async def toggle(callback: CallbackQuery) -> None:
-        column = callback.data.split(":", 1)[1]
-        row = await db.get_user(callback.from_user.id)
-        allowed_columns = {
-            "notify_messages",
-            "notify_new_orders",
-            "notify_order_status",
-            "notify_reviews",
-            "notify_lots_raise",
-            "notify_system",
-            "auto_raise_enabled",
-            "keep_online_enabled",
-            "autoreply_enabled",
-            "autoreply_new_chats_only",
-            "review_reply_enabled",
-            "auto_delivery_enabled",
-            "multi_delivery_enabled",
-            "delivery_auto_restore",
-            "delivery_auto_disable",
-            "notify_delivery",
-        }
-        if not row or column not in allowed_columns:
-            await callback.answer("–ù–µ–∏–∑–≤–µ—Å—Ç–Ω–∞—è –Ω–∞—Å—Ç—Ä–æ–π–∫–∞", show_alert=True)
-            return
-        await db.set_flag(callback.from_user.id, column, not row[column])
-        await callback.answer("–°–æ—Ö—Ä–∞–Ω–µ–Ω–æ")
-        if column == "keep_online_enabled":
-            try:
-                await manager.start(callback.from_user.id)
-            except Exception:
-                logger.exception("–ù–µ —É–¥–∞–ª–æ—Å—å –ø—Ä–∏–º–µ–Ω–∏—Ç—å –Ω–∞—Å—Ç—Ä–æ–π–∫—É –ø–æ–¥–¥–µ—Ä–∂–∞–Ω–∏—è —Å–µ—Å—Å–∏–∏")
-            await show_account(callback.message, callback.from_user.id)
-        elif column == "auto_raise_enabled":
-            runtime = manager.get(callback.from_user.id)
-            if runtime:
-                runtime.auto_raise_enabled = not row[column]
-            await show_auto_raise(callback.message, callback.from_user.id)
-        elif column in {"autoreply_enabled", "autoreply_new_chats_only"}:
-            await show_autoreply(callback.message, callback.from_user.id)
-        elif column == "review_reply_enabled":
-            await show_review_replies(callback.message, callback.from_user.id)
-        elif column in {
-            "auto_delivery_enabled",
-            "multi_delivery_enabled",
-            "delivery_auto_restore",
-            "delivery_auto_disable",
-            "notify_delivery",
-        }:
-            await show_delivery(callback.message, callback.from_user.id)
-        else:
-            await show_notifications(callback.message, callback.from_user.id)
-
-    async def show_notification_targets(target: Message, user_id: int) -> None:
-        targets = await db.list_notification_targets(user_id)
-        rows = [
-            [(
-                f"üóë {clipped(item['title'], 28)} ¬∑ {item['chat_id']}",
-                f"notification_target_delete:{item['chat_id']}",
-            )]
-            for item in targets
-        ]
-        rows.extend([
-            [("‚ûï –î–æ–±–∞–≤–∏—Ç—å —á–∞—Ç", "notification_target_add")],
-            [("‚¨ÖÔ∏è –£–≤–µ–¥–æ–º–ª–µ–Ω–∏—è", "notifications")],
-        ])
-        await target.answer(
-            "üì° <b>–î–æ–ø–æ–ª–Ω–∏—Ç–µ–ª—å–Ω—ã–µ —á–∞—Ç—ã —É–≤–µ–¥–æ–º–ª–µ–Ω–∏–π</b>\n\n"
-            "–ë–æ—Ç –æ—Ç–ø—Ä–∞–≤–ª—è–µ—Ç –∫–æ–ø–∏–∏ –≤—Å–µ—Ö –ø–æ–º–µ—á–µ–Ω–Ω—ã—Ö FunPay/Playerok-—É–≤–µ–¥–æ–º–ª–µ–Ω–∏–π –≤–ª–∞–¥–µ–ª—å—Ü—É –∏ –≤ —ç—Ç–∏ —á–∞—Ç—ã. "
-            "–ü–µ—Ä–µ–¥ –¥–æ–±–∞–≤–ª–µ–Ω–∏–µ–º –≤–∫–ª—é—á–∏—Ç–µ –±–æ—Ç–∞ –≤ –≥—Ä—É–ø–ø—É –∏–ª–∏ –∫–∞–Ω–∞–ª –∏ –≤—ã–¥–∞–π—Ç–µ –ø—Ä–∞–≤–æ –æ—Ç–ø—Ä–∞–≤–ª—è—Ç—å —Å–æ–æ–±—â–µ–Ω–∏—è.",
-            reply_markup=keyboard(rows),
-        )
-
-    @router.callback_query(F.data == "notification_targets")
-    async def notification_targets(callback: CallbackQuery) -> None:
-        await callback.answer()
-        await show_notification_targets(callback.message, callback.from_user.id)
-
-    @router.callback_query(F.data == "notification_target_add")
-    async def notification_target_add(callback: CallbackQuery, state: FSMContext) -> None:
-        await callback.answer()
-        await state.clear()
-        await state.set_state(NotificationTargetState.chat_id)
-        await callback.message.answer(
-            "–û—Ç–ø—Ä–∞–≤—å—Ç–µ —á–∏—Å–ª–æ–≤–æ–π ID –≥—Ä—É–ø–ø—ã –∏–ª–∏ –∫–∞–Ω–∞–ª–∞, –Ω–∞–ø—Ä–∏–º–µ—Ä <code>-1001234567890</code>. "
-            "–ë–æ—Ç –¥–æ–ª–∂–µ–Ω —É–∂–µ —Å–æ—Å—Ç–æ—è—Ç—å –≤ —ç—Ç–æ–º —á–∞—Ç–µ. –î–ª—è –æ—Ç–º–µ–Ω—ã: /cancel"
-        )
-
-    @router.message(NotificationTargetState.chat_id, F.text)
-    async def notification_target_save(message: Message, state: FSMContext) -> None:
-        try:
-            chat_id = int(message.text.strip())
-        except ValueError:
-            await message.answer("‚ùå –ù—É–∂–µ–Ω —á–∏—Å–ª–æ–≤–æ–π ID —á–∞—Ç–∞.")
-            return
-        try:
-            chat = await message.bot.get_chat(chat_id)
-            member = await message.bot.get_chat_member(chat_id, message.from_user.id)
-            member_status = getattr(member.status, "value", str(member.status))
-            if member_status not in {"administrator", "creator"}:
-                await message.answer(
-                    "‚ùå –î–æ–±–∞–≤–ª—è—Ç—å –≥—Ä—É–ø–ø—É –∏–ª–∏ –∫–∞–Ω–∞–ª –º–æ–∂–µ—Ç —Ç–æ–ª—å–∫–æ –µ–≥–æ —Å–æ–∑–¥–∞—Ç–µ–ª—å –∏–ª–∏ –∞–¥–º–∏–Ω–∏—Å—Ç—Ä–∞—Ç–æ—Ä."
-                )
-                return
-            title = getattr(chat, "title", None) or getattr(chat, "full_name", None) or str(chat_id)
-            await message.bot.send_message(
-                chat_id,
-                "‚úÖ –≠—Ç–æ—Ç —á–∞—Ç –ø–æ–¥–∫–ª—é—á—ë–Ω –¥–ª—è —É–≤–µ–¥–æ–º–ª–µ–Ω–∏–π FunPay/Playerok.",
-            )
-        except Exception as exc:  # noqa: BLE001 - Telegram returns several API exception types.
-            await message.answer(
-                f"‚ùå –ë–æ—Ç –Ω–µ –º–æ–∂–µ—Ç –ø–∏—Å–∞—Ç—å –≤ —ç—Ç–æ—Ç —á–∞—Ç: {html.escape(clipped(exc, 400))}"
-            )
-            return
-        await db.save_notification_target(message.from_user.id, chat_id, clipped(title, 120))
-        await state.clear()
-        await message.answer("‚úÖ –î–æ–ø–æ–ª–Ω–∏—Ç–µ–ª—å–Ω—ã–π —á–∞—Ç —Å–æ—Ö—Ä–∞–Ω—ë–Ω.")
-        await show_notification_targets(message, message.from_user.id)
-
-    @router.callback_query(F.data.startswith("notification_target_delete:"))
-    async def notification_target_delete_ask(callback: CallbackQuery) -> None:
-        chat_id = int(callback.data.split(":", 1)[1])
-        await callback.answer()
-        await callback.message.answer(
-            f"–£–¥–∞–ª–∏—Ç—å –¥–æ–ø–æ–ª–Ω–∏—Ç–µ–ª—å–Ω—ã–π —á–∞—Ç <code>{chat_id}</code>?",
-            reply_markup=keyboard([
-                [("–î–∞, —É–¥–∞–ª–∏—Ç—å", f"notification_target_delete_do:{chat_id}")],
-                [("–û—Ç–º–µ–Ω–∞", "notification_targets")],
-            ]),
-        )
-
-    @router.callback_query(F.data.startswith("notification_target_delete_do:"))
-    async def notification_target_delete(callback: CallbackQuery) -> None:
-        chat_id = int(callback.data.split(":", 1)[1])
-        await db.delete_notification_target(callback.from_user.id, chat_id)
-        await callback.answer("–ß–∞—Ç —É–¥–∞–ª—ë–Ω")
-        await show_notification_targets(callback.message, callback.from_user.id)
-
-    async def show_delivery(target: Message, user_id: int) -> None:
-        if not await require_runtime(target, user_id):
-            return
-        row = await db.get_user(user_id)
-        rules = await db.list_delivery_rules(user_id)
-        rows = [
-            [(
-                f"{'‚úÖ' if rule['enabled'] else '‚ùå'} {clipped(rule['lot_title'], 28)} ¬∑ {len(rule['products'])}",
-                f"delivery_rule:{rule['id']}",
-            )]
-            for rule in rules[:30]
-        ]
-        rows.extend([
-            [("‚ûï –î–æ–±–∞–≤–∏—Ç—å –∏–∑ –ª–æ—Ç–æ–≤", "delivery_add")],
-            [(f"{bool_icon(row['auto_delivery_enabled'])} –ê–≤—Ç–æ–≤—ã–¥–∞—á–∞", "toggle:auto_delivery_enabled")],
-            [(f"{bool_icon(row['multi_delivery_enabled'])} –í—ã–¥–∞–≤–∞—Ç—å –∫–æ–ª–∏—á–µ—Å—Ç–≤–æ –∑–∞–∫–∞–∑–∞", "toggle:multi_delivery_enabled")],
-            [(f"{bool_icon(row['delivery_auto_restore'])} –ê–≤—Ç–æ–≤–æ—Å—Å—Ç–∞–Ω–æ–≤–ª–µ–Ω–∏–µ", "toggle:delivery_auto_restore")],
-            [(f"{bool_icon(row['delivery_auto_disable'])} –í—ã–∫–ª—é—á–∞—Ç—å –±–µ–∑ —Ç–æ–≤–∞—Ä–∞", "toggle:delivery_auto_disable")],
-            [(f"{bool_icon(row['notify_delivery'])} –£–≤–µ–¥–æ–º–ª—è—Ç—å –æ –≤—ã–¥–∞—á–µ", "toggle:notify_delivery")],
-            [("‚¨ÖÔ∏è –ú–µ–Ω—é", "menu")],
-        ])
-        await target.answer(
-            "üì§ <b>–ê–≤—Ç–æ–≤—ã–¥–∞—á–∞ Cardinal</b>\n\n"
-            f"–ü—Ä–∞–≤–∏–ª: <b>{len(rules)}</b>. –ß–∏—Å–ª–æ —Å–ø—Ä–∞–≤–∞ ‚Äî –æ—Å—Ç–∞—Ç–æ–∫ —à—Ç—É—á–Ω—ã—Ö —Ç–æ–≤–∞—Ä–æ–≤. "
-            "–ï—Å–ª–∏ –≤ —à–∞–±–ª–æ–Ω–µ –Ω–µ—Ç <code>$product</code>, –æ—Ç–≤–µ—Ç —Å—á–∏—Ç–∞–µ—Ç—Å—è –±–µ–∑–ª–∏–º–∏—Ç–Ω—ã–º.\n\n"
-            "–ü–µ—Ä–µ–º–µ–Ω–Ω—ã–µ –∑–∞–∫–∞–∑–∞: $order_id, $order_title, $username, $chat_id, $date, $time. "
-            "–ü—Ä–∏ $product –æ–¥–Ω–∞ —Å—Ç—Ä–æ–∫–∞ –∑–∞–ø–∞—Å–∞ –≤—ã–¥–∞—ë—Ç—Å—è –∑–∞ –∫–∞–∂–¥—É—é –∫—É–ø–ª–µ–Ω–Ω—É—é –µ–¥–∏–Ω–∏—Ü—É.",
-            reply_markup=keyboard(rows),
-        )
-
-    @router.callback_query(F.data == "delivery")
-    async def delivery(callback: CallbackQuery) -> None:
-        await callback.answer()
-        await show_delivery(callback.message, callback.from_user.id)
-
-    @router.callback_query(F.data == "delivery_add")
-    async def delivery_add(callback: CallbackQuery) -> None:
-        runtime = await require_runtime(callback.message, callback.from_user.id)
-        if not runtime:
-            await callback.answer()
-            return
-        await callback.answer("–ü–æ–ª—É—á–∞—é –ª–æ—Ç—ã‚Ä¶")
-        try:
-            profile = await asyncio.to_thread(runtime.account.get_user, runtime.account.id)
-            lots = [
-                lot
-                for lot in profile.get_lots()
-                if lot.subcategory.type is types.SubCategoryTypes.COMMON and lot.description
-            ]
-        except Exception:
-            logger.exception("–ù–µ –∑–∞–≥—Ä—É–∂–µ–Ω—ã –ª–æ—Ç—ã –¥–ª—è –∞–≤—Ç–æ–≤—ã–¥–∞—á–∏")
-            await callback.message.answer("‚ùå FunPay –Ω–µ –æ—Ç–¥–∞–ª —Å–ø–∏—Å–æ–∫ –æ–±—ã—á–Ω—ã—Ö –ª–æ—Ç–æ–≤.")
-            return
-        rows = [
-            [(clipped(lot.description, 35), f"delivery_pick:{lot.id}")]
-            for lot in lots[:40]
-        ]
-        rows.append([("‚¨ÖÔ∏è –ê–≤—Ç–æ–≤—ã–¥–∞—á–∞", "delivery")])
-        await callback.message.answer(
-            "–í—ã–±–µ—Ä–∏—Ç–µ –ª–æ—Ç. –ü–æ–∫–∞–∑–∞–Ω—ã –ø–µ—Ä–≤—ã–µ 40 –æ–±—ã—á–Ω—ã—Ö –ª–æ—Ç–æ–≤:",
-            reply_markup=keyboard(rows),
-        )
-
-    async def resolve_funpay_lot(runtime: AccountRuntime, lot_id: int) -> Any | None:
-        profile = await asyncio.to_thread(runtime.account.get_user, runtime.account.id)
-        return next((lot for lot in profile.get_lots() if int(lot.id) == lot_id), None)
-
-    @router.callback_query(F.data.startswith("delivery_pick:"))
-    async def delivery_pick(callback: CallbackQuery, state: FSMContext) -> None:
-        lot_id = int(callback.data.split(":", 1)[1])
-        runtime = await require_runtime(callback.message, callback.from_user.id)
-        if not runtime:
-            await callback.answer()
-            return
-        try:
-            lot = await resolve_funpay_lot(runtime, lot_id)
-        except Exception:  # noqa: BLE001 - stale lots can fail in several FunPay API layers.
-            lot = None
-        if not lot or not lot.description:
-            await callback.answer("–õ–æ—Ç –±–æ–ª—å—à–µ –Ω–µ –Ω–∞–π–¥–µ–Ω", show_alert=True)
-            return
-        await callback.answer()
-        await state.clear()
-        await state.set_state(DeliveryRuleState.response)
-        await state.update_data(delivery_lot_id=lot_id, delivery_lot_title=lot.description)
-        await callback.message.answer(
-            f"–õ–æ—Ç: <b>{html.escape(clipped(lot.description, 1000))}</b>\n\n"
-            "–û—Ç–ø—Ä–∞–≤—å—Ç–µ —Ç–µ–∫—Å—Ç –≤—ã–¥–∞—á–∏ –¥–æ 3000 —Å–∏–º–≤–æ–ª–æ–≤. –î–æ–±–∞–≤—å—Ç–µ <code>$product</code> –≤ –º–µ—Å—Ç–æ, "
-            "–∫—É–¥–∞ –¥–æ–ª–∂–Ω—ã –ø–æ–¥—Å—Ç–∞–≤–ª—è—Ç—å—Å—è —Å—Ç—Ä–æ–∫–∏ –∏–∑ –∑–∞–ø–∞—Å–∞. –î–ª—è –æ—Ç–º–µ–Ω—ã: /cancel"
-        )
-
-    @router.message(DeliveryRuleState.response, F.text)
-    async def delivery_response_save(message: Message, state: FSMContext) -> None:
-        response = message.text.strip()
-        if not 1 <= len(response) <= 3000:
-            await message.answer("–¢–µ–∫—Å—Ç –¥–æ–ª–∂–µ–Ω —Å–æ–¥–µ—Ä–∂–∞—Ç—å –æ—Ç 1 –¥–æ 3000 —Å–∏–º–≤–æ–ª–æ–≤.")
-            return
-        data = await state.get_data()
-        existing_rule_id = data.get("delivery_rule_id")
-        if existing_rule_id:
-            existing = await db.get_delivery_rule(
-                message.from_user.id, int(existing_rule_id)
-            )
-            if not existing:
-                await state.clear()
-                await message.answer("–ü—Ä–∞–≤–∏–ª–æ –±–æ–ª—å—à–µ –Ω–µ –Ω–∞–π–¥–µ–Ω–æ.")
-                return
-            rule = await db.save_delivery_rule(
-                message.from_user.id,
-                existing["lot_id"],
-                existing["lot_title"],
-                response,
-            )
-            await state.clear()
-            await message.answer("‚úÖ –®–∞–±–ª–æ–Ω –≤—ã–¥–∞—á–∏ –æ–±–Ω–æ–≤–ª—ë–Ω.")
-            await show_delivery_rule(message, message.from_user.id, int(rule["id"]))
-            return
-        lot_id = data.get("delivery_lot_id")
-        lot_title = data.get("delivery_lot_title")
-        if not lot_id or not lot_title:
-            await state.clear()
-            await message.answer("–°–µ—Å—Å–∏—è –Ω–∞—Å—Ç—Ä–æ–π–∫–∏ –∏—Å—Ç–µ–∫–ª–∞.")
-            return
-        rule = await db.save_delivery_rule(message.from_user.id, lot_id, lot_title, response)
-        await state.clear()
-        await message.answer("‚úÖ –ü—Ä–∞–≤–∏–ª–æ –∞–≤—Ç–æ–≤—ã–¥–∞—á–∏ —Å–æ—Ö—Ä–∞–Ω–µ–Ω–æ.")
-        await show_delivery_rule(message, message.from_user.id, int(rule["id"]))
-
-    async def show_delivery_rule(target: Message, user_id: int, rule_id: int) -> None:
-        rule = await db.get_delivery_rule(user_id, rule_id)
-        if not rule:
-            await target.answer("–ü—Ä–∞–≤–∏–ª–æ –Ω–µ –Ω–∞–π–¥–µ–Ω–æ.")
-            return
-        stock = list(rule["products"] or [])
-        preview = "\n".join(f"‚Ä¢ {html.escape(clipped(item, 100))}" for item in stock[:5])
-        await target.answer(
-            f"üì¶ <b>{html.escape(clipped(rule['lot_title'], 1000))}</b>\n\n"
-            f"–õ–æ—Ç ID: <code>{rule['lot_id']}</code>\n"
-            f"–°–æ—Å—Ç–æ—è–Ω–∏–µ: {bool_icon(rule['enabled'])}\n"
-            f"–ó–∞–ø–∞—Å: <b>{len(stock)}</b>\n"
-            f"–®–∞–±–ª–æ–Ω:\n<pre>{html.escape(clipped(rule['response'], 1500))}</pre>"
-            + (f"\n–ü–µ—Ä–≤—ã–µ —Ç–æ–≤–∞—Ä—ã:\n{preview}" if preview else ""),
-            reply_markup=keyboard([
-                [("‚ûï –î–æ–±–∞–≤–∏—Ç—å —Ç–æ–≤–∞—Ä—ã", f"delivery_stock:{rule_id}")],
-                [("‚úèÔ∏è –ò–∑–º–µ–Ω–∏—Ç—å —à–∞–±–ª–æ–Ω", f"delivery_edit:{rule_id}")],
-                [("üßπ –û—á–∏—Å—Ç–∏—Ç—å –∑–∞–ø–∞—Å", f"delivery_clear_ask:{rule_id}")],
-                [("–í—ã–∫–ª—é—á–∏—Ç—å" if rule["enabled"] else "–í–∫–ª—é—á–∏—Ç—å", f"delivery_toggle:{rule_id}")],
-                [(
-                    f"{bool_icon(not rule['disable_auto_restore'])} –í–æ—Å—Å—Ç–∞–Ω–∞–≤–ª–∏–≤–∞—Ç—å —ç—Ç–æ—Ç –ª–æ—Ç",
-                    f"delivery_rule_restore:{rule_id}",
-                )],
-                [(
-                    f"{bool_icon(not rule['disable_auto_disable'])} –í—ã–∫–ª—é—á–∞—Ç—å –±–µ–∑ —Ç–æ–≤–∞—Ä–∞",
-                    f"delivery_rule_disable:{rule_id}",
-                )],
-                [("üóë –£–¥–∞–ª–∏—Ç—å", f"delivery_delete_ask:{rule_id}")],
-                [("‚¨ÖÔ∏è –ê–≤—Ç–æ–≤—ã–¥–∞—á–∞", "delivery")],
-            ]),
-        )
-
-    @router.callback_query(F.data.startswith("delivery_rule:"))
-    async def delivery_rule(callback: CallbackQuery) -> None:
-        await callback.answer()
-        await show_delivery_rule(
-            callback.message, callback.from_user.id, int(callback.data.split(":", 1)[1])
-        )
-
-    @router.callback_query(F.data.startswith("delivery_stock:"))
-    async def delivery_stock(callback: CallbackQuery, state: FSMContext) -> None:
-        rule_id = int(callback.data.split(":", 1)[1])
-        if not await db.get_delivery_rule(callback.from_user.id, rule_id):
-            await callback.answer("–ü—Ä–∞–≤–∏–ª–æ –Ω–µ –Ω–∞–π–¥–µ–Ω–æ", show_alert=True)
-            return
-        await callback.answer()
-        await state.clear()
-        await state.set_state(DeliveryRuleState.products)
-        await state.update_data(delivery_rule_id=rule_id)
-        await callback.message.answer(
-            "–û—Ç–ø—Ä–∞–≤—å—Ç–µ —Ç–æ–≤–∞—Ä—ã —Ç–µ–∫—Å—Ç–æ–º: –æ–¥–∏–Ω —Ç–æ–≤–∞—Ä –∏–ª–∏ –∫–ª—é—á –Ω–∞ —Å—Ç—Ä–æ–∫—É. –î–æ 500 —Å—Ç—Ä–æ–∫ –∑–∞ —Ä–∞–∑. "
-            "–ü–æ—Å–ª–µ–¥–æ–≤–∞—Ç–µ–ª—å–Ω–æ—Å—Ç—å —Å–æ—Ö—Ä–∞–Ω—è–µ—Ç—Å—è. –î–ª—è –æ—Ç–º–µ–Ω—ã: /cancel"
-        )
-
-    @router.callback_query(F.data.startswith("delivery_edit:"))
-    async def delivery_edit(callback: CallbackQuery, state: FSMContext) -> None:
-        rule_id = int(callback.data.split(":", 1)[1])
-        rule = await db.get_delivery_rule(callback.from_user.id, rule_id)
-        if not rule:
-            await callback.answer("–ü—Ä–∞–≤–∏–ª–æ –Ω–µ –Ω–∞–π–¥–µ–Ω–æ", show_alert=True)
-            return
-        await callback.answer()
-        await state.clear()
-        await state.set_state(DeliveryRuleState.response)
-        await state.update_data(delivery_rule_id=rule_id)
-        await callback.message.answer(
-            "–û—Ç–ø—Ä–∞–≤—å—Ç–µ –Ω–æ–≤—ã–π —à–∞–±–ª–æ–Ω –≤—ã–¥–∞—á–∏ –¥–æ 3000 —Å–∏–º–≤–æ–ª–æ–≤. "
-            "–î–ª—è —à—Ç—É—á–Ω–æ–≥–æ —Ç–æ–≤–∞—Ä–∞ –∏—Å–ø–æ–ª—å–∑—É–π—Ç–µ <code>$product</code>. –î–ª—è –æ—Ç–º–µ–Ω—ã: /cancel\n\n"
-            f"–°–µ–π—á–∞—Å:\n<pre>{html.escape(clipped(rule['response'], 1800))}</pre>"
-        )
-
-    @router.message(DeliveryRuleState.products, F.text)
-    async def delivery_stock_save(message: Message, state: FSMContext) -> None:
-        products = [line.strip() for line in message.text.splitlines() if line.strip()]
-        if not products or len(products) > 500 or any(len(item) > 1000 for item in products):
-            await message.answer("–ù—É–∂–Ω–æ –æ—Ç 1 –¥–æ 500 –Ω–µ–ø—É—Å—Ç—ã—Ö —Å—Ç—Ä–æ–∫, –∫–∞–∂–¥–∞—è –Ω–µ –¥–ª–∏–Ω–Ω–µ–µ 1000 —Å–∏–º–≤–æ–ª–æ–≤.")
-            return
-        data = await state.get_data()
-        rule_id = int(data.get("delivery_rule_id") or 0)
-        await db.add_delivery_products(message.from_user.id, rule_id, products)
-        await state.clear()
-        await message.answer(f"‚úÖ –î–æ–±–∞–≤–ª–µ–Ω–æ —Ç–æ–≤–∞—Ä–æ–≤: <b>{len(products)}</b>.")
-        await show_delivery_rule(message, message.from_user.id, rule_id)
-
-    @router.callback_query(F.data.startswith("delivery_toggle:"))
-    async def delivery_toggle(callback: CallbackQuery) -> None:
-        rule_id = int(callback.data.split(":", 1)[1])
-        await db.toggle_delivery_rule(callback.from_user.id, rule_id)
-        await callback.answer("–°–æ—Ö—Ä–∞–Ω–µ–Ω–æ")
-        await show_delivery_rule(callback.message, callback.from_user.id, rule_id)
-
-    @router.callback_query(F.data.startswith("delivery_rule_restore:"))
-    async def delivery_rule_restore(callback: CallbackQuery) -> None:
-        rule_id = int(callback.data.split(":", 1)[1])
-        await db.toggle_delivery_rule_option(
-            callback.from_user.id, rule_id, "disable_auto_restore"
-        )
-        await callback.answer("–°–æ—Ö—Ä–∞–Ω–µ–Ω–æ")
-        await show_delivery_rule(callback.message, callback.from_user.id, rule_id)
-
-    @router.callback_query(F.data.startswith("delivery_rule_disable:"))
-    async def delivery_rule_disable(callback: CallbackQuery) -> None:
-        rule_id = int(callback.data.split(":", 1)[1])
-        await db.toggle_delivery_rule_option(
-            callback.from_user.id, rule_id, "disable_auto_disable"
-        )
-        await callback.answer("–°–æ—Ö—Ä–∞–Ω–µ–Ω–æ")
-        await show_delivery_rule(callback.message, callback.from_user.id, rule_id)
-
-    @router.callback_query(F.data.startswith("delivery_clear_ask:"))
-    async def delivery_clear_ask(callback: CallbackQuery) -> None:
-        rule_id = int(callback.data.split(":", 1)[1])
-        await callback.answer()
-        await callback.message.answer(
-            "–£–¥–∞–ª–∏—Ç—å –≤–µ—Å—å –∑–∞–ø–∞—Å —Ç–æ–≤–∞—Ä–æ–≤ –±–µ–∑ –≤–æ–∑–º–æ–∂–Ω–æ—Å—Ç–∏ –≤–æ—Å—Å—Ç–∞–Ω–æ–≤–ª–µ–Ω–∏—è?",
-            reply_markup=keyboard([
-                [("–î–∞, –æ—á–∏—Å—Ç–∏—Ç—å", f"delivery_clear:{rule_id}")],
-                [("–û—Ç–º–µ–Ω–∞", f"delivery_rule:{rule_id}")],
-            ]),
-        )
-
-    @router.callback_query(F.data.startswith("delivery_clear:"))
-    async def delivery_clear(callback: CallbackQuery) -> None:
-        rule_id = int(callback.data.split(":", 1)[1])
-        await db.clear_delivery_products(callback.from_user.id, rule_id)
-        await callback.answer("–ó–∞–ø–∞—Å –æ—á–∏—â–µ–Ω")
-        await show_delivery_rule(callback.message, callback.from_user.id, rule_id)
-
-    @router.callback_query(F.data.startswith("delivery_delete_ask:"))
-    async def delivery_delete_ask(callback: CallbackQuery) -> None:
-        rule_id = int(callback.data.split(":", 1)[1])
-        await callback.answer()
-        await callback.message.answer(
-            "–£–¥–∞–ª–∏—Ç—å –ø—Ä–∞–≤–∏–ª–æ –∏ –≤–µ—Å—å –µ–≥–æ –∑–∞–ø–∞—Å?",
-            reply_markup=keyboard([
-                [("–î–∞, —É–¥–∞–ª–∏—Ç—å", f"delivery_delete:{rule_id}")],
-                [("–û—Ç–º–µ–Ω–∞", f"delivery_rule:{rule_id}")],
-            ]),
-        )
-
-    @router.callback_query(F.data.startswith("delivery_delete:"))
-    async def delivery_delete(callback: CallbackQuery) -> None:
-        rule_id = int(callback.data.split(":", 1)[1])
-        await db.delete_delivery_rule(callback.from_user.id, rule_id)
-        await callback.answer("–ü—Ä–∞–≤–∏–ª–æ —É–¥–∞–ª–µ–Ω–æ")
-        await show_delivery(callback.message, callback.from_user.id)
-
-    async def show_command_replies(target: Message, user_id: int) -> None:
-        if not await require_runtime(target, user_id):
-            return
-        replies = await db.list_command_replies(user_id)
-        rows = [
-            [(
-                f"{'‚úÖ' if item['enabled'] else '‚ùå'} {clipped(item['trigger'], 35)}",
-                f"command_reply:{item['id']}",
-            )]
-            for item in replies[:50]
-        ]
-        rows.extend([
-            [("‚ûï –î–æ–±–∞–≤–∏—Ç—å –∫–æ–º–∞–Ω–¥—É", "command_reply_add")],
-            [("‚¨ÖÔ∏è –ú–µ–Ω—é", "menu")],
-        ])
-        await target.answer(
-            "‚å®Ô∏è <b>–û—Ç–≤–µ—Ç—ã –Ω–∞ –∫–æ–º–∞–Ω–¥—ã Cardinal</b>\n\n"
-            "–ö–æ–º–∞–Ω–¥–∞ —Å—Ä–∞–≤–Ω–∏–≤–∞–µ—Ç—Å—è —Å–æ –≤—Å–µ–º —Å–æ–æ–±—â–µ–Ω–∏–µ–º –±–µ–∑ —É—á—ë—Ç–∞ —Ä–µ–≥–∏—Å—Ç—Ä–∞ –∏ –ø—Ä–æ–±–µ–ª–æ–≤ –ø–æ –∫—Ä–∞—è–º. "
-            "–û–Ω–∞ –∏–º–µ–µ—Ç –ø—Ä–∏–æ—Ä–∏—Ç–µ—Ç –Ω–∞–¥ –æ–±—ã—á–Ω—ã–º –∞–≤—Ç–æ–æ—Ç–≤–µ—Ç—á–∏–∫–æ–º.",
-            reply_markup=keyboard(rows),
-        )
-
-    @router.callback_query(F.data == "command_replies")
-    async def command_replies(callback: CallbackQuery) -> None:
-        await callback.answer()
-        await show_command_replies(callback.message, callback.from_user.id)
-
-    @router.callback_query(F.data == "command_reply_add")
-    async def command_reply_add(callback: CallbackQuery, state: FSMContext) -> None:
-        await callback.answer()
-        await state.clear()
-        await state.set_state(CommandReplyState.trigger)
-        await callback.message.answer(
-            "–û—Ç–ø—Ä–∞–≤—å—Ç–µ –∫–æ–º–∞–Ω–¥—É –ø–æ–∫—É–ø–∞—Ç–µ–ª—è, –Ω–∞–ø—Ä–∏–º–µ—Ä <code>!–Ω–∞–ª–∏—á–∏–µ</code> –∏–ª–∏ <code>#help</code>. "
-            "–î–æ 100 —Å–∏–º–≤–æ–ª–æ–≤, –æ–¥–Ω–æ–π —Å—Ç—Ä–æ–∫–æ–π. –î–ª—è –æ—Ç–º–µ–Ω—ã: /cancel"
-        )
-
-    @router.message(CommandReplyState.trigger, F.text)
-    async def command_reply_trigger(message: Message, state: FSMContext) -> None:
-        trigger = message.text.casefold().strip()
-        if not 1 <= len(trigger) <= 100 or "\n" in trigger:
-            await message.answer("–ö–æ–º–∞–Ω–¥–∞ –¥–æ–ª–∂–Ω–∞ –±—ã—Ç—å –æ–¥–Ω–æ–π —Å—Ç—Ä–æ–∫–æ–π –æ—Ç 1 –¥–æ 100 —Å–∏–º–≤–æ–ª–æ–≤.")
-            return
-        await state.update_data(command_trigger=trigger)
-        await state.set_state(CommandReplyState.response)
-        await message.answer(
-            "–¢–µ–ø–µ—Ä—å –æ—Ç–ø—Ä–∞–≤—å—Ç–µ –æ—Ç–≤–µ—Ç –¥–æ 3000 —Å–∏–º–≤–æ–ª–æ–≤. –ú–æ–∂–Ω–æ –∏—Å–ø–æ–ª—å–∑–æ–≤–∞—Ç—å –ø–µ—Ä–µ–º–µ–Ω–Ω—ã–µ –∞–≤—Ç–æ–æ—Ç–≤–µ—Ç—á–∏–∫–∞."
-        )
-
-    @router.message(CommandReplyState.response, F.text)
-    async def command_reply_response(message: Message, state: FSMContext) -> None:
-        response = message.text.strip()
-        if not 1 <= len(response) <= 3000:
-            await message.answer("–û—Ç–≤–µ—Ç –¥–æ–ª–∂–µ–Ω —Å–æ–¥–µ—Ä–∂–∞—Ç—å –æ—Ç 1 –¥–æ 3000 —Å–∏–º–≤–æ–ª–æ–≤.")
-            return
-        data = await state.get_data()
-        trigger = data.get("command_trigger")
-        if not trigger:
-            await state.clear()
-            await message.answer("–°–µ—Å—Å–∏—è –Ω–∞—Å—Ç—Ä–æ–π–∫–∏ –∏—Å—Ç–µ–∫–ª–∞.")
-            return
-        item = await db.save_command_reply(message.from_user.id, trigger, response)
-        await state.clear()
-        await message.answer("‚úÖ –ö–æ–º–∞–Ω–¥–∞ —Å–æ—Ö—Ä–∞–Ω–µ–Ω–∞.")
-        await show_command_reply(message, message.from_user.id, int(item["id"]))
-
-    async def show_command_reply(target: Message, user_id: int, reply_id: int) -> None:
-        item = await db.get_command_reply(user_id, reply_id)
-        if not item:
-            await target.answer("–ö–æ–º–∞–Ω–¥–∞ –Ω–µ –Ω–∞–π–¥–µ–Ω–∞.")
-            return
-        await target.answer(
-            "‚å®Ô∏è <b>–ö–æ–º–∞–Ω–¥–∞</b>\n\n"
-            f"–¢—Ä–∏–≥–≥–µ—Ä: <code>{html.escape(item['trigger'])}</code>\n"
-            f"–°–æ—Å—Ç–æ—è–Ω–∏–µ: {bool_icon(item['enabled'])}\n"
-            f"–£–≤–µ–¥–æ–º–ª–µ–Ω–∏–µ –æ —Å—Ä–∞–±–∞—Ç—ã–≤–∞–Ω–∏–∏: {bool_icon(item['notify'])}\n\n"
-            f"–û—Ç–≤–µ—Ç:\n<pre>{html.escape(clipped(item['response'], 2000))}</pre>",
-            reply_markup=keyboard([
-                [("–í—ã–∫–ª—é—á–∏—Ç—å" if item["enabled"] else "–í–∫–ª—é—á–∏—Ç—å", f"command_toggle:{reply_id}")],
-                [("‚úèÔ∏è –ò–∑–º–µ–Ω–∏—Ç—å –æ—Ç–≤–µ—Ç", f"command_edit:{reply_id}")],
-                [("üîî –ü–µ—Ä–µ–∫–ª—é—á–∏—Ç—å —É–≤–µ–¥–æ–º–ª–µ–Ω–∏–µ", f"command_notify:{reply_id}")],
-                [("üóë –£–¥–∞–ª–∏—Ç—å", f"command_delete_ask:{reply_id}")],
-                [("‚¨ÖÔ∏è –ö–æ–º–∞–Ω–¥—ã", "command_replies")],
-            ]),
-        )
-
-    @router.callback_query(F.data.startswith("command_reply:"))
-    async def command_reply(callback: CallbackQuery) -> None:
-        await callback.answer()
-        await show_command_reply(
-            callback.message, callback.from_user.id, int(callback.data.split(":", 1)[1])
-        )
-
-    @router.callback_query(F.data.startswith("command_toggle:"))
-    async def command_toggle(callback: CallbackQuery) -> None:
-        reply_id = int(callback.data.split(":", 1)[1])
-        await db.toggle_command_reply(callback.from_user.id, reply_id)
-        await callback.answer("–°–æ—Ö—Ä–∞–Ω–µ–Ω–æ")
-        await show_command_reply(callback.message, callback.from_user.id, reply_id)
-
-    @router.callback_query(F.data.startswith("command_edit:"))
-    async def command_edit(callback: CallbackQuery, state: FSMContext) -> None:
-        reply_id = int(callback.data.split(":", 1)[1])
-        item = await db.get_command_reply(callback.from_user.id, reply_id)
-        if not item:
-            await callback.answer("–ö–æ–º–∞–Ω–¥–∞ –Ω–µ –Ω–∞–π–¥–µ–Ω–∞", show_alert=True)
-            return
-        await callback.answer()
-        await state.clear()
-        await state.set_state(CommandReplyState.response)
-        await state.update_data(command_trigger=item["trigger"])
-        await callback.message.answer(
-            "–û—Ç–ø—Ä–∞–≤—å—Ç–µ –Ω–æ–≤—ã–π –æ—Ç–≤–µ—Ç –¥–æ 3000 —Å–∏–º–≤–æ–ª–æ–≤. –î–ª—è –æ—Ç–º–µ–Ω—ã: /cancel\n\n"
-            f"–°–µ–π—á–∞—Å:\n<pre>{html.escape(clipped(item['response'], 1800))}</pre>"
-        )
-
-    @router.callback_query(F.data.startswith("command_notify:"))
-    async def command_notify(callback: CallbackQuery) -> None:
-        reply_id = int(callback.data.split(":", 1)[1])
-        await db.toggle_command_notification(callback.from_user.id, reply_id)
-        await callback.answer("–°–æ—Ö—Ä–∞–Ω–µ–Ω–æ")
-        await show_command_reply(callback.message, callback.from_user.id, reply_id)
-
-    @router.callback_query(F.data.startswith("command_delete_ask:"))
-    async def command_delete_ask(callback: CallbackQuery) -> None:
-        reply_id = int(callback.data.split(":", 1)[1])
-        await callback.answer()
-        await callback.message.answer(
-            "–£–¥–∞–ª–∏—Ç—å —ç—Ç—É –∫–æ–º–∞–Ω–¥—É –±–µ–∑ –≤–æ–∑–º–æ–∂–Ω–æ—Å—Ç–∏ –≤–æ—Å—Å—Ç–∞–Ω–æ–≤–ª–µ–Ω–∏—è?",
-            reply_markup=keyboard([
-                [("–î–∞, —É–¥–∞–ª–∏—Ç—å", f"command_delete:{reply_id}")],
-                [("–û—Ç–º–µ–Ω–∞", f"command_reply:{reply_id}")],
-            ]),
-        )
-
-    @router.callback_query(F.data.startswith("command_delete:"))
-    async def command_delete(callback: CallbackQuery) -> None:
-        reply_id = int(callback.data.split(":", 1)[1])
-        await db.delete_command_reply(callback.from_user.id, reply_id)
-        await callback.answer("–ö–æ–º–∞–Ω–¥–∞ —É–¥–∞–ª–µ–Ω–∞")
-        await show_command_replies(callback.message, callback.from_user.id)
-
-    async def show_autoreply(target: Message, user_id: int) -> None:
-        row = await db.get_user(user_id)
-        await target.answer(
-            "ü§ñ <b>–ê–≤—Ç–æ–æ—Ç–≤–µ—Ç—á–∏–∫</b>\n"
-            f"–†–∞–±–æ—á–µ–µ –≤—Ä–µ–º—è: <b>{row['autoreply_work_start']:02d}:00‚Äì{row['autoreply_work_end']:02d}:00</b> "
-            "–ø–æ –≤—Ä–µ–º–µ–Ω–∏ —Å–µ—Ä–≤–µ—Ä–∞\n"
-            f"–ó–∞–¥–µ—Ä–∂–∫–∞ –ø–µ—Ä–µ–¥ –æ—Ç–≤–µ—Ç–æ–º: <b>{row['autoreply_delay_seconds']} —Å–µ–∫.</b>\n"
-            f"–ü–æ–≤—Ç–æ—Ä –≤ –æ–¥–Ω–æ–º —á–∞—Ç–µ: <b>{row['autoreply_cooldown_minutes']} –º–∏–Ω.</b>\n"
-            f"–¢–æ–ª—å–∫–æ –ø–µ—Ä–≤—ã–π –∫–æ–Ω—Ç–∞–∫—Ç: {bool_icon(row['autoreply_new_chats_only'])}\n\n"
-            f"–¢–µ–∫—Å—Ç: <i>{html.escape(clipped(row['autoreply_text'], 1000))}</i>",
-            reply_markup=keyboard([
-                [(f"{bool_icon(row['autoreply_enabled'])} –í–∫–ª—é—á—ë–Ω", "toggle:autoreply_enabled")],
-                [("‚úèÔ∏è –ò–∑–º–µ–Ω–∏—Ç—å —Ç–µ–∫—Å—Ç", "autoreply_text")],
-                [("‚è± –ó–∞–¥–µ—Ä–∂–∫–∞", "autoreply_delay"), ("üîÅ –ò–Ω—Ç–µ—Ä–≤–∞–ª", "autoreply_cooldown")],
-                [("üïí –†–∞–±–æ—á–µ–µ –≤—Ä–µ–º—è", "autoreply_hours")],
-                [(f"{bool_icon(row['autoreply_new_chats_only'])} –¢–æ–ª—å–∫–æ –Ω–æ–≤—ã–º", "toggle:autoreply_new_chats_only")],
-                [("‚≠ê –û—Ç–≤–µ—Ç—ã –Ω–∞ –æ—Ç–∑—ã–≤—ã", "review_replies")],
-                [("üëÅ –ü—Ä–µ–¥–ø—Ä–æ—Å–º–æ—Ç—Ä", "autoreply_preview")],
-                [("üß© –î–æ—Å—Ç—É–ø–Ω—ã–µ –ø–µ—Ä–µ–º–µ–Ω–Ω—ã–µ", "variables")],
-                [("‚¨ÖÔ∏è –ú–µ–Ω—é", "menu")],
-            ]),
-        )
-
-    @router.callback_query(F.data == "autoreply")
-    async def autoreply(callback: CallbackQuery) -> None:
-        await callback.answer()
-        await show_autoreply(callback.message, callback.from_user.id)
-
-    @router.callback_query(F.data == "autoreply_text")
-    async def autoreply_text(callback: CallbackQuery, state: FSMContext) -> None:
-        await callback.answer()
-        await state.clear()
-        await state.set_state(AutoReplyState.text)
-        await callback.message.answer("–û—Ç–ø—Ä–∞–≤—å—Ç–µ –Ω–æ–≤—ã–π —Ç–µ–∫—Å—Ç –∞–≤—Ç–æ–æ—Ç–≤–µ—Ç–∞ (–¥–æ 1500 —Å–∏–º–≤–æ–ª–æ–≤) –∏–ª–∏ /cancel.")
-
-    @router.callback_query(F.data == "autoreply_cooldown")
-    async def autoreply_cooldown(callback: CallbackQuery, state: FSMContext) -> None:
-        await callback.answer()
-        await state.clear()
-        await state.set_state(AutoReplyState.cooldown)
-        await callback.message.answer(
-            "–í–≤–µ–¥–∏—Ç–µ –∏–Ω—Ç–µ—Ä–≤–∞–ª –ø–æ–≤—Ç–æ—Ä–Ω–æ–≥–æ –∞–≤—Ç–æ–æ—Ç–≤–µ—Ç–∞ –æ—Ç 0 –¥–æ 1440 –º–∏–Ω—É—Ç. 0 ‚Äî –æ—Ç–≤–µ—á–∞—Ç—å –Ω–∞ –∫–∞–∂–¥–æ–µ —Å–æ–æ–±—â–µ–Ω–∏–µ."
-        )
-
-    @router.message(AutoReplyState.cooldown, F.text)
-    async def save_autoreply_cooldown(message: Message, state: FSMContext) -> None:
-        if not message.text.strip().isdigit() or not 0 <= int(message.text) <= 1440:
-            await message.answer("–í–≤–µ–¥–∏—Ç–µ —Ü–µ–ª–æ–µ —á–∏—Å–ª–æ –æ—Ç 0 –¥–æ 1440.")
-            return
-        await db.set_integer_setting(
-            message.from_user.id, "autoreply_cooldown_minutes", int(message.text)
-        )
-        await state.clear()
-        await show_autoreply(message, message.from_user.id)
-
-    @router.callback_query(F.data == "autoreply_delay")
-    async def autoreply_delay(callback: CallbackQuery, state: FSMContext) -> None:
-        await callback.answer()
-        await state.clear()
-        await state.set_state(AutoReplyState.delay)
-        await callback.message.answer("–í–≤–µ–¥–∏—Ç–µ –∑–∞–¥–µ—Ä–∂–∫—É –æ—Ç 0 –¥–æ 300 —Å–µ–∫—É–Ω–¥ –ø–µ—Ä–µ–¥ –∞–≤—Ç–æ–æ—Ç–≤–µ—Ç–æ–º.")
-
-    @router.message(AutoReplyState.delay, F.text)
-    async def save_autoreply_delay(message: Message, state: FSMContext) -> None:
-        if not message.text.strip().isdigit() or not 0 <= int(message.text) <= 300:
-            await message.answer("–í–≤–µ–¥–∏—Ç–µ —Ü–µ–ª–æ–µ —á–∏—Å–ª–æ –æ—Ç 0 –¥–æ 300.")
-            return
-        await db.set_integer_setting(
-            message.from_user.id, "autoreply_delay_seconds", int(message.text)
-        )
-        await state.clear()
-        await show_autoreply(message, message.from_user.id)
-
-    @router.callback_query(F.data == "autoreply_hours")
-    async def autoreply_hours(callback: CallbackQuery, state: FSMContext) -> None:
-        await callback.answer()
-        await state.clear()
-        await state.set_state(AutoReplyState.hours)
-        await callback.message.answer(
-            "–í–≤–µ–¥–∏—Ç–µ —Ä–∞–±–æ—á–µ–µ –≤—Ä–µ–º—è –≤ —Ñ–æ—Ä–º–∞—Ç–µ <code>9-22</code>. –î–ª—è –∫—Ä—É–≥–ª–æ—Å—É—Ç–æ—á–Ω–æ–π —Ä–∞–±–æ—Ç—ã: <code>0-24</code>."
-        )
-
-    @router.message(AutoReplyState.hours, F.text)
-    async def save_autoreply_hours(message: Message, state: FSMContext) -> None:
-        match = re.fullmatch(r"\s*(\d{1,2})\s*[-:]\s*(\d{1,2})\s*", message.text)
-        if not match:
-            await message.answer("–ò—Å–ø–æ–ª—å–∑—É–π—Ç–µ —Ñ–æ—Ä–º–∞—Ç 9-22 –∏–ª–∏ 0-24.")
-            return
-        start, end = map(int, match.groups())
-        if not 0 <= start <= 23 or not 1 <= end <= 24 or start == end:
-            await message.answer("–ù–∞—á–∞–ª–æ: 0‚Äì23, –æ–∫–æ–Ω—á–∞–Ω–∏–µ: 1‚Äì24; –∑–Ω–∞—á–µ–Ω–∏—è –Ω–µ –¥–æ–ª–∂–Ω—ã —Å–æ–≤–ø–∞–¥–∞—Ç—å.")
-            return
-        await db.set_integer_setting(message.from_user.id, "autoreply_work_start", start)
-        await db.set_integer_setting(message.from_user.id, "autoreply_work_end", end)
-        await state.clear()
-        await show_autoreply(message, message.from_user.id)
-
-    @router.callback_query(F.data == "autoreply_preview")
-    async def autoreply_preview(callback: CallbackQuery) -> None:
-        await callback.answer()
-        row = await db.get_user(callback.from_user.id)
-        runtime = manager.get(callback.from_user.id)
-
-        class PreviewMessage:
-            author = "–ü–æ–∫—É–ø–∞—Ç–µ–ª—å"
-            chat_name = "–ü–æ–∫—É–ø–∞—Ç–µ–ª—å"
-            chat_id = 123456
-
-            def __str__(self) -> str:
-                return "–ó–¥—Ä–∞–≤—Å—Ç–≤—É–π—Ç–µ, —Ç–æ–≤–∞—Ä –≤ –Ω–∞–ª–∏—á–∏–∏?"
-
-        sample = PreviewMessage()
-        rendered = render_template(
-            row["autoreply_text"], message=sample, account=runtime.account if runtime else None
-        )
-        await callback.message.answer(
-            f"üëÅ <b>–ü—Ä–µ–¥–ø—Ä–æ—Å–º–æ—Ç—Ä</b>\n<blockquote>{html.escape(rendered)}</blockquote>"
-        )
-
-    @router.callback_query(F.data == "variables")
-    async def variables(callback: CallbackQuery) -> None:
-        await callback.answer()
-        await callback.message.answer(
-            "üß© <b>–ü–µ—Ä–µ–º–µ–Ω–Ω—ã–µ –∏—Å—Ö–æ–¥—è—â–∏—Ö —Å–æ–æ–±—â–µ–Ω–∏–π</b>\n\n"
-            "<code>$username</code> ‚Äî –∏–º—è —Å–æ–±–µ—Å–µ–¥–Ω–∏–∫–∞\n"
-            "<code>$message_text</code> ‚Äî –≤—Ö–æ–¥—è—â–µ–µ —Å–æ–æ–±—â–µ–Ω–∏–µ\n"
-            "<code>$chat_id</code>, <code>$chat_name</code> ‚Äî —á–∞—Ç\n"
-            "<code>$date</code>, <code>$time</code>, <code>$full_time</code> ‚Äî –¥–∞—Ç–∞ –∏ –≤—Ä–µ–º—è\n"
-            "<code>$account_name</code>, <code>$account_id</code> ‚Äî –≤–∞—à –∞–∫–∫–∞—É–Ω—Ç\n"
-            "<code>$order_id</code>, <code>$order_link</code>, <code>$order_title</code> ‚Äî –∑–∞–∫–∞–∑.\n\n"
-            "–î–ª—è –æ—Ç–∑—ã–≤–æ–≤: <code>$stars</code>, <code>$rating</code>, "
-            "<code>$review_text</code>, <code>$review_reply</code>.\n\n"
-            "–ü–µ—Ä–µ–º–µ–Ω–Ω—ã–µ —Ä–∞–±–æ—Ç–∞—é—Ç –≤ –∞–≤—Ç–æ–æ—Ç–≤–µ—Ç—á–∏–∫–µ, —Ä—É—á–Ω—ã—Ö —Å–æ–æ–±—â–µ–Ω–∏—è—Ö –∏ –æ—Ç–≤–µ—Ç–∞—Ö –Ω–∞ –æ—Ç–∑—ã–≤—ã.",
-            reply_markup=keyboard([[("‚¨ÖÔ∏è –ê–≤—Ç–æ–æ—Ç–≤–µ—Ç—á–∏–∫", "autoreply")]]),
-        )
-
-    @router.message(AutoReplyState.text, F.text)
-    async def save_autoreply_text(message: Message, state: FSMContext) -> None:
-        value = message.text.strip()
-        if not value or len(value) > 1500:
-            await message.answer("–¢–µ–∫—Å—Ç –¥–æ–ª–∂–µ–Ω —Å–æ–¥–µ—Ä–∂–∞—Ç—å –æ—Ç 1 –¥–æ 1500 —Å–∏–º–≤–æ–ª–æ–≤.")
-            return
-        await db.set_autoreply_text(message.from_user.id, value)
-        await state.clear()
-        await message.answer("‚úÖ –¢–µ–∫—Å—Ç –∞–≤—Ç–æ–æ—Ç–≤–µ—Ç–∞ —Å–æ—Ö—Ä–∞–Ω—ë–Ω.")
-        await show_autoreply(message, message.from_user.id)
-
-    async def show_review_replies(target: Message, user_id: int) -> None:
-        row = await db.get_user(user_id)
-        previews = "\n".join(
-            f"{'‚≠ê' * stars}: <code>{html.escape(clipped(row[f'review_reply_{stars}'], 150))}</code>"
-            for stars in range(1, 6)
-        )
-        await target.answer(
-            "‚≠ê <b>–ê–≤—Ç–æ–æ—Ç–≤–µ—Ç—ã –Ω–∞ –æ—Ç–∑—ã–≤—ã</b>\n"
-            "–î–ª—è –∫–∞–∂–¥–æ–π –æ—Ü–µ–Ω–∫–∏ –∏—Å–ø–æ–ª—å–∑—É–µ—Ç—Å—è –æ—Ç–¥–µ–ª—å–Ω—ã–π —à–∞–±–ª–æ–Ω. –ü—Ä–∏ –∏–∑–º–µ–Ω–µ–Ω–∏–∏ –æ—Ç–∑—ã–≤–∞ –æ—Ç–≤–µ—Ç –æ–±–Ω–æ–≤–ª—è–µ—Ç—Å—è.\n\n"
-            f"{previews}",
-            reply_markup=keyboard([
-                [(f"{bool_icon(row['review_reply_enabled'])} –ê–≤—Ç–æ–æ—Ç–≤–µ—Ç—ã", "toggle:review_reply_enabled")],
-                [("‚≠ê 1", "review_template:1"), ("‚≠ê‚≠ê 2", "review_template:2")],
-                [("‚≠ê‚≠ê‚≠ê 3", "review_template:3"), ("‚≠ê‚≠ê‚≠ê‚≠ê 4", "review_template:4")],
-                [("‚≠ê‚≠ê‚≠ê‚≠ê‚≠ê 5", "review_template:5")],
-                [("üß™ –ü—Ä–æ–≤–µ—Ä–∏—Ç—å —à–∞–±–ª–æ–Ω", "review_preview_menu")],
-                [("üß© –ü–µ—Ä–µ–º–µ–Ω–Ω—ã–µ", "variables"), ("‚¨ÖÔ∏è –ù–∞–∑–∞–¥", "autoreply")],
-            ]),
-        )
-
-    @router.callback_query(F.data == "review_replies")
-    async def review_replies(callback: CallbackQuery) -> None:
-        await callback.answer()
-        await show_review_replies(callback.message, callback.from_user.id)
-
-    @router.callback_query(F.data == "review_preview_menu")
-    async def review_preview_menu(callback: CallbackQuery) -> None:
-        await callback.answer()
-        await callback.message.answer(
-            "üß™ <b>–ü—Ä–æ–≤–µ—Ä–∫–∞ –∞–≤—Ç–æ–æ—Ç–≤–µ—Ç–∞ –Ω–∞ –æ—Ç–∑—ã–≤</b>\n\n"
-            "–í—ã–±–µ—Ä–∏—Ç–µ –æ—Ü–µ–Ω–∫—É. –ë–æ—Ç –ø–æ–¥—Å—Ç–∞–≤–∏—Ç —Ç–µ—Å—Ç–æ–≤—ã–µ –¥–∞–Ω–Ω—ã–µ, –Ω–æ –Ω–∏—á–µ–≥–æ –Ω–µ –æ—Ç–ø—Ä–∞–≤–∏—Ç –Ω–∞ FunPay.",
-            reply_markup=keyboard([
-                [("‚≠ê 1", "review_preview:1"), ("‚≠ê‚≠ê 2", "review_preview:2")],
-                [("‚≠ê‚≠ê‚≠ê 3", "review_preview:3"), ("‚≠ê‚≠ê‚≠ê‚≠ê 4", "review_preview:4")],
-                [("‚≠ê‚≠ê‚≠ê‚≠ê‚≠ê 5", "review_preview:5")],
-                [("‚¨ÖÔ∏è –ê–≤—Ç–æ–æ—Ç–≤–µ—Ç—ã", "review_replies")],
-            ]),
-        )
-
-    @router.callback_query(F.data.startswith("review_preview:"))
-    async def review_preview(callback: CallbackQuery) -> None:
-        stars = int(callback.data.split(":", 1)[1])
-        row = await db.get_user(callback.from_user.id)
-        runtime = manager.get(callback.from_user.id)
-        await callback.answer()
-        if not row or stars not in range(1, 6):
-            await callback.message.answer("–®–∞–±–ª–æ–Ω –Ω–µ –Ω–∞–π–¥–µ–Ω.")
-            return
-
-        class PreviewReview:
-            text = "–í—Å—ë –ø–æ–ª—É—á–∏–ª, —Å–ø–∞—Å–∏–±–æ!"
-            reply = ""
-
-            def __init__(self, value: int):
-                self.stars = value
-
-        class PreviewOrder:
-            id = "TEST1234"
-            buyer_username = "–ü–æ–∫—É–ø–∞—Ç–µ–ª—å"
-            chat_id = 123456
-            title = "–¢–µ—Å—Ç–æ–≤—ã–π –ª–æ—Ç"
-
-            def __init__(self, review: PreviewReview):
-                self.review = review
-
-        review = PreviewReview(stars)
-        order = PreviewOrder(review)
-        rendered = normalize_review_reply(
-            render_template(
-                row[f"review_reply_{stars}"],
-                order=order,
-                review=review,
-                account=runtime.account if runtime else None,
-            )
-        )
-        await callback.message.answer(
-            f"üß™ <b>–ü—Ä–µ–¥–ø—Ä–æ—Å–º–æ—Ç—Ä –¥–ª—è {'‚≠ê' * stars}</b>\n\n"
-            f"<pre>{html.escape(rendered or '[–ø—É—Å—Ç–æ–π –æ—Ç–≤–µ—Ç]')}</pre>",
-            reply_markup=keyboard([
-                [("‚úèÔ∏è –ò–∑–º–µ–Ω–∏—Ç—å", f"review_template:{stars}")],
-                [("‚¨ÖÔ∏è –í—ã–±—Ä–∞—Ç—å –æ—Ü–µ–Ω–∫—É", "review_preview_menu")],
-            ]),
-        )
-
-    @router.callback_query(F.data.startswith("review_template:"))
-    async def review_template(callback: CallbackQuery, state: FSMContext) -> None:
-        stars = int(callback.data.split(":", 1)[1])
-        await callback.answer()
-        await state.clear()
-        await state.update_data(stars=stars)
-        await state.set_state(AutoReplyState.review_text)
-        await callback.message.answer(
-            f"–û—Ç–ø—Ä–∞–≤—å—Ç–µ —à–∞–±–ª–æ–Ω –æ—Ç–≤–µ—Ç–∞ –¥–ª—è –æ—Ü–µ–Ω–∫–∏ {'‚≠ê' * stars}. –î–æ 999 —Å–∏–º–≤–æ–ª–æ–≤ –∏ 10 —Å—Ç—Ä–æ–∫."
-        )
-
-    @router.message(AutoReplyState.review_text, F.text)
-    async def save_review_template(message: Message, state: FSMContext) -> None:
-        value = normalize_review_reply(message.text)
-        if not value:
-            await message.answer("–®–∞–±–ª–æ–Ω –Ω–µ –º–æ–∂–µ—Ç –±—ã—Ç—å –ø—É—Å—Ç—ã–º.")
-            return
-        data = await state.get_data()
-        await db.set_review_reply(message.from_user.id, data["stars"], value)
-        await state.clear()
-        await show_review_replies(message, message.from_user.id)
-
-    async def show_auto_raise(target: Message, user_id: int) -> None:
-        row = await db.get_user(user_id)
-        runtime = manager.get(user_id)
-        if not row:
-            return
-        last = runtime.last_raise_at.strftime("%d.%m %H:%M:%S") if runtime and runtime.last_raise_at else "–µ—â—ë –Ω–µ –±—ã–ª–æ"
-        summary = html.escape(runtime.last_raise_summary) if runtime else "Runner –æ—Å—Ç–∞–Ω–æ–≤–ª–µ–Ω"
-        await target.answer(
-            "üÜô <b>–ê–≤—Ç–æ–ø–æ–¥–Ω—è—Ç–∏–µ –ª–æ—Ç–æ–≤</b>\n"
-            f"–°–æ—Å—Ç–æ—è–Ω–∏–µ: {bool_icon(row['auto_raise_enabled'])}\n"
-            f"–ü–æ—Å–ª–µ–¥–Ω–∏–π –∑–∞–ø—É—Å–∫: <code>{last}</code>\n"
-            f"–†–µ–∑—É–ª—å—Ç–∞—Ç: <code>{summary}</code>\n\n"
-            "–ö–∞—Ç–µ–≥–æ—Ä–∏–∏ –æ–ø—Ä–µ–¥–µ–ª—è—é—Ç—Å—è –∞–≤—Ç–æ–º–∞—Ç–∏—á–µ—Å–∫–∏ –ø–æ –∞–∫—Ç–∏–≤–Ω—ã–º –ª–æ—Ç–∞–º –ø—Ä–æ—Ñ–∏–ª—è. "
-            "–°–ª–µ–¥—É—é—â–∞—è –ø–æ–ø—ã—Ç–∫–∞ –Ω–∞–∑–Ω–∞—á–∞–µ—Ç—Å—è –ø–æ —Ç–∞–π–º–µ—Ä—É FunPay.",
-            reply_markup=keyboard([
-                [(f"{bool_icon(row['auto_raise_enabled'])} –ê–≤—Ç–æ–ø–æ–¥–Ω—è—Ç–∏–µ", "toggle:auto_raise_enabled")],
-                [("üÜô –ü–æ–¥–Ω—è—Ç—å —Å–µ–π—á–∞—Å", "raise_now")],
-                [("‚¨ÖÔ∏è –ú–µ–Ω—é", "menu")],
-            ]),
-        )
-
-    @router.callback_query(F.data == "auto_raise")
-    async def auto_raise(callback: CallbackQuery) -> None:
-        await callback.answer()
-        await show_auto_raise(callback.message, callback.from_user.id)
-
-    @router.callback_query(F.data == "raise_now")
-    async def raise_now(callback: CallbackQuery) -> None:
-        await callback.answer("–ü–æ–¥–Ω–∏–º–∞—é –ª–æ—Ç—ã‚Ä¶")
-        try:
-            result = await manager.raise_lots_now(callback.from_user.id)
-        except Exception as exc:
-            logger.exception("–†—É—á–Ω–æ–µ –ø–æ–¥–Ω—è—Ç–∏–µ –ª–æ—Ç–æ–≤ –Ω–µ —É–¥–∞–ª–æ—Å—å")
-            await callback.message.answer(f"‚ùå –ù–µ —É–¥–∞–ª–æ—Å—å –ø–æ–¥–Ω—è—Ç—å –ª–æ—Ç—ã: {html.escape(clipped(exc, 500))}")
-            return
-        await callback.message.answer(result, reply_markup=keyboard([[("‚¨ÖÔ∏è –ê–≤—Ç–æ–ø–æ–¥–Ω—è—Ç–∏–µ", "auto_raise")]]))
-
-    async def show_playerok_plugins(target: Message, user_id: int) -> None:
-        plugin_runtime = manager.playerok_plugins.runtimes.get(user_id)
-        plugins = list(plugin_runtime.plugins.values()) if plugin_runtime else []
-        await target.answer(
-            "üß© <b>–ü–ª–∞–≥–∏–Ω—ã Playerok</b>\n"
-            f"–£—Å—Ç–∞–Ω–æ–≤–ª–µ–Ω–æ: <b>{len(plugins)}</b>\n\n"
-            "–ö–∞—Ç–∞–ª–æ–≥ —Å–æ–¥–µ—Ä–∂–∏—Ç –æ—Ñ–∏—Ü–∏–∞–ª—å–Ω—ã–µ —Ä–∞—Å—à–∏—Ä–µ–Ω–∏—è –∏ –ø—É–±–ª–∏–∫–∞—Ü–∏–∏ –ø–æ–ª—å–∑–æ–≤–∞—Ç–µ–ª–µ–π. "
-            "–ù–∞—Å—Ç—Ä–æ–π–∫–∏ –∫–∞–∂–¥–æ–≥–æ —É—Å—Ç–∞–Ω–æ–≤–ª–µ–Ω–Ω–æ–≥–æ –ø–ª–∞–≥–∏–Ω–∞ –¥–æ—Å—Ç—É–ø–Ω—ã –ø–æ—Å—Ç–æ—è–Ω–Ω–æ –≤ –µ–≥–æ –∫–∞—Ä—Ç–æ—á–∫–µ.",
-            reply_markup=keyboard([
-                [("üß≠ –ö–∞—Ç–∞–ª–æ–≥ –ø–ª–∞–≥–∏–Ω–æ–≤", "po_plugin_catalog:0")],
-                [(f"üß© –ú–æ–∏ –ø–ª–∞–≥–∏–Ω—ã ({len(plugins)})", "po_my_plugins")],
-                [("‚ûï –ó–∞–≥—Ä—É–∑–∏—Ç—å –ø–ª–∞–≥–∏–Ω", "po_plugin_upload_warning")],
-                [("üìö –î–æ–∫—É–º–µ–Ω—Ç–∞—Ü–∏—è", "po_plugin_docs")],
-                [("‚¨ÖÔ∏è –ú–µ–Ω—é", "menu")],
-            ]),
-        )
-
-    @router.callback_query(F.data == "po_plugins")
-    async def playerok_plugins(callback: CallbackQuery) -> None:
-        await callback.answer()
-        await show_playerok_plugins(callback.message, callback.from_user.id)
-
-    async def show_playerok_my_plugins(target: Message, user_id: int) -> None:
-        plugin_runtime = manager.playerok_plugins.runtimes.get(user_id)
-        plugins = list(plugin_runtime.plugins.values()) if plugin_runtime else []
-        rows = [
-            [(
-                f"{'‚úÖ' if plugin.enabled else '‚ùå'} {clipped(plugin.name, 27)} v{clipped(plugin.version, 9)}",
-                f"po_pi:{plugin.uuid}",
-            )]
-            for plugin in plugins
-        ]
-        rows.append([("‚¨ÖÔ∏è –ü–ª–∞–≥–∏–Ω—ã", "po_plugins")])
-        await target.answer(
-            "üß© <b>–ú–æ–∏ –ø–ª–∞–≥–∏–Ω—ã Playerok</b>\n\n"
-            + ("–í—ã–±–µ—Ä–∏—Ç–µ –ø–ª–∞–≥–∏–Ω." if plugins else "–ü–æ–∫–∞ –Ω–∏—á–µ–≥–æ –Ω–µ —É—Å—Ç–∞–Ω–æ–≤–ª–µ–Ω–æ."),
-            reply_markup=keyboard(rows),
-        )
-
-    @router.callback_query(F.data == "po_my_plugins")
-    async def playerok_my_plugins(callback: CallbackQuery) -> None:
-        await callback.answer()
-        await show_playerok_my_plugins(callback.message, callback.from_user.id)
-
-    async def show_playerok_plugin_catalog(
-        target: Message, user_id: int, page: int = 0
-    ) -> None:
-        page = max(0, page)
-        offset = page * PLUGIN_CATALOG_PAGE_SIZE
-        catalog, total = await db.list_playerok_catalog_plugins(
-            PLUGIN_CATALOG_PAGE_SIZE, offset
-        )
-        if not catalog and page:
-            page = max(0, (total - 1) // PLUGIN_CATALOG_PAGE_SIZE)
-            offset = page * PLUGIN_CATALOG_PAGE_SIZE
-            catalog, total = await db.list_playerok_catalog_plugins(
-                PLUGIN_CATALOG_PAGE_SIZE, offset
-            )
-        plugin_runtime = manager.playerok_plugins.runtimes.get(user_id)
-        installed = set(plugin_runtime.plugins) if plugin_runtime else set()
-        rows = [
-            [(
-                (
-                    f"{'‚úÖ' if item['uuid'] in installed else ('üõ°' if item['is_official'] else 'üß©')} "
-                    f"{clipped(item['name'], 27)} v{clipped(item['version'], 8)}"
-                ),
-                f"po_pc_view:{item['uuid']}:{page}",
-            )]
-            for item in catalog
-        ]
-        navigation = []
-        if page:
-            navigation.append(("‚óÄÔ∏è", f"po_plugin_catalog:{page - 1}"))
-        if offset + len(catalog) < total:
-            navigation.append(("‚ñ∂Ô∏è", f"po_plugin_catalog:{page + 1}"))
-        if navigation:
-            rows.append(navigation)
-        rows.append([("‚¨ÖÔ∏è –ü–ª–∞–≥–∏–Ω—ã", "po_plugins")])
-        await target.answer(
-            "üß≠ <b>–ö–∞—Ç–∞–ª–æ–≥ –ø–ª–∞–≥–∏–Ω–æ–≤ Playerok</b>\n\n"
-            f"–ü—É–±–ª–∏–∫–∞—Ü–∏–π: <b>{total}</b> ¬∑ —Å—Ç—Ä–∞–Ω–∏—Ü–∞ <b>{page + 1}</b>.\n"
-            "üõ° ‚Äî –æ—Ñ–∏—Ü–∏–∞–ª—å–Ω—ã–π ¬∑ üß© ‚Äî —Å–æ–æ–±—â–µ—Å—Ç–≤–æ ¬∑ ‚úÖ ‚Äî —É—Å—Ç–∞–Ω–æ–≤–ª–µ–Ω.\n\n"
-            "‚ö†Ô∏è –ü—É–±–ª–∏–∫–∞—Ü–∏–∏ —Å–æ–æ–±—â–µ—Å—Ç–≤–∞ –Ω–µ –º–æ–¥–µ—Ä–∏—Ä—É—é—Ç—Å—è: –ø–µ—Ä–µ–¥ —É—Å—Ç–∞–Ω–æ–≤–∫–æ–π —Å–∫–∞—á–∞–π—Ç–µ –∏ –ø—Ä–æ–≤–µ—Ä—å—Ç–µ –∏—Å—Ö–æ–¥–Ω–∏–∫.",
-            reply_markup=keyboard(rows),
-        )
-
-    @router.callback_query(F.data.startswith("po_plugin_catalog:"))
-    async def playerok_plugin_catalog(callback: CallbackQuery) -> None:
-        await callback.answer()
-        try:
-            page = int(callback.data.rsplit(":", 1)[1])
-        except ValueError:
-            page = 0
-        await show_playerok_plugin_catalog(callback.message, callback.from_user.id, page)
-
-    @router.callback_query(F.data.startswith("po_pc_view:"))
-    async def playerok_catalog_details(callback: CallbackQuery) -> None:
-        _, uuid, raw_page = callback.data.split(":", 2)
-        item = await db.get_playerok_catalog_plugin(uuid)
-        if not item:
-            await callback.answer("–ü—É–±–ª–∏–∫–∞—Ü–∏—è –Ω–µ –Ω–∞–π–¥–µ–Ω–∞", show_alert=True)
-            return
-        await callback.answer()
-        plugin_runtime = manager.playerok_plugins.runtimes.get(callback.from_user.id)
-        installed = bool(plugin_runtime and uuid in plugin_runtime.plugins)
-        rows = [[(
-            "üß© –û—Ç–∫—Ä—ã—Ç—å —É—Å—Ç–∞–Ω–æ–≤–ª–µ–Ω–Ω—ã–π" if installed else "‚¨áÔ∏è –£—Å—Ç–∞–Ω–æ–≤–∏—Ç—å",
-            f"po_pi:{uuid}" if installed else f"po_pc_ask:{uuid}",
-        )]]
-        rows.append([("üì• –°–∫–∞—á–∞—Ç—å –∏—Å—Ö–æ–¥–Ω–∏–∫", f"po_pc_source:{uuid}")])
-        rows.append([("‚¨ÖÔ∏è –ö–∞—Ç–∞–ª–æ–≥", f"po_plugin_catalog:{raw_page}")])
-        badge = "üõ° <b>–û—Ñ–∏—Ü–∏–∞–ª—å–Ω—ã–π –ø–ª–∞–≥–∏–Ω</b>" if item["is_official"] else "üß© –ü–ª–∞–≥–∏–Ω —Å–æ–æ–±—â–µ—Å—Ç–≤–∞"
-        await callback.message.answer(
-            f"{badge}\n\n"
-            f"<b>{html.escape(item['name'])}</b> v{html.escape(item['version'])}\n"
-            f"<i>{html.escape(item['short_description'])}</i>\n\n"
-            f"{html.escape(item['description'])}\n\n"
-            f"–ê–≤—Ç–æ—Ä: <b>{html.escape(item['publisher_name'])}</b>\n"
-            f"–£—Å—Ç–∞–Ω–æ–≤–æ–∫: <b>{item['install_count']}</b>\n"
-            f"UUID: <code>{uuid}</code>",
-            reply_markup=keyboard(rows),
-        )
-
-    @router.callback_query(F.data.startswith("po_pc_source:"))
-    async def playerok_catalog_source(callback: CallbackQuery) -> None:
-        uuid = callback.data.split(":", 1)[1]
-        item = await db.get_playerok_catalog_plugin(uuid)
-        if not item:
-            await callback.answer("–ò—Å—Ö–æ–¥–Ω–∏–∫ –Ω–µ–¥–æ—Å—Ç—É–ø–µ–Ω", show_alert=True)
-            return
-        await callback.answer("–û—Ç–ø—Ä–∞–≤–ª—è—é —Ñ–∞–π–ª‚Ä¶")
-        await callback.message.answer_document(
-            BufferedInputFile(item["source"].encode("utf-8"), filename=item["filename"]),
-            caption=f"–ò—Å—Ö–æ–¥–Ω–∏–∫ Playerok-–ø–ª–∞–≥–∏–Ω–∞ <b>{html.escape(item['name'])}</b>. –ü—Ä–æ–≤–µ—Ä—å—Ç–µ –µ–≥–æ –ø–µ—Ä–µ–¥ —É—Å—Ç–∞–Ω–æ–≤–∫–æ–π.",
-        )
-
-    @router.callback_query(F.data.startswith("po_pc_ask:"))
-    async def playerok_catalog_install_ask(callback: CallbackQuery) -> None:
-        uuid = callback.data.split(":", 1)[1]
-        item = await db.get_playerok_catalog_plugin(uuid)
-        if not item:
-            await callback.answer("–ü–ª–∞–≥–∏–Ω –Ω–µ–¥–æ—Å—Ç—É–ø–µ–Ω", show_alert=True)
-            return
-        await callback.answer()
-        await callback.message.answer(
-            f"–£—Å—Ç–∞–Ω–æ–≤–∏—Ç—å <b>{html.escape(item['name'])}</b>?\n\n"
-            "–ü–ª–∞–≥–∏–Ω –≤—ã–ø–æ–ª–Ω—è–µ—Ç—Å—è –≤–Ω—É—Ç—Ä–∏ –ø—Ä–æ—Ü–µ—Å—Å–∞ –±–æ—Ç–∞ –∏ –ø–æ–ª—É—á–∏—Ç –¥–æ—Å—Ç—É–ø –∫ Playerok-–∞–∫–∫–∞—É–Ω—Ç—É, "
-            "—Å–µ—Ç–∏ –∏ –≤–æ–∑–º–æ–∂–Ω–æ—Å—Ç—è–º Python-–ø—Ä–æ—Ü–µ—Å—Å–∞. –ö–∞—Ç–∞–ª–æ–≥ –Ω–µ –≥–∞—Ä–∞–Ω—Ç–∏—Ä—É–µ—Ç –±–µ–∑–æ–ø–∞—Å–Ω–æ—Å—Ç—å –∫–æ–¥–∞.",
-            reply_markup=keyboard([
-                [("üì• –°–∫–∞—á–∞—Ç—å –∏ –ø—Ä–æ–≤–µ—Ä–∏—Ç—å", f"po_pc_source:{uuid}")],
-                [("–Ø –¥–æ–≤–µ—Ä—è—é ‚Äî —É—Å—Ç–∞–Ω–æ–≤–∏—Ç—å", f"po_pc_install:{uuid}")],
-                [("–û—Ç–º–µ–Ω–∞", f"po_pc_view:{uuid}:0")],
-            ]),
-        )
-
-    @router.callback_query(F.data.startswith("po_pc_install:"))
-    async def playerok_catalog_install(callback: CallbackQuery) -> None:
-        uuid = callback.data.split(":", 1)[1]
-        item = await db.get_playerok_catalog_plugin(uuid)
-        runtime = await require_playerok_runtime(callback.message, callback.from_user.id)
-        if not item or not runtime:
-            return
-        if manager.playerok_plugins.is_enabled(callback.from_user.id, uuid) or (
-            manager.playerok_plugins.runtimes.get(callback.from_user.id)
-            and uuid in manager.playerok_plugins.runtimes[callback.from_user.id].plugins
-        ):
-            await callback.answer("–ü–ª–∞–≥–∏–Ω —É–∂–µ —É—Å—Ç–∞–Ω–æ–≤–ª–µ–Ω", show_alert=True)
-            return
-        await callback.answer("–£—Å—Ç–∞–Ω–∞–≤–ª–∏–≤–∞—é‚Ä¶")
-        try:
-            plugin = await manager.playerok_plugins.install(
-                callback.from_user.id, item["filename"], item["source"], runtime
-            )
-        except Exception as exc:
-            logger.exception("–ù–µ —É—Å—Ç–∞–Ω–æ–≤–ª–µ–Ω Playerok-–ø–ª–∞–≥–∏–Ω –∏–∑ –∫–∞—Ç–∞–ª–æ–≥–∞")
-            await callback.message.answer(f"‚ùå –£—Å—Ç–∞–Ω–æ–≤–∫–∞ –Ω–µ –≤—ã–ø–æ–ª–Ω–µ–Ω–∞: {html.escape(clipped(exc, 600))}")
-            return
-        await db.increment_playerok_catalog_install(uuid)
-        await callback.message.answer(
-            f"‚úÖ Playerok-–ø–ª–∞–≥–∏–Ω <b>{html.escape(plugin.name)}</b> —É—Å—Ç–∞–Ω–æ–≤–ª–µ–Ω.",
-            reply_markup=keyboard([[('‚öôÔ∏è –û—Ç–∫—Ä—ã—Ç—å –ø–ª–∞–≥–∏–Ω', f"po_pi:{uuid}")]]),
-        )
-
-    @router.callback_query(F.data == "po_plugin_docs")
-    async def playerok_plugin_docs(callback: CallbackQuery) -> None:
-        await callback.answer()
-        await callback.message.answer(
-            "üìö <b>Playerok Plugin SDK</b>\n\n"
-            "–ü–ª–∞–≥–∏–Ω—ã ‚Äî –æ–¥–∏–Ω–æ—á–Ω—ã–µ UTF-8 —Ñ–∞–π–ª—ã Python –¥–æ 512 –ö–ë. –û–Ω–∏ –ø–æ–ª—É—á–∞—é—Ç —Å–æ–±—ã—Ç–∏—è —Å–æ–æ–±—â–µ–Ω–∏–π, "
-            "—Å–¥–µ–ª–æ–∫, –æ—Ç–∑—ã–≤–æ–≤ –∏ –ø–µ—Ä–∏–æ–¥–∏—á–µ—Å–∫–∏–π —Ç–∏–∫, –∞ –Ω–∞—Å—Ç—Ä–æ–π–∫–∏ —Å—Ç—Ä–æ—è—Ç—Å—è –∞–≤—Ç–æ–º–∞—Ç–∏—á–µ—Å–∫–∏ –∏–∑ SETTINGS.",
-            reply_markup=keyboard([
-                [("üöÄ –ë—ã—Å—Ç—Ä—ã–π —Å—Ç–∞—Ä—Ç", "po_docs:start"), ("üß± –°—Ç—Ä—É–∫—Ç—É—Ä–∞", "po_docs:structure")],
-                [("‚ö° –•—É–∫–∏", "po_docs:hooks"), ("‚öôÔ∏è –ù–∞—Å—Ç—Ä–æ–π–∫–∏", "po_docs:settings")],
-                [("üß≠ –ö–∞—Ç–∞–ª–æ–≥", "po_docs:catalog")],
-                [("üì• –°–∫–∞—á–∞—Ç—å –ø–æ–ª–Ω—É—é –¥–æ–∫—É–º–µ–Ω—Ç–∞—Ü–∏—é", "po_docs_download")],
-                [("üõ° –ë–µ–∑–æ–ø–∞—Å–Ω–æ—Å—Ç—å", "po_docs:safety")],
-                [("‚¨ÖÔ∏è –ü–ª–∞–≥–∏–Ω—ã", "po_plugins")],
-            ]),
-        )
-
-    @router.callback_query(F.data == "po_docs_download")
-    async def playerok_plugin_docs_download(callback: CallbackQuery) -> None:
-        if not PLAYEROK_PLUGIN_DOCUMENTATION_PATH.is_file():
-            await callback.answer("–§–∞–π–ª –¥–æ–∫—É–º–µ–Ω—Ç–∞—Ü–∏–∏ –æ—Ç—Å—É—Ç—Å—Ç–≤—É–µ—Ç", show_alert=True)
-            return
-        await callback.answer("–û—Ç–ø—Ä–∞–≤–ª—è—é –¥–æ–∫—É–º–µ–Ω—Ç–∞—Ü–∏—é‚Ä¶")
-        await callback.message.answer_document(
-            FSInputFile(PLAYEROK_PLUGIN_DOCUMENTATION_PATH),
-            caption="–ü–æ–ª–Ω–∞—è –¥–æ–∫—É–º–µ–Ω—Ç–∞—Ü–∏—è Playerok Plugin SDK. –ï—ë –º–æ–∂–Ω–æ –ø–µ—Ä–µ–¥–∞—Ç—å –Ω–µ–π—Ä–æ—Å–µ—Ç–∏ –≤–º–µ—Å—Ç–µ —Å –∑–∞–¥–∞–Ω–∏–µ–º –Ω–∞ –ø–ª–∞–≥–∏–Ω.",
-        )
-
-    @router.callback_query(F.data.startswith("po_docs:"))
-    async def playerok_plugin_docs_page(callback: CallbackQuery) -> None:
-        await callback.answer()
-        page = callback.data.split(":", 1)[1]
-        pages = {
-            "start": (
-                "üöÄ <b>–ë—ã—Å—Ç—Ä—ã–π —Å—Ç–∞—Ä—Ç</b>\n\n"
-                "1. –í–æ–∑—å–º–∏—Ç–µ —à–∞–±–ª–æ–Ω –∏–∑ —Å–∫–∞—á–∏–≤–∞–µ–º–æ–π –¥–æ–∫—É–º–µ–Ω—Ç–∞—Ü–∏–∏.\n"
-                "2. –°–æ–∑–¥–∞–π—Ç–µ –Ω–æ–≤—ã–π UUID4 –∏ –∑–∞–ø–æ–ª–Ω–∏—Ç–µ –º–µ—Ç–∞–¥–∞–Ω–Ω—ã–µ.\n"
-                "3. –û–±—ä—è–≤–∏—Ç–µ SETTINGS, ACTIONS –∏ –≤—Å–µ —Å–ø–∏—Å–∫–∏ BIND_TO_*.\n"
-                "4. –ó–∞–≥—Ä—É–∑–∏—Ç–µ .py —á–µ—Ä–µ–∑ ¬´–ü–ª–∞–≥–∏–Ω—ã ‚Üí –ó–∞–≥—Ä—É–∑–∏—Ç—å –ø–ª–∞–≥–∏–Ω¬ª.\n"
-                "5. –ü—Ä–æ–≤–µ—Ä—å—Ç–µ –Ω–∞—Å—Ç—Ä–æ–π–∫–∏ –∏ —Å–æ–±—ã—Ç–∏—è –Ω–∞ —Ç–µ—Å—Ç–æ–≤–æ–º –∞–∫–∫–∞—É–Ω—Ç–µ."
-            ),
-            "structure": (
-                "üß± <b>–°—Ç—Ä—É–∫—Ç—É—Ä–∞</b>\n\n"
-                "–û–±—è–∑–∞—Ç–µ–ª—å–Ω—ã NAME, VERSION, DESCRIPTION, CREDITS, UUID, SETTINGS_PAGE, SETTINGS, "
-                "ACTIONS, BIND_TO_DELETE –∏ –≤—Å–µ —Å–ø–∏—Å–∫–∏ —Ö—É–∫–æ–≤. –û–±—Ä–∞–±–æ—Ç—á–∏–∫ –ø–æ–ª—É—á–∞–µ—Ç ctx; "
-                "–∞–∫–∫–∞—É–Ω—Ç –¥–æ—Å—Ç—É–ø–µ–Ω –∫–∞–∫ <code>ctx.account</code>, –Ω–∞—Å—Ç—Ä–æ–π–∫–∏ ‚Äî <code>ctx.get_setting()</code>."
-            ),
-            "hooks": (
-                "‚ö° <b>–•—É–∫–∏</b>\n\n"
-                "<code>BIND_TO_START</code>, <code>BIND_TO_STOP</code>, <code>BIND_TO_TICK</code>, "
-                "<code>BIND_TO_NEW_MESSAGE</code>, <code>BIND_TO_DEAL_CHANGED</code>, "
-                "<code>BIND_TO_NEW_REVIEW</code>, <code>BIND_TO_SETTING_CHANGED</code>.\n\n"
-                "–î–æ–ø—É—Å–∫–∞—é—Ç—Å—è def –∏ async def. –°–∏–Ω—Ö—Ä–æ–Ω–Ω—ã–µ —Ñ—É–Ω–∫—Ü–∏–∏ –≤—ã–ø–æ–ª–Ω—è—é—Ç—Å—è –≤–Ω–µ event loop."
-            ),
-            "settings": (
-                "‚öôÔ∏è <b>–ù–∞—Å—Ç—Ä–æ–π–∫–∏</b>\n\n"
-                "SETTINGS –ø–æ–¥–¥–µ—Ä–∂–∏–≤–∞–µ—Ç —Ç–∏–ø—ã bool, int, str –∏ choice. –ë–æ—Ç –∞–≤—Ç–æ–º–∞—Ç–∏—á–µ—Å–∫–∏ —Å–æ–∑–¥–∞—ë—Ç "
-                "–ø–æ—Å—Ç–æ—è–Ω–Ω—É—é –∫–Ω–æ–ø–∫—É ¬´–ù–∞—Å—Ç—Ä–æ–π–∫–∏¬ª, –ø—Ä–æ–≤–µ—Ä—è–µ—Ç –∑–Ω–∞—á–µ–Ω–∏—è –∏ —Å–æ—Ö—Ä–∞–Ω—è–µ—Ç –∏—Ö –≤ PostgreSQL. "
-                "ACTIONS –¥–æ–±–∞–≤–ª—è–µ—Ç –∫–Ω–æ–ø–∫–∏ —Ä—É—á–Ω—ã—Ö –¥–µ–π—Å—Ç–≤–∏–π –Ω–∞ —Ç—É –∂–µ —Å—Ç—Ä–∞–Ω–∏—Ü—É."
-            ),
-            "catalog": (
-                "üß≠ <b>–ü—É–±–ª–∏–∫–∞—Ü–∏—è</b>\n\n"
-                "–£—Å—Ç–∞–Ω–æ–≤–∏—Ç–µ –∏ –ø—Ä–æ–≤–µ—Ä—å—Ç–µ —Å–≤–æ–π –ø–ª–∞–≥–∏–Ω, –æ—Ç–∫—Ä–æ–π—Ç–µ –µ–≥–æ –∫–∞—Ä—Ç–æ—á–∫—É, –Ω–∞–∂–º–∏—Ç–µ ¬´–û–ø—É–±–ª–∏–∫–æ–≤–∞—Ç—å¬ª "
-                "–∏ –¥–æ–±–∞–≤—å—Ç–µ –æ–ø–∏—Å–∞–Ω–∏–µ –Ω–∞–∑–Ω–∞—á–µ–Ω–∏—è, –Ω–∞—Å—Ç—Ä–æ–π–∫–∏, –∑–∞–≤–∏—Å–∏–º–æ—Å—Ç–µ–π –∏ –æ–≥—Ä–∞–Ω–∏—á–µ–Ω–∏–π. "
-                "–ß—É–∂–æ–π –∏–ª–∏ –æ—Ñ–∏—Ü–∏–∞–ª—å–Ω—ã–π UUID –ø–µ—Ä–µ–∑–∞–ø–∏—Å–∞—Ç—å –Ω–µ–ª—å–∑—è."
-            ),
-            "safety": (
-                "üõ° <b>–ë–µ–∑–æ–ø–∞—Å–Ω–æ—Å—Ç—å</b>\n\n"
-                "–ü–ª–∞–≥–∏–Ω ‚Äî –∏—Å–ø–æ–ª–Ω—è–µ–º—ã–π Python-–∫–æ–¥ —Å –¥–æ—Å—Ç—É–ø–æ–º –∫ Playerok-—Å–µ—Å—Å–∏–∏ –∏ –æ–∫—Ä—É–∂–µ–Ω–∏—é –ø—Ä–æ—Ü–µ—Å—Å–∞. "
-                "–ü—Ä–æ–≤–µ—Ä—è–π—Ç–µ –∏—Å—Ö–æ–¥–Ω–∏–∫, –Ω–µ —Å–æ—Ö—Ä–∞–Ω—è–π—Ç–µ cookie –∏ –ø—Ä–æ–∫—Å–∏ –≤ –∫–æ–¥–µ –∏–ª–∏ –ª–æ–≥–∞—Ö. "
-                "–û—Ñ–∏—Ü–∏–∞–ª—å–Ω–æ–≥–æ —Å—Ç–∞–±–∏–ª—å–Ω–æ–≥–æ Playerok API –Ω–µ—Ç, –ø–æ—ç—Ç–æ–º—É –æ–±—Ä–∞–±–∞—Ç—ã–≤–∞–π—Ç–µ –æ—à–∏–±–∫–∏ —Å–µ—Ç–∏ –∏ –∏–∑–º–µ–Ω–µ–Ω–∏—è —Å—Ö–µ–º—ã."
-            ),
-        }
-        text = pages.get(page)
-        if not text:
-            await callback.message.answer("–†–∞–∑–¥–µ–ª –¥–æ–∫—É–º–µ–Ω—Ç–∞—Ü–∏–∏ –Ω–µ –Ω–∞–π–¥–µ–Ω.")
-            return
-        await callback.message.answer(text, reply_markup=keyboard([[('‚¨ÖÔ∏è –î–æ–∫—É–º–µ–Ω—Ç–∞—Ü–∏—è', 'po_plugin_docs')]]))
-
-    @router.callback_query(F.data == "po_plugin_upload_warning")
-    async def playerok_plugin_upload_warning(callback: CallbackQuery) -> None:
-        await callback.answer()
-        await callback.message.answer(
-            "‚ö†Ô∏è <b>–í–Ω–∏–º–∞–Ω–∏–µ</b>\n"
-            "Playerok-–ø–ª–∞–≥–∏–Ω –≤—ã–ø–æ–ª–Ω—è–µ—Ç—Å—è —Å –ø—Ä–∞–≤–∞–º–∏ –ø—Ä–æ—Ü–µ—Å—Å–∞ –±–æ—Ç–∞ –∏ –ø–æ–ª—É—á–∞–µ—Ç –¥–æ—Å—Ç—É–ø –∫ –∞–∫–∫–∞—É–Ω—Ç—É. "
-            "–ü—Ä–æ–¥–æ–ª–∂–∞–π—Ç–µ —Ç–æ–ª—å–∫–æ –µ—Å–ª–∏ –¥–æ–≤–µ—Ä—è–µ—Ç–µ –∞–≤—Ç–æ—Ä—É –∏ –ø—Ä–æ–≤–µ—Ä–∏–ª–∏ –∏—Å—Ö–æ–¥–Ω—ã–π –∫–æ–¥.",
-            reply_markup=keyboard([
-                [("–Ø –ø–æ–Ω–∏–º–∞—é —Ä–∏—Å–∫", "po_plugin_upload_confirm")],
-                [("–û—Ç–º–µ–Ω–∞", "po_plugins")],
-            ]),
-        )
-
-    @router.callback_query(F.data == "po_plugin_upload_confirm")
-    async def playerok_plugin_upload_confirm(callback: CallbackQuery, state: FSMContext) -> None:
-        await callback.answer()
-        if not await require_playerok_runtime(callback.message, callback.from_user.id):
-            return
-        await state.clear()
-        await state.set_state(PlayerokPluginState.file)
-        await callback.message.answer("–û—Ç–ø—Ä–∞–≤—å—Ç–µ –æ–¥–∏–Ω–æ—á–Ω—ã–π UTF-8 —Ñ–∞–π–ª Playerok-–ø–ª–∞–≥–∏–Ω–∞ .py –¥–æ 512 –ö–ë. –î–ª—è –æ—Ç–º–µ–Ω—ã: /cancel")
-
-    @router.message(PlayerokPluginState.file)
-    async def playerok_plugin_upload_file(message: Message, state: FSMContext) -> None:
-        document = message.document
-        if not document or not (document.file_name or "").lower().endswith(".py"):
-            await message.answer("‚ùå –û—Ç–ø—Ä–∞–≤—å—Ç–µ –¥–æ–∫—É–º–µ–Ω—Ç —Å —Ä–∞—Å—à–∏—Ä–µ–Ω–∏–µ–º .py.")
-            return
-        if document.file_size and document.file_size > 512 * 1024:
-            await message.answer("‚ùå –†–∞–∑–º–µ—Ä –ø–ª–∞–≥–∏–Ω–∞ –Ω–µ –¥–æ–ª–∂–µ–Ω –ø—Ä–µ–≤—ã—à–∞—Ç—å 512 –ö–ë.")
-            return
-        runtime = await require_playerok_runtime(message, message.from_user.id)
-        if not runtime:
-            await state.clear()
-            return
-        buffer = BytesIO()
-        await message.bot.download(document, destination=buffer)
-        try:
-            source = buffer.getvalue().decode("utf-8-sig")
-            plugin = await manager.playerok_plugins.install(
-                message.from_user.id, document.file_name, source, runtime
-            )
-        except UnicodeDecodeError:
-            await message.answer("‚ùå –§–∞–π–ª –¥–æ–ª–∂–µ–Ω –±—ã—Ç—å —Ç–µ–∫—Å—Ç–æ–≤—ã–º UTF-8 Python-–º–æ–¥—É–ª–µ–º.")
-            return
-        except PlayerokPluginValidationError as exc:
-            await message.answer(f"‚ùå –ü–ª–∞–≥–∏–Ω –æ—Ç–∫–ª–æ–Ω—ë–Ω: {html.escape(str(exc))}")
-            return
-        except Exception as exc:
-            logger.exception("–ù–µ —É–¥–∞–ª–æ—Å—å —É—Å—Ç–∞–Ω–æ–≤–∏—Ç—å Playerok-–ø–ª–∞–≥–∏–Ω")
-            await message.answer(f"‚ùå –û—à–∏–±–∫–∞ —É—Å—Ç–∞–Ω–æ–≤–∫–∏: {html.escape(clipped(exc, 600))}")
-            return
-        await state.clear()
-        await message.answer(f"‚úÖ Playerok-–ø–ª–∞–≥–∏–Ω <b>{html.escape(plugin.name)}</b> —É—Å—Ç–∞–Ω–æ–≤–ª–µ–Ω.")
-        await show_playerok_my_plugins(message, message.from_user.id)
-
-    async def show_playerok_plugin_info(target: Message, user_id: int, uuid: str) -> None:
-        runtime = manager.playerok_plugins.runtimes.get(user_id)
-        plugin = runtime.plugins.get(uuid) if runtime else None
-        if not plugin:
-            await target.answer("–ü–ª–∞–≥–∏–Ω –Ω–µ –Ω–∞–π–¥–µ–Ω.")
-            return
-        publication = await db.get_playerok_catalog_plugin(uuid)
-        rows = []
-        if plugin.settings_page:
-            rows.append([("‚öôÔ∏è –ù–∞—Å—Ç—Ä–æ–π–∫–∏", f"po_ps:{uuid}")])
-        publication_status = "–ù–µ –æ–ø—É–±–ª–∏–∫–æ–≤–∞–Ω"
-        if publication:
-            if publication["is_official"]:
-                publication_status = "üõ° –æ—Ñ–∏—Ü–∏–∞–ª—å–Ω–∞—è –ø—É–±–ª–∏–∫–∞—Ü–∏—è"
-                rows.append([("üß≠ –û—Ç–∫—Ä—ã—Ç—å –≤ –∫–∞—Ç–∞–ª–æ–≥–µ", f"po_pc_view:{uuid}:0")])
-            elif publication["owner_telegram_id"] == user_id:
-                publication_status = "‚úÖ –æ–ø—É–±–ª–∏–∫–æ–≤–∞–Ω –≤–∞–º–∏"
-                rows.append([("üìù –û–±–Ω–æ–≤–∏—Ç—å –ø—É–±–ª–∏–∫–∞—Ü–∏—é", f"po_pub_start:{uuid}")])
-                rows.append([("–£–±—Ä–∞—Ç—å –∏–∑ –∫–∞—Ç–∞–ª–æ–≥–∞", f"po_unpub_ask:{uuid}")])
-            else:
-                publication_status = "–û–ø—É–±–ª–∏–∫–æ–≤–∞–Ω –¥—Ä—É–≥–∏–º –ø–æ–ª—å–∑–æ–≤–∞—Ç–µ–ª–µ–º"
-                rows.append([("üß≠ –û—Ç–∫—Ä—ã—Ç—å –≤ –∫–∞—Ç–∞–ª–æ–≥–µ", f"po_pc_view:{uuid}:0")])
-        elif uuid not in PLAYEROK_READY_PLUGIN_BY_UUID:
-            rows.append([("üåê –û–ø—É–±–ª–∏–∫–æ–≤–∞—Ç—å –≤ –∫–∞—Ç–∞–ª–æ–≥–µ", f"po_pub_start:{uuid}")])
-        rows.extend([
-            [("–í—ã–∫–ª—é—á–∏—Ç—å" if plugin.enabled else "–í–∫–ª—é—á–∏—Ç—å", f"po_pt:{uuid}")],
-            [("üóë –£–¥–∞–ª–∏—Ç—å", f"po_pd_ask:{uuid}")],
-            [("‚¨ÖÔ∏è –ú–æ–∏ –ø–ª–∞–≥–∏–Ω—ã", "po_my_plugins")],
-        ])
-        hooks_count = sum(len(value) for value in plugin.hooks.values())
-        await target.answer(
-            f"üß© <b>{html.escape(plugin.name)}</b> v{html.escape(plugin.version)}\n"
-            f"{html.escape(plugin.description)}\n\n"
-            f"–ê–≤—Ç–æ—Ä: {html.escape(plugin.credits)}\n"
-            f"UUID: <code>{plugin.uuid}</code>\n"
-            f"–•—É–∫–æ–≤: <b>{hooks_count}</b> ¬∑ –¥–µ–π—Å—Ç–≤–∏–π: <b>{len(plugin.actions)}</b>\n"
-            f"–ù–∞—Å—Ç—Ä–æ–π–∫–∏: {bool_icon(plugin.settings_page)}\n"
-            f"–ö–∞—Ç–∞–ª–æ–≥: {html.escape(publication_status)}\n"
-            f"–°–æ—Å—Ç–æ—è–Ω–∏–µ: {bool_icon(plugin.enabled)}",
-            reply_markup=keyboard(rows),
-        )
-
-    @router.callback_query(F.data.startswith("po_pi:"))
-    async def playerok_plugin_info(callback: CallbackQuery, state: FSMContext) -> None:
-        await callback.answer()
-        await state.clear()
-        await show_playerok_plugin_info(callback.message, callback.from_user.id, callback.data.split(":", 1)[1])
-
-    async def show_playerok_plugin_settings(target: Message, user_id: int, uuid: str) -> None:
-        runtime = manager.playerok_plugins.runtimes.get(user_id)
-        plugin = runtime.plugins.get(uuid) if runtime else None
-        if not plugin or not plugin.settings_page:
-            await target.answer("–°—Ç—Ä–∞–Ω–∏—Ü–∞ –Ω–∞—Å—Ç—Ä–æ–µ–∫ –Ω–µ –Ω–∞–π–¥–µ–Ω–∞.")
-            return
-        values = runtime.settings.get(uuid, {})
-        rows = []
-        for index, (key, spec) in enumerate(plugin.settings_schema.items()):
-            value = values.get(key, spec["default"])
-            rows.append([(
-                f"{spec['label']}: {clipped(playerok_setting_label(spec, value), 22)}",
-                f"po_pset:{uuid}:{index}",
-            )])
-        for index, action in enumerate(plugin.actions.values()):
-            rows.append([(action["label"], f"po_pact:{uuid}:{index}")])
-        rows.append([("‚¨ÖÔ∏è –ö –ø–ª–∞–≥–∏–Ω—É", f"po_pi:{uuid}")])
-        await target.answer(
-            f"‚öôÔ∏è <b>–ù–∞—Å—Ç—Ä–æ–π–∫–∏: {html.escape(plugin.name)}</b>\n\n"
-            "–ù–∞–∂–º–∏—Ç–µ –Ω–∞—Å—Ç—Ä–æ–π–∫—É –¥–ª—è –∏–∑–º–µ–Ω–µ–Ω–∏—è. –ó–Ω–∞—á–µ–Ω–∏—è —Å–æ—Ö—Ä–∞–Ω—è—é—Ç—Å—è –≤ PostgreSQL –∏ –≤–æ—Å—Å—Ç–∞–Ω–∞–≤–ª–∏–≤–∞—é—Ç—Å—è –ø–æ—Å–ª–µ –ø–µ—Ä–µ–∑–∞–ø—É—Å–∫–∞.",
-            reply_markup=keyboard(rows),
-        )
-
-    @router.callback_query(F.data.startswith("po_ps:"))
-    async def playerok_plugin_settings(callback: CallbackQuery) -> None:
-        await callback.answer()
-        await show_playerok_plugin_settings(callback.message, callback.from_user.id, callback.data.split(":", 1)[1])
-
-    @router.callback_query(F.data.startswith("po_pset:"))
-    async def playerok_plugin_setting_change(callback: CallbackQuery, state: FSMContext) -> None:
-        _, uuid, raw_index = callback.data.split(":", 2)
-        runtime = manager.playerok_plugins.runtimes.get(callback.from_user.id)
-        plugin = runtime.plugins.get(uuid) if runtime else None
-        if not plugin or not plugin.enabled:
-            await callback.answer("–°–Ω–∞—á–∞–ª–∞ –≤–∫–ª—é—á–∏—Ç–µ –ø–ª–∞–≥–∏–Ω", show_alert=True)
-            return
-        items = list(plugin.settings_schema.items())
-        try:
-            key, spec = items[int(raw_index)]
-        except (ValueError, IndexError):
-            await callback.answer("–ù–∞—Å—Ç—Ä–æ–π–∫–∞ –Ω–µ –Ω–∞–π–¥–µ–Ω–∞", show_alert=True)
-            return
-        current = runtime.settings.get(uuid, {}).get(key, spec["default"])
-        if spec["type"] == "bool":
-            await manager.playerok_plugins.set_setting(callback.from_user.id, uuid, key, not bool(current))
-            await callback.answer("–°–æ—Ö—Ä–∞–Ω–µ–Ω–æ")
-            await show_playerok_plugin_settings(callback.message, callback.from_user.id, uuid)
-            return
-        if spec["type"] == "choice":
-            choices = list(spec["choices"])
-            index = choices.index(str(current)) if str(current) in choices else -1
-            await manager.playerok_plugins.set_setting(callback.from_user.id, uuid, key, choices[(index + 1) % len(choices)])
-            await callback.answer("–í—ã–±—Ä–∞–Ω —Å–ª–µ–¥—É—é—â–∏–π –≤–∞—Ä–∏–∞–Ω—Ç")
-            await show_playerok_plugin_settings(callback.message, callback.from_user.id, uuid)
-            return
-        await callback.answer()
-        await state.clear()
-        await state.set_state(PlayerokPluginState.setting_value)
-        await state.update_data(po_plugin_uuid=uuid, po_plugin_setting=key)
-        constraints = (
-            f"–æ—Ç {spec.get('min', '‚àí‚àû')} –¥–æ {spec.get('max', '+‚àû')}"
-            if spec["type"] == "int"
-            else f"–æ—Ç {spec.get('min_length', 0)} –¥–æ {spec.get('max_length', 2000)} —Å–∏–º–≤–æ–ª–æ–≤"
-        )
-        await callback.message.answer(
-            f"–í–≤–µ–¥–∏—Ç–µ –Ω–æ–≤–æ–µ –∑–Ω–∞—á–µ–Ω–∏–µ ¬´<b>{html.escape(spec['label'])}</b>¬ª ({constraints}). –î–ª—è –æ—Ç–º–µ–Ω—ã: /cancel"
-        )
-
-    @router.message(PlayerokPluginState.setting_value, F.text)
-    async def playerok_plugin_setting_save(message: Message, state: FSMContext) -> None:
-        data = await state.get_data()
-        uuid = data.get("po_plugin_uuid")
-        key = data.get("po_plugin_setting")
-        if not uuid or not key:
-            await state.clear()
-            return
-        try:
-            await manager.playerok_plugins.set_setting(message.from_user.id, uuid, key, message.text)
-        except (KeyError, ValueError) as exc:
-            await message.answer(f"‚ùå –ó–Ω–∞—á–µ–Ω–∏–µ –Ω–µ —Å–æ—Ö—Ä–∞–Ω–µ–Ω–æ: {html.escape(str(exc))}")
-            return
-        await state.clear()
-        await message.answer("‚úÖ –ù–∞—Å—Ç—Ä–æ–π–∫–∞ —Å–æ—Ö—Ä–∞–Ω–µ–Ω–∞.")
-        await show_playerok_plugin_settings(message, message.from_user.id, uuid)
-
-    @router.callback_query(F.data.startswith("po_pact:"))
-    async def playerok_plugin_action(callback: CallbackQuery) -> None:
-        _, uuid, raw_index = callback.data.split(":", 2)
-        runtime = manager.playerok_plugins.runtimes.get(callback.from_user.id)
-        plugin = runtime.plugins.get(uuid) if runtime else None
-        if not plugin or not plugin.enabled:
-            await callback.answer("–°–Ω–∞—á–∞–ª–∞ –≤–∫–ª—é—á–∏—Ç–µ –ø–ª–∞–≥–∏–Ω", show_alert=True)
-            return
-        actions = list(plugin.actions)
-        try:
-            action_id = actions[int(raw_index)]
-        except (ValueError, IndexError):
-            await callback.answer("–î–µ–π—Å—Ç–≤–∏–µ –Ω–µ –Ω–∞–π–¥–µ–Ω–æ", show_alert=True)
-            return
-        await callback.answer("–í—ã–ø–æ–ª–Ω—è—é‚Ä¶")
-        try:
-            result = await manager.playerok_plugins.run_action(callback.from_user.id, uuid, action_id)
-        except Exception as exc:
-            logger.exception("–û—à–∏–±–∫–∞ –¥–µ–π—Å—Ç–≤–∏—è Playerok-–ø–ª–∞–≥–∏–Ω–∞ %s", uuid)
-            await callback.message.answer(f"‚ùå –î–µ–π—Å—Ç–≤–∏–µ –∑–∞–≤–µ—Ä—à–∏–ª–æ—Å—å –æ—à–∏–±–∫–æ–π: <code>{html.escape(clipped(exc, 700))}</code>")
-            return
-        if result is not None:
-            await callback.message.answer(clipped(str(result), 3900))
-        await show_playerok_plugin_settings(callback.message, callback.from_user.id, uuid)
-
-    @router.callback_query(F.data.startswith("po_pt:"))
-    async def playerok_plugin_toggle(callback: CallbackQuery) -> None:
-        uuid = callback.data.split(":", 1)[1]
-        try:
-            enabled = await manager.playerok_plugins.toggle(callback.from_user.id, uuid)
-        except KeyError:
-            await callback.answer("–ü–ª–∞–≥–∏–Ω –Ω–µ –Ω–∞–π–¥–µ–Ω", show_alert=True)
-            return
-        await callback.answer("–ü–ª–∞–≥–∏–Ω –≤–∫–ª—é—á—ë–Ω" if enabled else "–ü–ª–∞–≥–∏–Ω –≤—ã–∫–ª—é—á–µ–Ω")
-        await show_playerok_plugin_info(callback.message, callback.from_user.id, uuid)
-
-    @router.callback_query(F.data.startswith("po_pd_ask:"))
-    async def playerok_plugin_delete_ask(callback: CallbackQuery) -> None:
-        uuid = callback.data.split(":", 1)[1]
-        await callback.answer()
-        await callback.message.answer(
-            "–£–¥–∞–ª–∏—Ç—å Playerok-–ø–ª–∞–≥–∏–Ω, –µ–≥–æ –∏—Å—Ö–æ–¥–Ω–∏–∫ –∏ –Ω–∞—Å—Ç—Ä–æ–π–∫–∏?",
-            reply_markup=keyboard([[("–î–∞, —É–¥–∞–ª–∏—Ç—å", f"po_pd_do:{uuid}"), ("–û—Ç–º–µ–Ω–∞", f"po_pi:{uuid}")]]),
-        )
-
-    @router.callback_query(F.data.startswith("po_pd_do:"))
-    async def playerok_plugin_delete(callback: CallbackQuery) -> None:
-        uuid = callback.data.split(":", 1)[1]
-        await callback.answer("–£–¥–∞–ª—è—é‚Ä¶")
-        await manager.playerok_plugins.delete(callback.from_user.id, uuid)
-        await callback.message.answer("‚úÖ Playerok-–ø–ª–∞–≥–∏–Ω —É–¥–∞–ª—ë–Ω.")
-        await show_playerok_my_plugins(callback.message, callback.from_user.id)
-
-    @router.callback_query(F.data.startswith("po_pub_start:"))
-    async def playerok_catalog_publish_start(callback: CallbackQuery, state: FSMContext) -> None:
-        uuid = callback.data.split(":", 1)[1]
-        plugin = await db.get_playerok_plugin(callback.from_user.id, uuid)
-        publication = await db.get_playerok_catalog_plugin(uuid)
-        if not plugin:
-            await callback.answer("–£—Å—Ç–∞–Ω–æ–≤–ª–µ–Ω–Ω—ã–π –ø–ª–∞–≥–∏–Ω –Ω–µ –Ω–∞–π–¥–µ–Ω", show_alert=True)
-            return
-        if publication and (publication["is_official"] or publication["owner_telegram_id"] != callback.from_user.id):
-            await callback.answer("–≠—Ç–æ—Ç UUID —É–∂–µ –æ–ø—É–±–ª–∏–∫–æ–≤–∞–Ω –¥—Ä—É–≥–∏–º –∞–≤—Ç–æ—Ä–æ–º", show_alert=True)
-            return
-        await callback.answer()
-        await state.clear()
-        await state.set_state(PlayerokCatalogPublishState.description)
-        await state.update_data(po_catalog_uuid=uuid)
-        await callback.message.answer(
-            f"–û—Ç–ø—Ä–∞–≤—å—Ç–µ –æ–ø–∏—Å–∞–Ω–∏–µ Playerok-–ø–ª–∞–≥–∏–Ω–∞: –Ω–∞–∑–Ω–∞—á–µ–Ω–∏–µ, –Ω–∞—Å—Ç—Ä–æ–π–∫–∞, –∫–æ–º–∞–Ω–¥—ã/–¥–µ–π—Å—Ç–≤–∏—è, "
-            f"–∑–∞–≤–∏—Å–∏–º–æ—Å—Ç–∏ –∏ –æ–≥—Ä–∞–Ω–∏—á–µ–Ω–∏—è. –û—Ç {PLUGIN_CATALOG_DESCRIPTION_MIN} –¥–æ {PLUGIN_CATALOG_DESCRIPTION_MAX} —Å–∏–º–≤–æ–ª–æ–≤.\n\n–î–ª—è –æ—Ç–º–µ–Ω—ã: /cancel"
-        )
-
-    @router.message(PlayerokCatalogPublishState.description, F.text)
-    async def playerok_catalog_publish_description(message: Message, state: FSMContext) -> None:
-        try:
-            description = validate_catalog_description(message.text or "")
-        except ValueError as exc:
-            await message.answer(f"‚ùå {html.escape(str(exc))}")
-            return
-        uuid = (await state.get_data()).get("po_catalog_uuid")
-        plugin = await db.get_playerok_plugin(message.from_user.id, uuid) if uuid else None
-        if not plugin:
-            await state.clear()
-            await message.answer("‚ùå –ü–ª–∞–≥–∏–Ω –±–æ–ª—å—à–µ –Ω–µ —É—Å—Ç–∞–Ω–æ–≤–ª–µ–Ω.")
-            return
-        await state.update_data(po_catalog_description=description)
-        await message.answer(
-            "üîé <b>–ü—Ä–µ–¥–ø—Ä–æ—Å–º–æ—Ç—Ä –ø—É–±–ª–∏–∫–∞—Ü–∏–∏ Playerok</b>\n\n"
-            f"<b>{html.escape(plugin['name'])}</b> v{html.escape(plugin['version'])}\n"
-            f"<i>{html.escape(plugin['description'])}</i>\n\n"
-            f"{html.escape(description)}\n\n"
-            f"–ü—É–±–ª–∏—á–Ω—ã–π –∞–≤—Ç–æ—Ä: <b>{html.escape(telegram_publisher_name(message.from_user))}</b>",
-            reply_markup=keyboard([[("‚úÖ –û–ø—É–±–ª–∏–∫–æ–≤–∞—Ç—å", f"po_pub_do:{uuid}"), ("–û—Ç–º–µ–Ω–∞", f"po_pi:{uuid}")]]),
-        )
-
-    @router.callback_query(F.data.startswith("po_pub_do:"))
-    async def playerok_catalog_publish_do(callback: CallbackQuery, state: FSMContext) -> None:
-        uuid = callback.data.split(":", 1)[1]
-        data = await state.get_data()
-        if data.get("po_catalog_uuid") != uuid or not data.get("po_catalog_description"):
-            await callback.answer("–°–µ—Å—Å–∏—è –ø—É–±–ª–∏–∫–∞—Ü–∏–∏ –∏—Å—Ç–µ–∫–ª–∞", show_alert=True)
-            return
-        published = await db.publish_playerok_catalog_plugin(
-            callback.from_user.id,
-            uuid,
-            telegram_publisher_name(callback.from_user),
-            data["po_catalog_description"],
-        )
-        await state.clear()
-        await callback.answer("–û–ø—É–±–ª–∏–∫–æ–≤–∞–Ω–æ" if published else "–ü—É–±–ª–∏–∫–∞—Ü–∏—è –Ω–µ –≤—ã–ø–æ–ª–Ω–µ–Ω–∞", show_alert=not published)
-        if published:
-            await callback.message.answer("‚úÖ Playerok-–ø–ª–∞–≥–∏–Ω –æ–ø—É–±–ª–∏–∫–æ–≤–∞–Ω –≤ –æ–±—â–µ–º –∫–∞—Ç–∞–ª–æ–≥–µ.", reply_markup=keyboard([[('üß≠ –û—Ç–∫—Ä—ã—Ç—å', f"po_pc_view:{uuid}:0")]]))
-
-    @router.callback_query(F.data.startswith("po_unpub_ask:"))
-    async def playerok_catalog_unpublish_ask(callback: CallbackQuery) -> None:
-        uuid = callback.data.split(":", 1)[1]
-        item = await db.get_playerok_catalog_plugin(uuid)
-        if not item or item["owner_telegram_id"] != callback.from_user.id or item["is_official"]:
-            await callback.answer("–£–¥–∞–ª–∏—Ç—å —ç—Ç—É –ø—É–±–ª–∏–∫–∞—Ü–∏—é –Ω–µ–ª—å–∑—è", show_alert=True)
-            return
-        await callback.answer()
-        await callback.message.answer(
-            f"–£–±—Ä–∞—Ç—å <b>{html.escape(item['name'])}</b> –∏–∑ –∫–∞—Ç–∞–ª–æ–≥–∞ Playerok? –£—Å—Ç–∞–Ω–æ–≤–ª–µ–Ω–Ω—ã–µ –∫–æ–ø–∏–∏ –æ—Å—Ç–∞–Ω—É—Ç—Å—è.",
-            reply_markup=keyboard([[("–î–∞, —É–±—Ä–∞—Ç—å", f"po_unpub_do:{uuid}"), ("–û—Ç–º–µ–Ω–∞", f"po_pi:{uuid}")]]),
-        )
-
-    @router.callback_query(F.data.startswith("po_unpub_do:"))
-    async def playerok_catalog_unpublish_do(callback: CallbackQuery) -> None:
-        uuid = callback.data.split(":", 1)[1]
-        removed = await db.unpublish_playerok_catalog_plugin(callback.from_user.id, uuid)
-        await callback.answer("–ü—É–±–ª–∏–∫–∞—Ü–∏—è —É–¥–∞–ª–µ–Ω–∞" if removed else "–ü—É–±–ª–∏–∫–∞—Ü–∏—è –Ω–µ –Ω–∞–π–¥–µ–Ω–∞")
-        await show_playerok_plugin_info(callback.message, callback.from_user.id, uuid)
-
-    async def show_ai_plugin_builder(target: Message, user_id: int) -> None:
-        settings = await db.get_plugin_builder_settings(user_id)
-        configured = bool(settings["api_token_enc"] and settings["model_id"])
-        running = user_id in ai_builder_jobs
-        await target.answer(
-            "‚ú® <b>AI-–∫–æ–Ω—Å—Ç—Ä—É–∫—Ç–æ—Ä –ø–ª–∞–≥–∏–Ω–æ–≤</b>\n\n"
-            "–û–ø–∏—à–∏—Ç–µ –Ω—É–∂–Ω—ã–π FunPay-–ø–ª–∞–≥–∏–Ω –æ–±—ã—á–Ω—ã–º —Ç–µ–∫—Å—Ç–æ–º. –ë–æ—Ç –ø–µ—Ä–µ–¥–∞—Å—Ç –º–æ–¥–µ–ª–∏ –ø–æ–ª–Ω—É—é "
-            "–¥–æ–∫—É–º–µ–Ω—Ç–∞—Ü–∏—é, —Å–æ–∑–¥–∞—Å—Ç –∏—Å—Ö–æ–¥–Ω–∏–∫, –∑–∞—Ç–µ–º –æ—Ç–¥–µ–ª—å–Ω—ã–º —ç—Ç–∞–ø–æ–º –ø—Ä–æ–≤–µ—Ä–∏—Ç —Å–∏–Ω—Ç–∞–∫—Å–∏—Å –∏ "
-            "—Å–æ–æ—Ç–≤–µ—Ç—Å—Ç–≤–∏–µ –∫–æ–Ω—Ç—Ä–∞–∫—Ç—É. –£—Å–ø–µ—à–Ω—ã–π —Ä–µ–∑—É–ª—å—Ç–∞—Ç –∞–≤—Ç–æ–º–∞—Ç–∏—á–µ—Å–∫–∏ –ø–æ—è–≤–∏—Ç—Å—è –≤ ¬´–ú–æ–∏ –ø–ª–∞–≥–∏–Ω—ã¬ª.\n\n"
-            "‚ö†Ô∏è –°–≥–µ–Ω–µ—Ä–∏—Ä–æ–≤–∞–Ω–Ω—ã–π Python-–∫–æ–¥ –≤—ã–ø–æ–ª–Ω—è–µ—Ç—Å—è —Å –ø—Ä–∞–≤–∞–º–∏ –ø—Ä–æ—Ü–µ—Å—Å–∞ –±–æ—Ç–∞. –ö–æ–Ω—Å—Ç—Ä—É–∫—Ç–æ—Ä "
-            "–±–ª–æ–∫–∏—Ä—É–µ—Ç –Ω–µ—Å–∫–æ–ª—å–∫–æ –æ—Å–æ–±–æ –æ–ø–∞—Å–Ω—ã—Ö –∫–æ–Ω—Å—Ç—Ä—É–∫—Ü–∏–π, –Ω–æ –ø–µ—Ä–µ–¥ –ø—É–±–ª–∏–∫–∞—Ü–∏–µ–π –≤—Å—ë —Ä–∞–≤–Ω–æ "
-            "—Ä–µ–∫–æ–º–µ–Ω–¥—É–µ—Ç—Å—è –ø—Ä–æ–≤–µ—Ä–∏—Ç—å –∏—Å—Ö–æ–¥–Ω–∏–∫.\n\n"
-            f"–ù–∞—Å—Ç—Ä–æ–π–∫–∏ API: {'‚úÖ –≥–æ—Ç–æ–≤—ã' if configured else '‚ùå –Ω–µ –∑–∞–ø–æ–ª–Ω–µ–Ω—ã'}\n"
-            f"–ó–∞–¥–∞—á–∞: {'ü§ñ –≤—ã–ø–æ–ª–Ω—è–µ—Ç—Å—è' if running else '—Å–≤–æ–±–æ–¥–µ–Ω'}",
-            reply_markup=keyboard([
-                [("‚ú® –ü–µ—Ä–µ–π—Ç–∏ –∫ —Å–æ–∑–¥–∞–Ω–∏—é", "ai_builder_create")],
-                [("‚öôÔ∏è –ù–∞—Å—Ç—Ä–æ–π–∫–∏", "ai_builder_settings")],
-                [("‚¨ÖÔ∏è –ü–ª–∞–≥–∏–Ω—ã", "plugins")],
-            ]),
-        )
-
-    async def show_ai_plugin_builder_settings(target: Message, user_id: int) -> None:
-        settings = await db.get_plugin_builder_settings(user_id)
-        await target.answer(
-            "‚öôÔ∏è <b>–ù–∞—Å—Ç—Ä–æ–π–∫–∏ AI-–∫–æ–Ω—Å—Ç—Ä—É–∫—Ç–æ—Ä–∞</b>\n\n"
-            f"Base URL: <code>{html.escape(str(settings['api_base_url']))}</code>\n"
-            f"API-—Ç–æ–∫–µ–Ω: <code>{AI_BUILDER_TOKEN_MASK if settings['api_token_enc'] else '–Ω–µ –∑–∞–¥–∞–Ω'}</code>\n"
-            f"ID –º–æ–¥–µ–ª–∏: <code>{html.escape(str(settings['model_id'] or '–Ω–µ –∑–∞–¥–∞–Ω'))}</code>\n\n"
-            "–ò—Å–ø–æ–ª—å–∑—É–µ—Ç—Å—è –æ—Ñ–∏—Ü–∏–∞–ª—å–Ω—ã–π Anthropic SDK. –î–ª—è —Å–æ–≤–º–µ—Å—Ç–∏–º–æ–≥–æ –ø—Ä–æ–∫—Å–∏ —É–∫–∞–∂–∏—Ç–µ –µ–≥–æ HTTPS Base URL.",
-            reply_markup=keyboard([
-                [("üåê –ò–∑–º–µ–Ω–∏—Ç—å Base URL", "ai_builder_set:base")],
-                [("üîë –ò–∑–º–µ–Ω–∏—Ç—å API-—Ç–æ–∫–µ–Ω", "ai_builder_set:token")],
-                [("üß† –ò–∑–º–µ–Ω–∏—Ç—å ID –º–æ–¥–µ–ª–∏", "ai_builder_set:model")],
-                [("‚¨ÖÔ∏è –ö–æ–Ω—Å—Ç—Ä—É–∫—Ç–æ—Ä", "ai_builder")],
-            ]),
-        )
-
-    async def ai_generation_timer(
-        status_message: Message,
-        phase: dict[str, str],
-        stop_event: asyncio.Event,
-    ) -> None:
-        started = asyncio.get_running_loop().time()
-        while not stop_event.is_set():
-            elapsed = int(asyncio.get_running_loop().time() - started)
-            try:
-                await status_message.edit_text(
-                    "ü§ñ <b>–î—É–º–∞—é‚Ä¶</b>\n"
-                    f"‚è± –ü—Ä–æ—à–ª–æ: <b>{elapsed} —Å–µ–∫.</b>\n"
-                    f"{phase['label']}"
-                )
-            except TelegramBadRequest as exc:
-                if "message is not modified" not in str(exc).casefold():
-                    logger.warning("–ù–µ –æ–±–Ω–æ–≤–ª—ë–Ω —Ç–∞–π–º–µ—Ä AI-–∫–æ–Ω—Å—Ç—Ä—É–∫—Ç–æ—Ä–∞: %s", exc)
-            except Exception:
-                logger.warning("–ù–µ –æ–±–Ω–æ–≤–ª—ë–Ω —Ç–∞–π–º–µ—Ä AI-–∫–æ–Ω—Å—Ç—Ä—É–∫—Ç–æ—Ä–∞", exc_info=True)
-            try:
-                await asyncio.wait_for(stop_event.wait(), timeout=1)
-            except TimeoutError:
-                pass
-
-    async def run_ai_plugin_generation(
-        message: Message,
-        request: str,
-        *,
-        edit_uuid: str | None = None,
-    ) -> None:
-        user_id = message.from_user.id
-        if user_id in ai_builder_jobs:
-            await message.answer("‚è≥ –ü—Ä–µ–¥—ã–¥—É—â–∏–π –ø–ª–∞–≥–∏–Ω –µ—â—ë —Å–æ–∑–¥–∞—ë—Ç—Å—è. –î–æ–∂–¥–∏—Ç–µ—Å—å —Ä–µ–∑—É–ª—å—Ç–∞—Ç–∞.")
-            return
-        runtime = await require_runtime(message, user_id)
-        if not runtime:
-            return
-        settings = await db.get_plugin_builder_settings(user_id)
-        if not settings["api_token_enc"] or not settings["model_id"]:
-            await message.answer(
-                "‚ùå –°–Ω–∞—á–∞–ª–∞ –∑–∞–¥–∞–π—Ç–µ API-—Ç–æ–∫–µ–Ω –∏ ID –º–æ–¥–µ–ª–∏.",
-                reply_markup=keyboard([[('‚öôÔ∏è –û—Ç–∫—Ä—ã—Ç—å –Ω–∞—Å—Ç—Ä–æ–π–∫–∏', 'ai_builder_settings')]]),
-            )
-            return
-        try:
-            api_token = secrets.decrypt(settings["api_token_enc"])
-        except (InvalidToken, ValueError) as exc:
-            logger.warning("–ù–µ —Ä–∞—Å—à–∏—Ñ—Ä–æ–≤–∞–Ω —Ç–æ–∫–µ–Ω AI-–∫–æ–Ω—Å—Ç—Ä—É–∫—Ç–æ—Ä–∞ –¥–ª—è %s", user_id)
-            await message.answer(
-                "‚ùå –°–æ—Ö—Ä–∞–Ω—ë–Ω–Ω—ã–π API-—Ç–æ–∫–µ–Ω –Ω–µ —É–¥–∞–ª–æ—Å—å –ø—Ä–æ—á–∏—Ç–∞—Ç—å. –í–≤–µ–¥–∏—Ç–µ –µ–≥–æ –∑–∞–Ω–æ–≤–æ –≤ –Ω–∞—Å—Ç—Ä–æ–π–∫–∞—Ö."
-            )
-            return
-
-        existing = await db.get_plugin(user_id, edit_uuid) if edit_uuid else None
-        if edit_uuid and (not existing or not existing["ai_generated"]):
-            await message.answer("‚ùå –†–µ–¥–∞–∫—Ç–∏—Ä–æ–≤–∞—Ç—å —á–µ—Ä–µ–∑ –ò–ò –º–æ–∂–Ω–æ —Ç–æ–ª—å–∫–æ —Å–æ–∑–¥–∞–Ω–Ω—ã–π –∏–º –ø–ª–∞–≥–∏–Ω.")
-            return
-        publication = await db.get_catalog_plugin(edit_uuid) if edit_uuid else None
-        ai_builder_jobs.add(user_id)
-        phase = {"label": "1/2 ¬∑ –°–æ–∑–¥–∞–Ω–∏–µ –∏—Å—Ö–æ–¥–Ω–∏–∫–∞"}
-        stop_event = asyncio.Event()
-        status_message = await message.answer(
-            "ü§ñ <b>–î—É–º–∞—é‚Ä¶</b>\n‚è± –ü—Ä–æ—à–ª–æ: <b>0 —Å–µ–∫.</b>\n1/2 ¬∑ –°–æ–∑–¥–∞–Ω–∏–µ –∏—Å—Ö–æ–¥–Ω–∏–∫–∞"
-        )
-        timer_task = asyncio.create_task(
-            ai_generation_timer(status_message, phase, stop_event)
-        )
-        try:
-            documentation = await asyncio.to_thread(
-                PLUGIN_DOCUMENTATION_PATH.read_text, encoding="utf-8"
-            )
-            builder = AnthropicPluginBuilder(
-                api_token,
-                str(settings["api_base_url"] or AI_BUILDER_DEFAULT_API_BASE_URL),
-                str(settings["model_id"]),
-            )
-            if existing:
-                draft = await builder.edit_draft(
-                    request,
-                    documentation,
-                    str(existing["source"]),
-                    str(existing["uuid"]),
-                )
-            else:
-                draft = await builder.create_draft(request, documentation)
-
-            phase["label"] = "2/2 ¬∑ –ü—Ä–æ–≤–µ—Ä–∫–∞ —Å–∏–Ω—Ç–∞–∫—Å–∏—Å–∞ –∏ –¥–æ–∫—É–º–µ–Ω—Ç–∞—Ü–∏–∏"
-            expected_uuid = str(existing["uuid"]) if existing else None
-            reviewed = await builder.review_draft(
-                request,
-                documentation,
-                draft,
-                expected_uuid=expected_uuid,
-            )
-            metadata = inspect_generated_source(
-                reviewed.source, expected_uuid=expected_uuid
-            )
-            filename = (
-                str(existing["filename"])
-                if existing
-                else generated_filename(str(metadata["NAME"]), str(metadata["UUID"]))
-            )
-            plugin = await manager.plugins.install(
-                user_id,
-                filename,
-                reviewed.source,
-                runtime,
-            )
-            await db.mark_plugin_ai_generated(
-                user_id,
-                plugin.uuid,
-                request,
-                reviewed.summary,
-            )
-            catalog_updated = False
-            if (
-                publication
-                and publication["owner_telegram_id"] == user_id
-                and not publication["is_official"]
-            ):
-                catalog_updated = await db.publish_catalog_plugin(
-                    user_id,
-                    plugin.uuid,
-                    str(publication["publisher_name"]),
-                    str(publication["description"]),
-                )
-        except (AIPluginBuilderError, PluginValidationError, ValueError) as exc:
-            logger.warning("AI-–∫–æ–Ω—Å—Ç—Ä—É–∫—Ç–æ—Ä –æ—Ç–∫–ª–æ–Ω–∏–ª —Ä–µ–∑—É–ª—å—Ç–∞—Ç –¥–ª—è %s: %s", user_id, exc)
-            await status_message.edit_text(
-                "‚ùå <b>–ü–ª–∞–≥–∏–Ω –Ω–µ —Å–æ–∑–¥–∞–Ω</b>\n\n"
-                f"{html.escape(clipped(exc, 1200))}\n\n"
-                "–ò—Å–ø—Ä–∞–≤—å—Ç–µ –æ–ø–∏—Å–∞–Ω–∏–µ –∏–ª–∏ –Ω–∞—Å—Ç—Ä–æ–π–∫–∏ –º–æ–¥–µ–ª–∏ –∏ –ø–æ–ø—Ä–æ–±—É–π—Ç–µ –µ—â—ë —Ä–∞–∑.",
-                reply_markup=keyboard([[('‚¨ÖÔ∏è AI-–∫–æ–Ω—Å—Ç—Ä—É–∫—Ç–æ—Ä', 'ai_builder')]]),
-            )
-            return
-        except Exception as exc:
-            logger.exception("–û—à–∏–±–∫–∞ AI-–∫–æ–Ω—Å—Ç—Ä—É–∫—Ç–æ—Ä–∞ –¥–ª—è %s", user_id)
-            await status_message.edit_text(
-                "‚ùå <b>–°–æ–∑–¥–∞–Ω–∏–µ –∑–∞–≤–µ—Ä—à–∏–ª–æ—Å—å –æ—à–∏–±–∫–æ–π</b>\n\n"
-                f"{html.escape(clipped(exc, 1200))}",
-                reply_markup=keyboard([[('‚¨ÖÔ∏è AI-–∫–æ–Ω—Å—Ç—Ä—É–∫—Ç–æ—Ä', 'ai_builder')]]),
-            )
-            return
-        finally:
-            stop_event.set()
-            await timer_task
-            ai_builder_jobs.discard(user_id)
-
-        action = "–æ–±–Ω–æ–≤–ª—ë–Ω" if existing else "—Å–æ–∑–¥–∞–Ω –∏ —É—Å—Ç–∞–Ω–æ–≤–ª–µ–Ω"
-        catalog_note = "\nüåê –û–ø—É–±–ª–∏–∫–æ–≤–∞–Ω–Ω–∞—è –≤–µ—Ä—Å–∏—è —Ç–∞–∫–∂–µ –æ–±–Ω–æ–≤–ª–µ–Ω–∞." if catalog_updated else ""
-        await status_message.edit_text(
-            f"‚úÖ <b>–ü–ª–∞–≥–∏–Ω {action}</b>\n\n"
-            f"ü§ñ <b>–°–ì–ï–ù–ï–†–ò–†–û–í–ê–ù–û –ò–ò</b>\n"
-            f"<b>{html.escape(plugin.name)}</b> v{html.escape(plugin.version)}\n\n"
-            f"{html.escape(clipped(reviewed.summary, 2200))}"
-            f"{catalog_note}",
-            reply_markup=keyboard([
-                [("üß© –û—Ç–∫—Ä—ã—Ç—å –ø–ª–∞–≥–∏–Ω", f"plugin_info:{plugin.uuid}")],
-                [("‚ú® –†–µ–¥–∞–∫—Ç–∏—Ä–æ–≤–∞—Ç—å —á–µ—Ä–µ–∑ –ò–ò", f"ai_builder_edit:{plugin.uuid}")],
-                [("‚¨ÖÔ∏è –ú–æ–∏ –ø–ª–∞–≥–∏–Ω—ã", "my_plugins")],
-            ]),
-        )
-
-    async def show_plugins(target: Message, user_id: int) -> None:
-        runtime = await require_runtime(target, user_id)
-        if not runtime:
-            return
-        plugin_runtime = manager.plugins.runtimes.get(user_id)
-        plugins = list(plugin_runtime.plugins.values()) if plugin_runtime else []
-        rows = [
-            [("üß≠ –ö–∞—Ç–∞–ª–æ–≥ –ø–ª–∞–≥–∏–Ω–æ–≤", "plugin_catalog:0")],
-            [(f"üß© –ú–æ–∏ –ø–ª–∞–≥–∏–Ω—ã ({len(plugins)})", "my_plugins")],
-            [("‚ú® –°–æ–∑–¥–∞—Ç—å –ø–ª–∞–≥–∏–Ω", "ai_builder")],
-            [("‚ûï –ó–∞–≥—Ä—É–∑–∏—Ç—å –ø–ª–∞–≥–∏–Ω", "plugin_upload_warning")],
-            [("üìö –î–æ–∫—É–º–µ–Ω—Ç–∞—Ü–∏—è", "plugin_docs")],
-            [("‚¨ÖÔ∏è –ú–µ–Ω—é", "menu")],
-        ]
-        await target.answer(
-            "üß© <b>–ü–ª–∞–≥–∏–Ω—ã FunPayCardinal</b>\n"
-            f"–£—Å—Ç–∞–Ω–æ–≤–ª–µ–Ω–æ: <b>{len(plugins)}</b>\n\n"
-            "–û—Ç–∫—Ä–æ–π—Ç–µ –æ–±—â–∏–π –∫–∞—Ç–∞–ª–æ–≥, —Å–æ–∑–¥–∞–π—Ç–µ —Ä–∞—Å—à–∏—Ä–µ–Ω–∏–µ —á–µ—Ä–µ–∑ –ò–ò –∏–ª–∏ –∑–∞–≥—Ä—É–∑–∏—Ç–µ "
-            "—Å–æ–±—Å—Ç–≤–µ–Ω–Ω—ã–π –æ–¥–Ω–æ—Ñ–∞–π–ª–æ–≤—ã–π .py-–ø–ª–∞–≥–∏–Ω.",
-            reply_markup=keyboard(rows),
-        )
-
-    @router.callback_query(F.data == "plugins")
-    async def plugins(callback: CallbackQuery) -> None:
-        await callback.answer()
-        await show_plugins(callback.message, callback.from_user.id)
-
-    @router.callback_query(F.data == "ai_builder")
-    async def ai_builder_menu(callback: CallbackQuery, state: FSMContext) -> None:
-        await callback.answer()
-        await state.clear()
-        await show_ai_plugin_builder(callback.message, callback.from_user.id)
-
-    @router.callback_query(F.data == "ai_builder_settings")
-    async def ai_builder_settings(callback: CallbackQuery, state: FSMContext) -> None:
-        await callback.answer()
-        await state.clear()
-        await show_ai_plugin_builder_settings(callback.message, callback.from_user.id)
-
-    @router.callback_query(F.data.startswith("ai_builder_set:"))
-    async def ai_builder_setting_start(
-        callback: CallbackQuery, state: FSMContext
-    ) -> None:
-        field = callback.data.split(":", 1)[1]
-        prompts = {
-            "base": (
-                AIPluginBuilderState.api_base_url,
-                "–û—Ç–ø—Ä–∞–≤—å—Ç–µ HTTPS Base URL Anthropic API –∏–ª–∏ —Å–æ–≤–º–µ—Å—Ç–∏–º–æ–≥–æ —Å–µ—Ä–≤–∏—Å–∞.\n"
-                f"–û—Ñ–∏—Ü–∏–∞–ª—å–Ω—ã–π –∞–¥—Ä–µ—Å: <code>{AI_BUILDER_DEFAULT_API_BASE_URL}</code>",
-            ),
-            "token": (
-                AIPluginBuilderState.api_token,
-                "–û—Ç–ø—Ä–∞–≤—å—Ç–µ API-—Ç–æ–∫–µ–Ω –æ–¥–Ω–∏–º —Å–æ–æ–±—â–µ–Ω–∏–µ–º. –°–æ–æ–±—â–µ–Ω–∏–µ –±—É–¥–µ—Ç —É–¥–∞–ª–µ–Ω–æ, –∞ —Ç–æ–∫–µ–Ω —Å–æ—Ö—Ä–∞–Ω—ë–Ω –∑–∞—à–∏—Ñ—Ä–æ–≤–∞–Ω–Ω—ã–º.",
-            ),
-            "model": (
-                AIPluginBuilderState.model_id,
-                "–û—Ç–ø—Ä–∞–≤—å—Ç–µ —Ç–æ—á–Ω—ã–π ID –º–æ–¥–µ–ª–∏, –¥–æ—Å—Ç—É–ø–Ω–æ–π —É –≤–∞—à–µ–≥–æ API-–ø—Ä–æ–≤–∞–π–¥–µ—Ä–∞.",
-            ),
-        }
-        prompt = prompts.get(field)
-        if not prompt:
-            await callback.answer("–ù–µ–∏–∑–≤–µ—Å—Ç–Ω–∞—è –Ω–∞—Å—Ç—Ä–æ–π–∫–∞", show_alert=True)
-            return
-        await callback.answer()
-        await state.clear()
-        await state.set_state(prompt[0])
-        await callback.message.answer(f"{prompt[1]}\n\n–î–ª—è –æ—Ç–º–µ–Ω—ã: /cancel")
-
-    @router.message(AIPluginBuilderState.api_base_url, F.text)
-    async def ai_builder_base_url_value(message: Message, state: FSMContext) -> None:
-        try:
-            value = validate_ai_builder_api_base_url(message.text or "")
-        except ValueError as exc:
-            await message.answer(f"‚ùå {html.escape(str(exc))}")
-            return
-        await db.set_plugin_builder_setting(message.from_user.id, "api_base_url", value)
-        await state.clear()
-        await message.answer("‚úÖ Base URL —Å–æ—Ö—Ä–∞–Ω—ë–Ω.")
-        await show_ai_plugin_builder_settings(message, message.from_user.id)
-
-    @router.message(AIPluginBuilderState.api_token, F.text)
-    async def ai_builder_api_token_value(message: Message, state: FSMContext) -> None:
-        token = (message.text or "").strip()
-        try:
-            await message.delete()
-        except Exception:
-            logger.warning("–ù–µ —É–¥–∞–ª–æ—Å—å —É–¥–∞–ª–∏—Ç—å —Å–æ–æ–±—â–µ–Ω–∏–µ —Å API-—Ç–æ–∫–µ–Ω–æ–º", exc_info=True)
-        if not 8 <= len(token) <= 1000:
-            await message.answer("‚ùå API-—Ç–æ–∫–µ–Ω –¥–æ–ª–∂–µ–Ω —Å–æ–¥–µ—Ä–∂–∞—Ç—å –æ—Ç 8 –¥–æ 1000 —Å–∏–º–≤–æ–ª–æ–≤.")
-            return
-        await db.set_plugin_builder_setting(
-            message.from_user.id, "api_token_enc", secrets.encrypt(token)
-        )
-        await state.clear()
-        await message.answer("‚úÖ API-—Ç–æ–∫–µ–Ω —Å–æ—Ö—Ä–∞–Ω—ë–Ω –≤ –∑–∞—à–∏—Ñ—Ä–æ–≤–∞–Ω–Ω–æ–º –≤–∏–¥–µ.")
-        await show_ai_plugin_builder_settings(message, message.from_user.id)
-
-    @router.message(AIPluginBuilderState.model_id, F.text)
-    async def ai_builder_model_value(message: Message, state: FSMContext) -> None:
-        try:
-            value = validate_ai_builder_model_id(message.text or "")
-        except ValueError as exc:
-            await message.answer(f"‚ùå {html.escape(str(exc))}")
-            return
-        await db.set_plugin_builder_setting(message.from_user.id, "model_id", value)
-        await state.clear()
-        await message.answer("‚úÖ ID –º–æ–¥–µ–ª–∏ —Å–æ—Ö—Ä–∞–Ω—ë–Ω.")
-        await show_ai_plugin_builder_settings(message, message.from_user.id)
-
-    @router.callback_query(F.data == "ai_builder_create")
-    async def ai_builder_create(callback: CallbackQuery, state: FSMContext) -> None:
-        if callback.from_user.id in ai_builder_jobs:
-            await callback.answer("–ü—Ä–µ–¥—ã–¥—É—â–∞—è –∑–∞–¥–∞—á–∞ –µ—â—ë –≤—ã–ø–æ–ª–Ω—è–µ—Ç—Å—è", show_alert=True)
-            return
-        settings = await db.get_plugin_builder_settings(callback.from_user.id)
-        if not settings["api_token_enc"] or not settings["model_id"]:
-            await callback.answer("–°–Ω–∞—á–∞–ª–∞ –∑–∞–ø–æ–ª–Ω–∏—Ç–µ –Ω–∞—Å—Ç—Ä–æ–π–∫–∏ API", show_alert=True)
-            await show_ai_plugin_builder_settings(callback.message, callback.from_user.id)
-            return
-        await callback.answer()
-        await state.clear()
-        await state.set_state(AIPluginBuilderState.request)
-        await callback.message.answer(
-            "‚ú® <b>–ù–æ–≤—ã–π AI-–ø–ª–∞–≥–∏–Ω</b>\n\n"
-            "–ü–æ–¥—Ä–æ–±–Ω–æ –æ–ø–∏—à–∏—Ç–µ, —á—Ç–æ –æ–Ω –¥–æ–ª–∂–µ–Ω –¥–µ–ª–∞—Ç—å: —Å–æ–±—ã—Ç–∏—è FunPay, –∫–æ–º–∞–Ω–¥—ã, –Ω–∞—Å—Ç—Ä–æ–π–∫–∏, –≤–Ω–µ—à–Ω–∏–µ API, "
-            "—Å–æ–æ–±—â–µ–Ω–∏—è –ø–æ–∫—É–ø–∞—Ç–µ–ª—é –∏ –ø–æ–≤–µ–¥–µ–Ω–∏–µ –ø—Ä–∏ –æ—à–∏–±–∫–∞—Ö. –ü–æ—Å–ª–µ –æ—Ç–ø—Ä–∞–≤–∫–∏ –Ω–∞—á–Ω—É—Ç—Å—è –¥–≤–∞ —ç—Ç–∞–ø–∞ —Å–æ–∑–¥–∞–Ω–∏—è.\n\n"
-            "–î–ª—è –æ—Ç–º–µ–Ω—ã: /cancel"
-        )
-
-    @router.message(AIPluginBuilderState.request, F.text)
-    async def ai_builder_create_request(message: Message, state: FSMContext) -> None:
-        try:
-            request = validate_plugin_request(message.text or "")
-        except ValueError as exc:
-            await message.answer(f"‚ùå {html.escape(str(exc))}")
-            return
-        await state.clear()
-        await run_ai_plugin_generation(message, request)
-
-    @router.callback_query(F.data.startswith("ai_builder_edit:"))
-    async def ai_builder_edit(callback: CallbackQuery, state: FSMContext) -> None:
-        uuid = callback.data.split(":", 1)[1]
-        row = await db.get_plugin(callback.from_user.id, uuid)
-        if not row or not row["ai_generated"]:
-            await callback.answer("–≠—Ç–æ –Ω–µ AI-–ø–ª–∞–≥–∏–Ω", show_alert=True)
-            return
-        if callback.from_user.id in ai_builder_jobs:
-            await callback.answer("–ü—Ä–µ–¥—ã–¥—É—â–∞—è –∑–∞–¥–∞—á–∞ –µ—â—ë –≤—ã–ø–æ–ª–Ω—è–µ—Ç—Å—è", show_alert=True)
-            return
-        await callback.answer()
-        await state.clear()
-        await state.set_state(AIPluginBuilderState.edit_request)
-        await state.update_data(ai_builder_edit_uuid=uuid)
-        await callback.message.answer(
-            f"‚ú® <b>–†–µ–¥–∞–∫—Ç–∏—Ä–æ–≤–∞–Ω–∏–µ {html.escape(row['name'])}</b>\n\n"
-            "–û–ø–∏—à–∏—Ç–µ, —á—Ç–æ –∏—Å–ø—Ä–∞–≤–∏—Ç—å –∏–ª–∏ –¥–æ–±–∞–≤–∏—Ç—å. –ú–æ–¥–µ–ª—å –ø–æ–ª—É—á–∏—Ç —Ç–µ–∫—É—â–∏–π –∏—Å—Ö–æ–¥–Ω–∏–∫ –∏ –¥–æ–∫—É–º–µ–Ω—Ç–∞—Ü–∏—é, "
-            "—Å–æ—Ö—Ä–∞–Ω–∏—Ç UUID, —É–≤–µ–ª–∏—á–∏—Ç –≤–µ—Ä—Å–∏—é –∏ –ø–æ—Å–ª–µ –ø—Ä–æ–≤–µ—Ä–∫–∏ –∑–∞–º–µ–Ω–∏—Ç —É—Å—Ç–∞–Ω–æ–≤–ª–µ–Ω–Ω—ã–π –ø–ª–∞–≥–∏–Ω. "
-            "–†–µ–¥–∞–∫—Ç–∏—Ä–æ–≤–∞—Ç—å –º–æ–∂–Ω–æ –Ω–µ–æ–≥—Ä–∞–Ω–∏—á–µ–Ω–Ω–æ–µ —á–∏—Å–ª–æ —Ä–∞–∑.\n\n"
-            "–î–ª—è –æ—Ç–º–µ–Ω—ã: /cancel"
-        )
-
-    @router.message(AIPluginBuilderState.edit_request, F.text)
-    async def ai_builder_edit_request(message: Message, state: FSMContext) -> None:
-        try:
-            request = validate_plugin_request(message.text or "")
-        except ValueError as exc:
-            await message.answer(f"‚ùå {html.escape(str(exc))}")
-            return
-        uuid = (await state.get_data()).get("ai_builder_edit_uuid")
-        await state.clear()
-        if not uuid:
-            await message.answer("‚ùå –°–µ—Å—Å–∏—è —Ä–µ–¥–∞–∫—Ç–∏—Ä–æ–≤–∞–Ω–∏—è –∏—Å—Ç–µ–∫–ª–∞.")
-            return
-        await run_ai_plugin_generation(message, request, edit_uuid=str(uuid))
-
-    async def show_my_plugins(target: Message, user_id: int) -> None:
-        if not await require_runtime(target, user_id):
-            return
-        plugin_runtime = manager.plugins.runtimes.get(user_id)
-        plugins = list(plugin_runtime.plugins.values()) if plugin_runtime else []
-        stored_plugins = {
-            str(row["uuid"]): row for row in await db.list_plugins(user_id)
-        }
-        rows = [
-            [(
-                f"{'‚úÖ' if plugin.enabled else '‚ùå'} "
-                f"{'ü§ñ ' if stored_plugins.get(plugin.uuid) and stored_plugins[plugin.uuid]['ai_generated'] else ''}"
-                f"{clipped(plugin.name, 25)} v{clipped(plugin.version, 10)}",
-                f"plugin_info:{plugin.uuid}",
-            )]
-            for plugin in plugins
-        ]
-        rows.append([("‚¨ÖÔ∏è –ü–ª–∞–≥–∏–Ω—ã", "plugins")])
-        text = (
-            "üß© <b>–ú–æ–∏ –ø–ª–∞–≥–∏–Ω—ã</b>\n\n"
-            "–ù–∞–∂–º–∏—Ç–µ –Ω–∞ –ø–ª–∞–≥–∏–Ω, —á—Ç–æ–±—ã –æ—Ç–∫—Ä—ã—Ç—å –Ω–∞—Å—Ç—Ä–æ–π–∫–∏, –≤—ã–∫–ª—é—á–∏—Ç—å –∏–ª–∏ —É–¥–∞–ª–∏—Ç—å –µ–≥–æ.\n"
-            "ü§ñ ‚Äî —Å–æ–∑–¥–∞–Ω AI-–∫–æ–Ω—Å—Ç—Ä—É–∫—Ç–æ—Ä–æ–º."
-            if plugins
-            else "üß© <b>–ú–æ–∏ –ø–ª–∞–≥–∏–Ω—ã</b>\n\n–ü–æ–∫–∞ –Ω–∏—á–µ–≥–æ –Ω–µ —É—Å—Ç–∞–Ω–æ–≤–ª–µ–Ω–æ."
-        )
-        await target.answer(text, reply_markup=keyboard(rows))
-
-    @router.callback_query(F.data == "my_plugins")
-    async def my_plugins(callback: CallbackQuery) -> None:
-        await callback.answer()
-        await show_my_plugins(callback.message, callback.from_user.id)
-
-    async def show_plugin_catalog(target: Message, user_id: int, page: int = 0) -> None:
-        if not await require_runtime(target, user_id):
-            return
-        page = max(0, page)
-        catalog, total = await db.list_catalog_plugins(
-            PLUGIN_CATALOG_PAGE_SIZE,
-            page * PLUGIN_CATALOG_PAGE_SIZE,
-        )
-        total_pages = max(1, (total + PLUGIN_CATALOG_PAGE_SIZE - 1) // PLUGIN_CATALOG_PAGE_SIZE)
-        if page >= total_pages:
-            page = total_pages - 1
-            catalog, total = await db.list_catalog_plugins(
-                PLUGIN_CATALOG_PAGE_SIZE,
-                page * PLUGIN_CATALOG_PAGE_SIZE,
-            )
-        plugin_runtime = manager.plugins.runtimes.get(user_id)
-        installed = set(plugin_runtime.plugins) if plugin_runtime else set()
-        rows = [
-            [(
-                (
-                    f"{'‚úÖ' if plugin['uuid'] in installed else ('üõ°' if plugin['is_official'] else ('ü§ñ' if plugin['ai_generated'] else 'üß©'))} "
-                    f"{clipped(plugin['name'], 27)} v{clipped(plugin['version'], 8)}"
-                ),
-                f"catalog_view:{plugin['uuid']}:{page}",
-            )]
-            for plugin in catalog
-        ]
-        navigation = []
-        if page > 0:
-            navigation.append(("‚óÄÔ∏è", f"plugin_catalog:{page - 1}"))
-        if page + 1 < total_pages:
-            navigation.append(("‚ñ∂Ô∏è", f"plugin_catalog:{page + 1}"))
-        if navigation:
-            rows.append(navigation)
-        rows.append([("‚¨ÖÔ∏è –ü–ª–∞–≥–∏–Ω—ã", "plugins")])
-        await target.answer(
-            "üß≠ <b>–ö–∞—Ç–∞–ª–æ–≥ –ø–ª–∞–≥–∏–Ω–æ–≤</b>\n\n"
-            f"–û–ø—É–±–ª–∏–∫–æ–≤–∞–Ω–æ: <b>{total}</b> ¬∑ —Å—Ç—Ä–∞–Ω–∏—Ü–∞ <b>{page + 1}/{total_pages}</b>\n"
-            "üõ° ‚Äî –æ—Ñ–∏—Ü–∏–∞–ª—å–Ω—ã–π ¬∑ üß© ‚Äî –æ—Ç —Å–æ–æ–±—â–µ—Å—Ç–≤–∞ ¬∑ ü§ñ ‚Äî —Å–≥–µ–Ω–µ—Ä–∏—Ä–æ–≤–∞–Ω –ò–ò ¬∑ ‚úÖ ‚Äî —É–∂–µ —É—Å—Ç–∞–Ω–æ–≤–ª–µ–Ω.\n\n"
-            "–ß—Ç–æ–±—ã –æ–ø—É–±–ª–∏–∫–æ–≤–∞—Ç—å —Å–≤–æ–π –ø–ª–∞–≥–∏–Ω, –æ—Ç–∫—Ä–æ–π—Ç–µ –µ–≥–æ –≤ —Ä–∞–∑–¥–µ–ª–µ ¬´–ú–æ–∏ –ø–ª–∞–≥–∏–Ω—ã¬ª. "
-            "‚ö†Ô∏è –ö–∞—Ç–∞–ª–æ–≥ –Ω–µ –º–æ–¥–µ—Ä–∏—Ä—É–µ—Ç—Å—è: –∏–∑—É—á–∞–π—Ç–µ –æ–ø–∏—Å–∞–Ω–∏–µ –∏ —Å–∫–∞—á–∏–≤–∞–π—Ç–µ –∏—Å—Ö–æ–¥–Ω–∏–∫ –ø–µ—Ä–µ–¥ —É—Å—Ç–∞–Ω–æ–≤–∫–æ–π.",
-            reply_markup=keyboard(rows),
-        )
-
-    @router.callback_query(F.data.startswith("plugin_catalog:"))
-    async def plugin_catalog(callback: CallbackQuery) -> None:
-        await callback.answer()
-        try:
-            page = int(callback.data.rsplit(":", 1)[1])
-        except ValueError:
-            page = 0
-        await show_plugin_catalog(callback.message, callback.from_user.id, page)
-
-    @router.callback_query(F.data == "ready_plugins")
-    async def legacy_ready_plugins(callback: CallbackQuery) -> None:
-        await callback.answer()
-        await show_plugin_catalog(callback.message, callback.from_user.id)
-
-    @router.callback_query(F.data.startswith("catalog_view:"))
-    async def catalog_plugin_details(callback: CallbackQuery) -> None:
-        await callback.answer()
-        _, uuid, raw_page = callback.data.split(":", 2)
-        item = await db.get_catalog_plugin(uuid)
-        if not item:
-            await callback.message.answer("–ü—É–±–ª–∏–∫–∞—Ü–∏—è —É–¥–∞–ª–µ–Ω–∞ –∏–∑ –∫–∞—Ç–∞–ª–æ–≥–∞.")
-            return
-        try:
-            page = max(0, int(raw_page))
-        except ValueError:
-            page = 0
-        installed = bool(
-            manager.plugins.runtimes.get(callback.from_user.id)
-            and uuid in manager.plugins.runtimes[callback.from_user.id].plugins
-        )
-        rows = []
-        if installed:
-            rows.append([("üß© –û—Ç–∫—Ä—ã—Ç—å —É—Å—Ç–∞–Ω–æ–≤–ª–µ–Ω–Ω—ã–π", f"plugin_info:{uuid}")])
-        else:
-            rows.append([("‚¨áÔ∏è –£—Å—Ç–∞–Ω–æ–≤–∏—Ç—å", f"catalog_install_ask:{uuid}")])
-        rows.append([("üì• –°–∫–∞—á–∞—Ç—å –∏—Å—Ö–æ–¥–Ω–∏–∫", f"catalog_source:{uuid}")])
-        rows.append([("‚¨ÖÔ∏è –ö–∞—Ç–∞–ª–æ–≥", f"plugin_catalog:{page}")])
-        badge = (
-            "üõ° <b>–û—Ñ–∏—Ü–∏–∞–ª—å–Ω—ã–π –ø–ª–∞–≥–∏–Ω</b>"
-            if item["is_official"]
-            else (
-                "ü§ñ <b>–°–ì–ï–ù–ï–†–ò–†–û–í–ê–ù–û –ò–ò</b>\nüß© –ü–ª–∞–≥–∏–Ω —Å–æ–æ–±—â–µ—Å—Ç–≤–∞"
-                if item["ai_generated"]
-                else "üß© –ü–ª–∞–≥–∏–Ω —Å–æ–æ–±—â–µ—Å—Ç–≤–∞"
-            )
-        )
-        await callback.message.answer(
-            f"{badge}\n"
-            f"<b>{html.escape(clipped(item['name'], 100))}</b> "
-            f"v{html.escape(clipped(item['version'], 30))}\n"
-            f"<i>{html.escape(clipped(item['short_description'], 500))}</i>\n\n"
-            f"{html.escape(item['description'])}\n\n"
-            f"–û–ø—É–±–ª–∏–∫–æ–≤–∞–ª: <b>{html.escape(clipped(item['publisher_name'], 100))}</b>\n"
-            f"–ê–≤—Ç–æ—Ä –≤ —Ñ–∞–π–ª–µ: {html.escape(clipped(item['credits'], 200))}\n"
-            f"–£—Å—Ç–∞–Ω–æ–≤–æ–∫ –∏–∑ –∫–∞—Ç–∞–ª–æ–≥–∞: <b>{item['install_count']}</b>\n"
-            f"UUID: <code>{item['uuid']}</code>\n"
-            f"–°–æ—Å—Ç–æ—è–Ω–∏–µ: {'‚úÖ —É—Å—Ç–∞–Ω–æ–≤–ª–µ–Ω' if installed else '–Ω–µ —É—Å—Ç–∞–Ω–æ–≤–ª–µ–Ω'}",
-            reply_markup=keyboard(rows),
-        )
-
-    @router.callback_query(F.data.startswith("catalog_source:"))
-    async def catalog_plugin_source(callback: CallbackQuery) -> None:
-        uuid = callback.data.split(":", 1)[1]
-        item = await db.get_catalog_plugin(uuid)
-        if not item:
-            await callback.answer("–ü—É–±–ª–∏–∫–∞—Ü–∏—è —É–¥–∞–ª–µ–Ω–∞", show_alert=True)
-            return
-        await callback.answer("–ì–æ—Ç–æ–≤–ª—é –∏—Å—Ö–æ–¥–Ω–∏–∫‚Ä¶")
-        await callback.message.answer_document(
-            BufferedInputFile(item["source"].encode("utf-8"), filename=item["filename"]),
-            caption=(
-                f"üìÑ –ò—Å—Ö–æ–¥–Ω–∏–∫ <b>{html.escape(item['name'])}</b> v{html.escape(item['version'])}.\n"
-                + ("ü§ñ <b>–°–ì–ï–ù–ï–†–ò–†–û–í–ê–ù–û –ò–ò</b>\n" if item["ai_generated"] else "")
-                + "–ü—Ä–æ–≤–µ—Ä—å—Ç–µ –∫–æ–¥ –ø–µ—Ä–µ–¥ —É—Å—Ç–∞–Ω–æ–≤–∫–æ–π: –ø–ª–∞–≥–∏–Ω—ã –≤—ã–ø–æ–ª–Ω—è—é—Ç—Å—è —Å –ø—Ä–∞–≤–∞–º–∏ –ø—Ä–æ—Ü–µ—Å—Å–∞ –±–æ—Ç–∞."
-            ),
-        )
-
-    @router.callback_query(F.data.startswith("catalog_install_ask:"))
-    async def catalog_plugin_install_ask(callback: CallbackQuery) -> None:
-        uuid = callback.data.split(":", 1)[1]
-        item = await db.get_catalog_plugin(uuid)
-        if not item:
-            await callback.answer("–ü—É–±–ª–∏–∫–∞—Ü–∏—è —É–¥–∞–ª–µ–Ω–∞", show_alert=True)
-            return
-        await callback.answer()
-        await callback.message.answer(
-            f"‚ö†Ô∏è <b>–£—Å—Ç–∞–Ω–æ–≤–∏—Ç—å {html.escape(item['name'])}?</b>\n\n"
-            "–ü–ª–∞–≥–∏–Ω –ø–æ–ª—É—á–∏—Ç –¥–æ—Å—Ç—É–ø –∫ FunPay-–∞–∫–∫–∞—É–Ω—Ç—É, golden_key, —Å–µ—Ç–∏, –ø–µ—Ä–µ–º–µ–Ω–Ω—ã–º –æ–∫—Ä—É–∂–µ–Ω–∏—è "
-            "–∏ –≤–æ–∑–º–æ–∂–Ω–æ—Å—Ç—è–º –ø—Ä–æ—Ü–µ—Å—Å–∞ –±–æ—Ç–∞. –ü–æ—Å–ª–µ –æ—Ç–¥–µ–ª—å–Ω–æ–π –∞–≤—Ç–æ—Ä–∏–∑–∞—Ü–∏–∏ Telethon-–ø–ª–∞–≥–∏–Ω —Å–º–æ–∂–µ—Ç "
-            "–ø–æ–ª–Ω–æ—Å—Ç—å—é —É–ø—Ä–∞–≤–ª—è—Ç—å –ø–æ–¥–∫–ª—é—á—ë–Ω–Ω—ã–º Telegram-–∞–∫–∫–∞—É–Ω—Ç–æ–º. –ö–∞—Ç–∞–ª–æ–≥ –Ω–µ –≥–∞—Ä–∞–Ω—Ç–∏—Ä—É–µ—Ç –±–µ–∑–æ–ø–∞—Å–Ω–æ—Å—Ç—å –∫–æ–¥–∞.",
-            reply_markup=keyboard([
-                [("üì• –°–∫–∞—á–∞—Ç—å –∏ –ø—Ä–æ–≤–µ—Ä–∏—Ç—å", f"catalog_source:{uuid}")],
-                [("–Ø –¥–æ–≤–µ—Ä—è—é ‚Äî —É—Å—Ç–∞–Ω–æ–≤–∏—Ç—å", f"catalog_install_do:{uuid}")],
-                [("–û—Ç–º–µ–Ω–∞", f"catalog_view:{uuid}:0")],
-            ]),
-        )
-
-    @router.callback_query(F.data.startswith("catalog_install_do:"))
-    async def catalog_plugin_install(callback: CallbackQuery) -> None:
-        uuid = callback.data.split(":", 1)[1]
-        item = await db.get_catalog_plugin(uuid)
-        runtime = await require_runtime(callback.message, callback.from_user.id)
-        if not item or not runtime:
-            await callback.answer("–ü–ª–∞–≥–∏–Ω –Ω–µ–¥–æ—Å—Ç—É–ø–µ–Ω", show_alert=True)
-            return
-        if manager.plugins.runtimes.get(callback.from_user.id) and uuid in manager.plugins.runtimes[
-            callback.from_user.id
-        ].plugins:
-            await callback.answer("–ü–ª–∞–≥–∏–Ω —É–∂–µ —É—Å—Ç–∞–Ω–æ–≤–ª–µ–Ω", show_alert=True)
-            return
-        await callback.answer("–£—Å—Ç–∞–Ω–∞–≤–ª–∏–≤–∞—é‚Ä¶")
-        try:
-            installed_plugin = await manager.plugins.install(
-                callback.from_user.id,
-                item["filename"],
-                item["source"],
-                runtime,
-            )
-            if item["ai_generated"]:
-                await db.mark_plugin_ai_generated(
-                    callback.from_user.id,
-                    installed_plugin.uuid,
-                    "–£—Å—Ç–∞–Ω–æ–≤–ª–µ–Ω –∏–∑ –æ–±—â–µ–≥–æ –∫–∞—Ç–∞–ª–æ–≥–∞",
-                    f"–ö–æ–ø–∏—è AI-–ø–ª–∞–≥–∏–Ω–∞ –∞–≤—Ç–æ—Ä–∞ {item['publisher_name']}",
-                )
-        except Exception as exc:
-            logger.exception("–ù–µ —É–¥–∞–ª–æ—Å—å —É—Å—Ç–∞–Ω–æ–≤–∏—Ç—å –ø–ª–∞–≥–∏–Ω –∏–∑ –∫–∞—Ç–∞–ª–æ–≥–∞ %s", uuid)
-            await callback.message.answer(
-                f"‚ùå –£—Å—Ç–∞–Ω–æ–≤–∫–∞ –Ω–µ –≤—ã–ø–æ–ª–Ω–µ–Ω–∞: {html.escape(clipped(exc, 600))}"
-            )
-            return
-        await db.increment_catalog_install(uuid)
-        await callback.message.answer(
-            f"‚úÖ <b>{html.escape(item['name'])}</b> —É—Å—Ç–∞–Ω–æ–≤–ª–µ–Ω –∏–∑ –∫–∞—Ç–∞–ª–æ–≥–∞.",
-            reply_markup=keyboard([
-                [("üß© –û—Ç–∫—Ä—ã—Ç—å –ø–ª–∞–≥–∏–Ω", f"plugin_info:{uuid}")],
-                [("‚¨ÖÔ∏è –ö–∞—Ç–∞–ª–æ–≥", "plugin_catalog:0")],
-            ]),
-        )
-
-    @router.callback_query(F.data == "plugin_docs")
-    async def plugin_docs(callback: CallbackQuery) -> None:
-        await callback.answer()
-        await callback.message.answer(
-            "üìö <b>–î–æ–∫—É–º–µ–Ω—Ç–∞—Ü–∏—è –ø–æ –ø–ª–∞–≥–∏–Ω–∞–º</b>\n\n"
-            "–ó–¥–µ—Å—å –æ–ø–∏—Å–∞–Ω—ã —É—Å—Ç–∞–Ω–æ–≤–∫–∞, –ø–æ–ª–Ω—ã–π –∫–æ–Ω—Ç—Ä–∞–∫—Ç —Ñ–∞–π–ª–∞, —Å–æ–±—ã—Ç–∏—è, Telegram-–∏–Ω—Ç–µ—Ä—Ñ–µ–π—Å –∏ –æ–≥—Ä–∞–Ω–∏—á–µ–Ω–∏—è. "
-            "–ù–∞—á–Ω–∏—Ç–µ —Å —Ä–∞–∑–¥–µ–ª–∞ ¬´–ë—ã—Å—Ç—Ä—ã–π —Å—Ç–∞—Ä—Ç¬ª, –µ—Å–ª–∏ —Å–æ–∑–¥–∞—ë—Ç–µ –ø–µ—Ä–≤—ã–π –ø–ª–∞–≥–∏–Ω.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [
-                    InlineKeyboardButton(text="üöÄ –ë—ã—Å—Ç—Ä—ã–π —Å—Ç–∞—Ä—Ç", callback_data="plugin_docs:start"),
-                    InlineKeyboardButton(text="üß± –°—Ç—Ä—É–∫—Ç—É—Ä–∞", callback_data="plugin_docs:structure"),
-                ],
-                [InlineKeyboardButton(text="‚ú® AI-–∫–æ–Ω—Å—Ç—Ä—É–∫—Ç–æ—Ä", callback_data="plugin_docs:builder")],
-                [
-                    InlineKeyboardButton(text="‚ö° –•—É–∫–∏", callback_data="plugin_docs:hooks"),
-                    InlineKeyboardButton(text="ü§ñ Telegram API", callback_data="plugin_docs:telegram"),
-                ],
-                [InlineKeyboardButton(text="üì± Telethon user-account", callback_data="plugin_docs:telethon")],
-                [InlineKeyboardButton(text="üß≠ –ü—É–±–ª–∏–∫–∞—Ü–∏—è –≤ –∫–∞—Ç–∞–ª–æ–≥–µ", callback_data="plugin_docs:catalog")],
-                [InlineKeyboardButton(text="üì• –°–∫–∞—á–∞—Ç—å –ø–æ–ª–Ω—É—é –¥–æ–∫—É–º–µ–Ω—Ç–∞—Ü–∏—é", callback_data="plugin_docs_download")],
-                [InlineKeyboardButton(text="üõ° –°–æ–≤–º–µ—Å—Ç–∏–º–æ—Å—Ç—å –∏ –±–µ–∑–æ–ø–∞—Å–Ω–æ—Å—Ç—å", callback_data="plugin_docs:safety")],
-                [InlineKeyboardButton(text="üåê –ò—Å—Ö–æ–¥–Ω—ã–π FunPayCardinal", url="https://github.com/sidor0912/FunPayCardinal")],
-                [InlineKeyboardButton(text="‚¨ÖÔ∏è –ü–ª–∞–≥–∏–Ω—ã", callback_data="plugins")],
-            ]),
-            disable_web_page_preview=True,
-        )
-
-    @router.callback_query(F.data == "plugin_docs_download")
-    async def plugin_docs_download(callback: CallbackQuery) -> None:
-        await callback.answer("–ì–æ—Ç–æ–≤–ª—é —Ñ–∞–π–ª‚Ä¶")
-        if not PLUGIN_DOCUMENTATION_PATH.is_file():
-            await callback.message.answer(
-                "‚ùå –§–∞–π–ª –¥–æ–∫—É–º–µ–Ω—Ç–∞—Ü–∏–∏ –æ—Ç—Å—É—Ç—Å—Ç–≤—É–µ—Ç –≤ —Ç–µ–∫—É—â–µ–π —Å–±–æ—Ä–∫–µ."
-            )
-            return
-        await callback.message.answer_document(
-            document=FSInputFile(
-                PLUGIN_DOCUMENTATION_PATH,
-                filename="PLUGIN_DEVELOPMENT.md",
-            ),
-            caption=(
-                "üìö –ü–æ–ª–Ω—ã–π –∫–æ–Ω—Ç—Ä–∞–∫—Ç –ø–ª–∞–≥–∏–Ω–æ–≤ <code>aiogram-compat-1</code>. "
-                "–§–∞–π–ª –º–æ–∂–Ω–æ –ø–µ—Ä–µ–¥–∞—Ç—å –Ω–µ–π—Ä–æ—Å–µ—Ç–∏ –≤–º–µ—Å—Ç–µ —Å –æ–ø–∏—Å–∞–Ω–∏–µ–º –Ω—É–∂–Ω–æ–≥–æ –ø–ª–∞–≥–∏–Ω–∞."
-            ),
-        )
-
-    @router.callback_query(F.data.startswith("plugin_docs:"))
-    async def plugin_docs_page(callback: CallbackQuery) -> None:
-        await callback.answer()
-        page = callback.data.split(":", 1)[1]
-        code_example = html.escape(
-            """from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
-
-NAME = "My Plugin"
-VERSION = "1.0.0"
-DESCRIPTION = "–û–ø–∏—Å–∞–Ω–∏–µ"
-CREDITS = "–ê–≤—Ç–æ—Ä"
-SETTINGS_PAGE = False
-TELETHON = False
-UUID = "—Å–æ–∑–¥–∞–π—Ç–µ UUID –≤–µ—Ä—Å–∏–∏ 4"
-BIND_TO_DELETE = None
-
-def on_message(cardinal, event):
-    message = event.message
-    if str(message).strip() == "#hello":
-        cardinal.account.send_message(
-            message.chat_id, "–ü—Ä–∏–≤–µ—Ç!", message.chat_name
-        )
-
-BIND_TO_NEW_MESSAGE = [on_message]
-"""
-        )
-        pages = {
-            "start": (
-                "üöÄ <b>–ë—ã—Å—Ç—Ä—ã–π —Å—Ç–∞—Ä—Ç</b>\n\n"
-                "1. –°–æ–∑–¥–∞–π—Ç–µ –æ–¥–∏–Ω UTF-8 —Ñ–∞–π–ª —Å —Ä–∞—Å—à–∏—Ä–µ–Ω–∏–µ–º <code>.py</code>.\n"
-                "2. –î–æ–±–∞–≤—å—Ç–µ –æ–±—è–∑–∞—Ç–µ–ª—å–Ω—ã–µ –º–µ—Ç–∞–¥–∞–Ω–Ω—ã–µ –∏ UUID4.\n"
-                "3. –°–æ–∑–¥–∞–π—Ç–µ —Ñ—É–Ω–∫—Ü–∏–∏-–æ–±—Ä–∞–±–æ—Ç—á–∏–∫–∏ –∏ –ø–æ–º–µ—Å—Ç–∏—Ç–µ –∏—Ö –≤ –Ω—É–∂–Ω—ã–µ —Å–ø–∏—Å–∫–∏ BIND_TO_*.\n"
-                "4. –û—Ç–∫—Ä–æ–π—Ç–µ ¬´–ü–ª–∞–≥–∏–Ω—ã ‚Üí –ó–∞–≥—Ä—É–∑–∏—Ç—å –ø–ª–∞–≥–∏–Ω¬ª, –ø–æ–¥—Ç–≤–µ—Ä–¥–∏—Ç–µ —Ä–∏—Å–∫ –∏ –æ—Ç–ø—Ä–∞–≤—å—Ç–µ —Ñ–∞–π–ª –¥–æ–∫—É–º–µ–Ω—Ç–æ–º.\n"
-                "5. –ü–æ—Å–ª–µ –ø—Ä–æ–≤–µ—Ä–∫–∏ –ø–ª–∞–≥–∏–Ω –ø–æ—è–≤–∏—Ç—Å—è –≤ ¬´–ú–æ–∏ –ø–ª–∞–≥–∏–Ω—ã¬ª. –ï–≥–æ –º–æ–∂–Ω–æ –≤—ã–∫–ª—é—á–∏—Ç—å –±–µ–∑ —É–¥–∞–ª–µ–Ω–∏—è.\n\n"
-                "–ü—Ä–∏ –ø–µ—Ä–µ–∑–∞–ø—É—Å–∫–µ –∏—Å—Ö–æ–¥–Ω–∏–∫ –≤–æ—Å—Å—Ç–∞–Ω–∞–≤–ª–∏–≤–∞–µ—Ç—Å—è –∏–∑ PostgreSQL –∞–≤—Ç–æ–º–∞—Ç–∏—á–µ—Å–∫–∏. –ú–∞–∫—Å–∏–º–∞–ª—å–Ω—ã–π —Ä–∞–∑–º–µ—Ä ‚Äî 512 –ö–ë."
-            ),
-            "structure": (
-                "üß± <b>–ú–∏–Ω–∏–º–∞–ª—å–Ω–∞—è —Å—Ç—Ä—É–∫—Ç—É—Ä–∞ –ø–ª–∞–≥–∏–Ω–∞</b>\n\n"
-                f"<pre>{code_example}</pre>\n"
-                "<b>–û–±—è–∑–∞—Ç–µ–ª—å–Ω—ã–µ –ø–æ–ª—è:</b> NAME, VERSION, DESCRIPTION –∏ CREDITS ‚Äî —Å—Ç—Ä–æ–∫–∏; "
-                "SETTINGS_PAGE ‚Äî bool, —Å–æ–∑–¥–∞—é—â–∏–π –ø–æ—Å—Ç–æ—è–Ω–Ω—É—é –∫–Ω–æ–ø–∫—É –Ω–∞—Å—Ç—Ä–æ–µ–∫; UUID ‚Äî –∫–∞–Ω–æ–Ω–∏—á–µ—Å–∫–∏–π UUID4; "
-                "BIND_TO_DELETE ‚Äî —Ñ—É–Ω–∫—Ü–∏—è –∏–ª–∏ None. "
-                "–ù–µ–∏—Å–ø–æ–ª—å–∑—É–µ–º—ã–µ BIND_TO_* –º–æ–∂–Ω–æ –Ω–µ –æ–±—ä—è–≤–ª—è—Ç—å: –∑–∞–≥—Ä—É–∑—á–∏–∫ —Å—á–∏—Ç–∞–µ—Ç –∏—Ö –ø—É—Å—Ç—ã–º–∏ —Å–ø–∏—Å–∫–∞–º–∏."
-            ),
-            "builder": (
-                "‚ú® <b>AI-–∫–æ–Ω—Å—Ç—Ä—É–∫—Ç–æ—Ä –ø–ª–∞–≥–∏–Ω–æ–≤</b>\n\n"
-                "1. –û—Ç–∫—Ä–æ–π—Ç–µ ¬´–ü–ª–∞–≥–∏–Ω—ã ‚Üí –°–æ–∑–¥–∞—Ç—å –ø–ª–∞–≥–∏–Ω ‚Üí –ù–∞—Å—Ç—Ä–æ–π–∫–∏¬ª –∏ –∑–∞–¥–∞–π—Ç–µ HTTPS Base URL, "
-                "API-—Ç–æ–∫–µ–Ω –∏ ID –º–æ–¥–µ–ª–∏ Anthropic.\n"
-                "2. –ù–∞–∂–º–∏—Ç–µ ¬´–ü–µ—Ä–µ–π—Ç–∏ –∫ —Å–æ–∑–¥–∞–Ω–∏—é¬ª –∏ –ø–æ–¥—Ä–æ–±–Ω–æ –æ–ø–∏—à–∏—Ç–µ –ø–æ–≤–µ–¥–µ–Ω–∏–µ –ø–ª–∞–≥–∏–Ω–∞.\n"
-                "3. –ù–∞ –ø–µ—Ä–≤–æ–º —ç—Ç–∞–ø–µ –º–æ–¥–µ–ª—å –ø–æ–ª—É—á–∞–µ—Ç –∑–∞–ø—Ä–æ—Å –∏ –ø–æ–ª–Ω—ã–π PLUGIN_DEVELOPMENT.md; –Ω–∞ –≤—Ç–æ—Ä–æ–º "
-                "–ø—Ä–æ–≤–µ—Ä—è–µ—Ç —á–µ—Ä–Ω–æ–≤–∏–∫ –ø–æ –¥–æ–∫—É–º–µ–Ω—Ç–∞—Ü–∏–∏ –∏ –∏—Å–ø—Ä–∞–≤–ª—è–µ—Ç —Å–∏–Ω—Ç–∞–∫—Å–∏—Å.\n"
-                "4. –ü–æ—Å–ª–µ –ª–æ–∫–∞–ª—å–Ω–æ–π –ø—Ä–æ–≤–µ—Ä–∫–∏ –ø–ª–∞–≥–∏–Ω —É—Å—Ç–∞–Ω–∞–≤–ª–∏–≤–∞–µ—Ç—Å—è –∞–≤—Ç–æ–º–∞—Ç–∏—á–µ—Å–∫–∏.\n\n"
-                "–í –∫–∞—Ä—Ç–æ—á–∫–µ AI-–ø–ª–∞–≥–∏–Ω–∞ –µ—Å—Ç—å –Ω–µ–æ–≥—Ä–∞–Ω–∏—á–µ–Ω–Ω–æ–µ —Ä–µ–¥–∞–∫—Ç–∏—Ä–æ–≤–∞–Ω–∏–µ –Ω–æ–≤—ã–º –∑–∞–ø—Ä–æ—Å–æ–º. UUID —Å–æ—Ö—Ä–∞–Ω—è–µ—Ç—Å—è, "
-                "–≤–µ—Ä—Å–∏—è —É–≤–µ–ª–∏—á–∏–≤–∞–µ—Ç—Å—è. –í –∫–∞—Ç–∞–ª–æ–≥–µ –∏ –∏—Å—Ö–æ–¥–Ω–∏–∫–µ –≤—Å–µ–≥–¥–∞ –ø–æ–∫–∞–∑—ã–≤–∞–µ—Ç—Å—è ¬´–°–ì–ï–ù–ï–†–ò–†–û–í–ê–ù–û –ò–ò¬ª. "
-                "API-—Ç–æ–∫–µ–Ω —Ö—Ä–∞–Ω–∏—Ç—Å—è –∑–∞—à–∏—Ñ—Ä–æ–≤–∞–Ω–Ω—ã–º. –ü—Ä–æ–≤–µ—Ä—è–π—Ç–µ –∫–æ–¥: AI-–ø–æ–º–µ—Ç–∫–∞ –Ω–µ –≥–∞—Ä–∞–Ω—Ç–∏—Ä—É–µ—Ç –±–µ–∑–æ–ø–∞—Å–Ω–æ—Å—Ç—å."
-            ),
-            "hooks": (
-                "‚ö° <b>–ü–æ–¥–¥–µ—Ä–∂–∏–≤–∞–µ–º—ã–µ —Ö—É–∫–∏</b>\n\n"
-                "<b>–ñ–∏–∑–Ω–µ–Ω–Ω—ã–π —Ü–∏–∫–ª:</b> PRE_INIT, POST_INIT, PRE_START, POST_START, PRE_STOP, POST_STOP.\n"
-                "<b>–°–æ–æ–±—â–µ–Ω–∏—è:</b> INIT_MESSAGE, MESSAGES_LIST_CHANGED, LAST_CHAT_MESSAGE_CHANGED, NEW_MESSAGE.\n"
-                "<b>–ó–∞–∫–∞–∑—ã:</b> INIT_ORDER, NEW_ORDER, ORDERS_LIST_CHANGED, ORDER_STATUS_CHANGED.\n"
-                "<b>–û–ø–µ—Ä–∞—Ü–∏–∏:</b> PRE_DELIVERY, POST_DELIVERY, PRE_LOTS_RAISE, POST_LOTS_RAISE.\n\n"
-                "<b>Telethon:</b> TELETHON_READY, TELETHON_DISCONNECTED.\n\n"
-                "–ü–µ—Ä–µ–¥ –∫–∞–∂–¥—ã–º –Ω–∞–∑–≤–∞–Ω–∏–µ–º –¥–æ–±–∞–≤–ª—è–µ—Ç—Å—è <code>BIND_TO_</code>. –°–æ–±—ã—Ç–∏–π–Ω—ã–π –æ–±—Ä–∞–±–æ—Ç—á–∏–∫ –ø–æ–ª—É—á–∞–µ—Ç "
-                "<code>(cardinal, event)</code>; –æ–±—Ä–∞–±–æ—Ç—á–∏–∫–∏ –∂–∏–∑–Ω–µ–Ω–Ω–æ–≥–æ —Ü–∏–∫–ª–∞ ‚Äî –æ–±—ä–µ–∫—Ç cardinal; –æ–±—Ä–∞–±–æ—Ç—á–∏–∫ —É–¥–∞–ª–µ–Ω–∏—è ‚Äî "
-                "<code>(cardinal, callback)</code>. –û—à–∏–±–∫–∞ –æ–¥–Ω–æ–≥–æ –æ–±—Ä–∞–±–æ—Ç—á–∏–∫–∞ –∑–∞–ø–∏—Å—ã–≤–∞–µ—Ç—Å—è –≤ –ª–æ–≥ –∏ –Ω–µ –æ—Å—Ç–∞–Ω–∞–≤–ª–∏–≤–∞–µ—Ç –æ—Å—Ç–∞–ª—å–Ω—ã–µ –ø–ª–∞–≥–∏–Ω—ã."
-            ),
-            "telegram": (
-                "ü§ñ <b>Telegram API –ø–ª–∞–≥–∏–Ω–∞</b>\n\n"
-                "–ß–µ—Ä–µ–∑ <code>cardinal.telegram.bot</code> –¥–æ—Å—Ç—É–ø–Ω—ã: send_message, edit_message_text, "
-                "edit_message_reply_markup, answer_callback_query, delete_message, message_handler, "
-                "callback_query_handler –∏ –º–µ—Ç–æ–¥—ã register_*_handler.\n\n"
-                "–ü–æ–¥–¥–µ—Ä–∂–∞–Ω—ã –æ–±—ã—á–Ω—ã–µ —Ñ–∏–ª—å—Ç—Ä—ã <code>commands</code>, <code>content_types</code> –∏ <code>func</code>, "
-                "–∞ —Ç–∞–∫–∂–µ InlineKeyboardButton/InlineKeyboardMarkup –∏–∑ <code>telebot.types</code>. "
-                "Telegram-–æ–±—Ä–∞–±–æ—Ç—á–∏–∫–∏ –∞–≤—Ç–æ–º–∞—Ç–∏—á–µ—Å–∫–∏ –ø–µ—Ä–µ—Å—Ç–∞—é—Ç –≤—ã–ø–æ–ª–Ω—è—Ç—å—Å—è –ø—Ä–∏ –≤—ã–∫–ª—é—á–µ–Ω–∏–∏ –∏–ª–∏ —É–¥–∞–ª–µ–Ω–∏–∏ –ø–ª–∞–≥–∏–Ω–∞.\n\n"
-                "–ü—Ä–∏ SETTINGS_PAGE=True –∫–∞—Ä—Ç–æ—á–∫–∞ –ø–ª–∞–≥–∏–Ω–∞ –ø–æ–∫–∞–∑—ã–≤–∞–µ—Ç –∫–Ω–æ–ø–∫—É ¬´–ù–∞—Å—Ç—Ä–æ–π–∫–∏¬ª —Å callback "
-                "<code>47:UUID:0</code>. –ó–∞—Ä–µ–≥–∏—Å—Ç—Ä–∏—Ä—É–π—Ç–µ –¥–ª—è –Ω–µ—ë callback-handler; –ø—Ä–µ—Ñ–∏–∫—Å —Ç–∞–∫–∂–µ –¥–æ—Å—Ç—É–ø–µ–Ω "
-                "–∫–∞–∫ <code>CBT.PLUGIN_SETTINGS</code> —á–µ—Ä–µ–∑ <code>from tg_bot import CBT</code>.\n\n"
-                "FunPay –¥–æ—Å—Ç—É–ø–µ–Ω —á–µ—Ä–µ–∑ <code>cardinal.account</code>, Runner ‚Äî —á–µ—Ä–µ–∑ <code>cardinal.runner</code>."
-            ),
-            "telethon": (
-                "üì± <b>Telethon user-account</b>\n\n"
-                "–î–æ–±–∞–≤—å—Ç–µ <code>TELETHON = True</code>. –í –∫–∞—Ä—Ç–æ—á–∫–µ –ø–ª–∞–≥–∏–Ω–∞ –ø–æ—è–≤–∏—Ç—Å—è –≤—Å—Ç—Ä–æ–µ–Ω–Ω–∞—è "
-                "–Ω–∞—Å—Ç—Ä–æ–π–∫–∞: –Ω–æ–º–µ—Ä ‚Üí –∫–æ–¥ Telegram ‚Üí –ø–∞—Ä–æ–ª—å 2FA, –µ—Å–ª–∏ –æ–Ω –≤–∫–ª—é—á—ë–Ω. –ü–ª–∞–≥–∏–Ω –Ω–µ –¥–æ–ª–∂–µ–Ω "
-                "—Å–∞–º —Å–æ–±–∏—Ä–∞—Ç—å —ç—Ç–∏ –∑–Ω–∞—á–µ–Ω–∏—è. –ö–æ–¥ –Ω–µ —Å–æ—Ö—Ä–∞–Ω—è–µ—Ç—Å—è; –Ω–æ–º–µ—Ä, StringSession –∏ 2FA "
-                "—à–∏—Ñ—Ä—É—é—Ç—Å—è —á–µ—Ä–µ–∑ APP_SECRET –æ—Ç–¥–µ–ª—å–Ω–æ –¥–ª—è –ø–æ–ª—å–∑–æ–≤–∞—Ç–µ–ª—è –∏ UUID –ø–ª–∞–≥–∏–Ω–∞.\n\n"
-                "–ü–æ—Å–ª–µ –≤—Ö–æ–¥–∞ —Ö—É–∫ <code>BIND_TO_TELETHON_READY</code> –ø–æ–ª—É—á–∞–µ—Ç "
-                "<code>(cardinal, client)</code>, –≥–¥–µ client ‚Äî –Ω–∞—Å—Ç–æ—è—â–∏–π "
-                "<code>telethon.TelegramClient</code>. –ò–∑ —Å–∏–Ω—Ö—Ä–æ–Ω–Ω–æ–≥–æ —Ö—É–∫–∞ –≤—ã–∑—ã–≤–∞–π—Ç–µ async API —Ç–∞–∫: "
-                "<code>cardinal.telethon.run(client.send_message('me', 'test'))</code>.\n\n"
-                "–ê–¥–º–∏–Ω–∏—Å—Ç—Ä–∞—Ç–æ—Ä –¥–æ–ª–∂–µ–Ω –∑–∞–¥–∞—Ç—å TELETHON_API_ID –∏ TELETHON_API_HASH –æ—Ç my.telegram.org. "
-                "–ü–æ–ª–Ω—ã–µ –ø—Ä–∏–º–µ—Ä—ã —Å–æ–±—ã—Ç–∏–π –∏ lifecycle –µ—Å—Ç—å –≤ —Å–∫–∞—á–∏–≤–∞–µ–º–æ–º PLUGIN_DEVELOPMENT.md."
-            ),
-            "safety": (
-                "üõ° <b>–°–æ–≤–º–µ—Å—Ç–∏–º–æ—Å—Ç—å –∏ –±–µ–∑–æ–ø–∞—Å–Ω–æ—Å—Ç—å</b>\n\n"
-                "–ü–æ–¥–¥–µ—Ä–∂–∏–≤–∞–µ—Ç—Å—è –æ–¥–Ω–æ—Ñ–∞–π–ª–æ–≤—ã–π –∫–æ–Ω—Ç—Ä–∞–∫—Ç, 18 —Ö—É–∫–æ–≤ FunPayCardinal, –¥–≤–∞ Telethon-—Ö—É–∫–∞, "
-                "–∏–º–ø–æ—Ä—Ç—ã <code>cardinal</code>, <code>FunPayAPI</code>, –æ—Ñ–∏—Ü–∏–∞–ª—å–Ω—ã–π <code>telethon</code>, "
-                "<code>tg_bot.CBT</code> –∏ –±–∞–∑–æ–≤—ã–π —Å–ª–æ–π <code>telebot.types</code>. "
-                "–ü–ª–∞–≥–∏–Ω, –∫–æ—Ç–æ—Ä—ã–π –∏–º–ø–æ—Ä—Ç–∏—Ä—É–µ—Ç –¥–æ–ø–æ–ª–Ω–∏—Ç–µ–ª—å–Ω—ã–µ "
-                "–ø–∞–∫–µ—Ç—ã –∏–ª–∏ –≤–Ω—É—Ç—Ä–µ–Ω–Ω–∏–µ –º–æ–¥—É–ª–∏ –∫–æ–Ω–∫—Ä–µ—Ç–Ω–æ–π —Å–±–æ—Ä–∫–∏ Cardinal, –ø–æ—Ç—Ä–µ–±—É–µ—Ç –¥–æ–±–∞–≤–∏—Ç—å –∏—Ö –≤ Docker-–æ–±—Ä–∞–∑.\n\n"
-                "‚ö†Ô∏è Python-–ø–ª–∞–≥–∏–Ω –≤—ã–ø–æ–ª–Ω—è–µ—Ç—Å—è –≤–Ω—É—Ç—Ä–∏ –ø—Ä–æ—Ü–µ—Å—Å–∞ –±–æ—Ç–∞. –û–Ω –º–æ–∂–µ—Ç –ø—Ä–æ—á–∏—Ç–∞—Ç—å BOT_TOKEN, DATABASE_URL, "
-                "golden_key, –æ–±—Ä–∞—â–∞—Ç—å—Å—è –∫ —Å–µ—Ç–∏ –∏ —É–ø—Ä–∞–≤–ª—è—Ç—å –∞–∫–∫–∞—É–Ω—Ç–æ–º. –ü—Ä–æ–≤–µ—Ä—è–π—Ç–µ –∏—Å—Ö–æ–¥–Ω—ã–π –∫–æ–¥, UUID –∏ –∞–≤—Ç–æ—Ä–∞. "
-                "–í—ã–∫–ª—é—á–µ–Ω–∏–µ –æ—Å—Ç–∞–Ω–∞–≤–ª–∏–≤–∞–µ—Ç —Ö—É–∫–∏, –Ω–æ –¥–ª—è –ø–æ–ª–Ω–æ–≥–æ —É–¥–∞–ª–µ–Ω–∏—è –Ω–µ–¥–æ–≤–µ—Ä–µ–Ω–Ω–æ–≥–æ –∫–æ–¥–∞ –∏—Å–ø–æ–ª—å–∑—É–π—Ç–µ –∫–Ω–æ–ø–∫—É ¬´–£–¥–∞–ª–∏—Ç—å¬ª."
-            ),
-            "catalog": (
-                "üß≠ <b>–ü—É–±–ª–∏–∫–∞—Ü–∏—è –≤ –∫–∞—Ç–∞–ª–æ–≥–µ</b>\n\n"
-                "1. –°–Ω–∞—á–∞–ª–∞ —É—Å—Ç–∞–Ω–æ–≤–∏—Ç–µ –∏ –ø—Ä–æ–≤–µ—Ä—å—Ç–µ —Å–æ–±—Å—Ç–≤–µ–Ω–Ω—ã–π .py-–ø–ª–∞–≥–∏–Ω.\n"
-                "2. –û—Ç–∫—Ä–æ–π—Ç–µ ¬´–ú–æ–∏ –ø–ª–∞–≥–∏–Ω—ã ‚Üí –ø–ª–∞–≥–∏–Ω ‚Üí –û–ø—É–±–ª–∏–∫–æ–≤–∞—Ç—å –≤ –∫–∞—Ç–∞–ª–æ–≥–µ¬ª.\n"
-                "3. –ù–∞–ø–∏—à–∏—Ç–µ –ø–æ–¥—Ä–æ–±–Ω–æ–µ –æ–ø–∏—Å–∞–Ω–∏–µ –¥–ª–∏–Ω–æ–π 40‚Äì2000 —Å–∏–º–≤–æ–ª–æ–≤: –Ω–∞–∑–Ω–∞—á–µ–Ω–∏–µ, –∫–æ–º–∞–Ω–¥—ã, "
-                "–Ω–∞—Å—Ç—Ä–æ–π–∫–∞, –∑–∞–≤–∏—Å–∏–º–æ—Å—Ç–∏, —Ä–∞–∑—Ä–µ—à–µ–Ω–∏—è –∏ –æ–≥—Ä–∞–Ω–∏—á–µ–Ω–∏—è.\n"
-                "4. –ü—Ä–æ–≤–µ—Ä—å—Ç–µ –∫–∞—Ä—Ç–æ—á–∫—É –∏ –ø–æ–¥—Ç–≤–µ—Ä–¥–∏—Ç–µ –ø—É–±–ª–∏–∫–∞—Ü–∏—é.\n\n"
-                "–ü—Ä–∏ –æ–±–Ω–æ–≤–ª–µ–Ω–∏–∏ –±–æ—Ç –∑–∞–Ω–æ–≤–æ –∫–æ–ø–∏—Ä—É–µ—Ç –º–µ—Ç–∞–¥–∞–Ω–Ω—ã–µ –∏ –∏—Å—Ö–æ–¥–Ω–∏–∫ —Ç–µ–∫—É—â–µ–π —É—Å—Ç–∞–Ω–æ–≤–ª–µ–Ω–Ω–æ–π –≤–µ—Ä—Å–∏–∏. "
-                "–ß—É–∂–æ–π –∏–ª–∏ –æ—Ñ–∏—Ü–∏–∞–ª—å–Ω—ã–π UUID –ø–µ—Ä–µ–∑–∞–ø–∏—Å–∞—Ç—å –Ω–µ–ª—å–∑—è. –ü—É–±–ª–∏–∫–∞—Ü–∏—é –º–æ–∂–Ω–æ —É–±—Ä–∞—Ç—å; —É–∂–µ —É—Å—Ç–∞–Ω–æ–≤–ª–µ–Ω–Ω—ã–µ "
-                "–∫–æ–ø–∏–∏ —É –¥—Ä—É–≥–∏—Ö –ø–æ–ª—å–∑–æ–≤–∞—Ç–µ–ª–µ–π —Å–æ—Ö—Ä–∞–Ω—è—Ç—Å—è. –ö–∞—Ç–∞–ª–æ–≥ —Å–æ–æ–±—â–µ—Å—Ç–≤–∞ –Ω–µ –º–æ–¥–µ—Ä–∏—Ä—É–µ—Ç—Å—è, –ø–æ—ç—Ç–æ–º—É "
-                "–ø–µ—Ä–µ–¥ —É—Å—Ç–∞–Ω–æ–≤–∫–æ–π —Å–∫–∞—á–∏–≤–∞–π—Ç–µ –∏ –ø—Ä–æ–≤–µ—Ä—è–π—Ç–µ –∏—Å—Ö–æ–¥–Ω—ã–π —Ñ–∞–π–ª. –°–æ–∑–¥–∞–Ω–Ω—ã–µ –≤—Å—Ç—Ä–æ–µ–Ω–Ω—ã–º "
-                "–∫–æ–Ω—Å—Ç—Ä—É–∫—Ç–æ—Ä–æ–º —Ä–∞—Å—à–∏—Ä–µ–Ω–∏—è –≤—Å–µ–≥–¥–∞ –ø—É–±–ª–∏–∫—É—é—Ç—Å—è —Å –ø–æ–º–µ—Ç–∫–æ–π ¬´–°–ì–ï–ù–ï–†–ò–†–û–í–ê–ù–û –ò–ò¬ª."
-            ),
-        }
-        text = pages.get(page)
-        if not text:
-            await callback.message.answer("–†–∞–∑–¥–µ–ª –¥–æ–∫—É–º–µ–Ω—Ç–∞—Ü–∏–∏ –Ω–µ –Ω–∞–π–¥–µ–Ω.")
-            return
-        await callback.message.answer(
-            text,
-            reply_markup=keyboard([[("‚¨ÖÔ∏è –î–æ–∫—É–º–µ–Ω—Ç–∞—Ü–∏—è", "plugin_docs")]]),
-            disable_web_page_preview=True,
-        )
-
-    @router.callback_query(F.data == "plugin_upload_warning")
-    async def plugin_upload_warning(callback: CallbackQuery) -> None:
-        await callback.answer()
-        await callback.message.answer(
-            "‚ö†Ô∏è <b>–í–Ω–∏–º–∞–Ω–∏–µ</b>\n"
-            "–ü–ª–∞–≥–∏–Ω –≤—ã–ø–æ–ª–Ω—è–µ—Ç—Å—è —Å —Ç–µ–º–∏ –∂–µ –ø—Ä–∞–≤–∞–º–∏, —á—Ç–æ –∏ –±–æ—Ç. –û–Ω –º–æ–∂–µ—Ç –ø—Ä–æ—á–∏—Ç–∞—Ç—å –ø–µ—Ä–µ–º–µ–Ω–Ω—ã–µ –æ–∫—Ä—É–∂–µ–Ω–∏—è, "
-            "–ø–æ–ª—É—á–∏—Ç—å –¥–æ—Å—Ç—É–ø –∫ FunPay-–∞–∫–∫–∞—É–Ω—Ç—É –∏ –±–∞–∑–µ –¥–∞–Ω–Ω—ã—Ö. –ü–æ—Å–ª–µ –æ—Ç–¥–µ–ª—å–Ω–æ–π –∞–≤—Ç–æ—Ä–∏–∑–∞—Ü–∏–∏ Telethon-–ø–ª–∞–≥–∏–Ω "
-            "—Å–º–æ–∂–µ—Ç –ø–æ–ª–Ω–æ—Å—Ç—å—é —É–ø—Ä–∞–≤–ª—è—Ç—å –ø–æ–¥–∫–ª—é—á—ë–Ω–Ω—ã–º Telegram-–∞–∫–∫–∞—É–Ω—Ç–æ–º. –ü—Ä–æ–¥–æ–ª–∂–∞–π—Ç–µ —Ç–æ–ª—å–∫–æ –µ—Å–ª–∏ –¥–æ–≤–µ—Ä—è–µ—Ç–µ –∞–≤—Ç–æ—Ä—É.",
-            reply_markup=keyboard([
-                [("–Ø –ø–æ–Ω–∏–º–∞—é —Ä–∏—Å–∫", "plugin_upload_confirm")],
-                [("–û—Ç–º–µ–Ω–∞", "plugins")],
-            ]),
-        )
-
-    @router.callback_query(F.data == "plugin_upload_confirm")
-    async def plugin_upload_confirm(callback: CallbackQuery, state: FSMContext) -> None:
-        await callback.answer()
-        if not await require_runtime(callback.message, callback.from_user.id):
-            return
-        await state.clear()
-        await state.set_state(PluginState.file)
-        await callback.message.answer(
-            "–û—Ç–ø—Ä–∞–≤—å—Ç–µ –æ–¥–∏–Ω–æ—á–Ω—ã–π —Ñ–∞–π–ª –ø–ª–∞–≥–∏–Ω–∞ <code>.py</code> –¥–æ 512 –ö–ë. –î–ª—è –æ—Ç–º–µ–Ω—ã: /cancel"
-        )
-
-    @router.message(PluginState.file)
-    async def plugin_upload_file(message: Message, state: FSMContext) -> None:
-        document = message.document
-        if not document or not (document.file_name or "").lower().endswith(".py"):
-            await message.answer("‚ùå –û—Ç–ø—Ä–∞–≤—å—Ç–µ –¥–æ–∫—É–º–µ–Ω—Ç —Å —Ä–∞—Å—à–∏—Ä–µ–Ω–∏–µ–º .py.")
-            return
-        if document.file_size and document.file_size > 512 * 1024:
-            await message.answer("‚ùå –†–∞–∑–º–µ—Ä –ø–ª–∞–≥–∏–Ω–∞ –Ω–µ –¥–æ–ª–∂–µ–Ω –ø—Ä–µ–≤—ã—à–∞—Ç—å 512 –ö–ë.")
-            return
-        runtime = await require_runtime(message, message.from_user.id)
-        if not runtime:
-            await state.clear()
-            return
-        buffer = BytesIO()
-        await message.bot.download(document, destination=buffer)
-        try:
-            source = buffer.getvalue().decode("utf-8-sig")
-        except UnicodeDecodeError:
-            await message.answer("‚ùå –§–∞–π–ª –¥–æ–ª–∂–µ–Ω –±—ã—Ç—å —Ç–µ–∫—Å—Ç–æ–≤—ã–º UTF-8 Python-–º–æ–¥—É–ª–µ–º.")
-            return
-        try:
-            plugin = await manager.plugins.install(
-                message.from_user.id,
-                document.file_name,
-                source,
-                runtime,
-            )
-        except PluginValidationError as exc:
-            await message.answer(f"‚ùå –ü–ª–∞–≥–∏–Ω –æ—Ç–∫–ª–æ–Ω—ë–Ω: {html.escape(str(exc))}")
-            return
-        except Exception as exc:
-            logger.exception("–ù–µ —É–¥–∞–ª–æ—Å—å —É—Å—Ç–∞–Ω–æ–≤–∏—Ç—å –ø–ª–∞–≥–∏–Ω")
-            await message.answer(
-                f"‚ùå –û—à–∏–±–∫–∞ —É—Å—Ç–∞–Ω–æ–≤–∫–∏: {html.escape(clipped(exc, 600))}"
-            )
-            return
-        await state.clear()
-        await message.answer(
-            f"‚úÖ –ü–ª–∞–≥–∏–Ω <b>{html.escape(plugin.name)}</b> v{html.escape(plugin.version)} —É—Å—Ç–∞–Ω–æ–≤–ª–µ–Ω."
-        )
-        await show_plugins(message, message.from_user.id)
-
-    @router.callback_query(F.data.startswith("plugin_info:"))
-    async def plugin_info(callback: CallbackQuery, state: FSMContext) -> None:
-        await callback.answer()
-        await state.clear()
-        uuid = callback.data.split(":", 1)[1]
-        plugin_runtime = manager.plugins.runtimes.get(callback.from_user.id)
-        plugin = plugin_runtime.plugins.get(uuid) if plugin_runtime else None
-        if not plugin:
-            await callback.message.answer("–ü–ª–∞–≥–∏–Ω –Ω–µ –Ω–∞–π–¥–µ–Ω.")
-            return
-        stored_plugin = await db.get_plugin(callback.from_user.id, uuid)
-        ai_generated = bool(stored_plugin and stored_plugin["ai_generated"])
-        hooks_count = sum(len(value) for value in plugin.hooks.values())
-        publication = await db.get_catalog_plugin(uuid)
-        rows = []
-        settings_callback = plugin_settings_callback_data(plugin)
-        if settings_callback:
-            rows.append([("‚öôÔ∏è –ù–∞—Å—Ç—Ä–æ–π–∫–∏", settings_callback)])
-        if ai_generated:
-            rows.append([("‚ú® –†–µ–¥–∞–∫—Ç–∏—Ä–æ–≤–∞—Ç—å —á–µ—Ä–µ–∑ –ò–ò", f"ai_builder_edit:{uuid}")])
-        telethon_status = "–Ω–µ –∏—Å–ø–æ–ª—å–∑—É–µ—Ç—Å—è"
-        if plugin.telethon_enabled:
-            telethon_row = await db.get_plugin_telethon_session(
-                callback.from_user.id, uuid
-            )
-            telethon_status = "–ø–æ–¥–∫–ª—é—á—ë–Ω" if telethon_row else "–Ω–µ –∞–≤—Ç–æ—Ä–∏–∑–æ–≤–∞–Ω"
-            rows.append([("üì± Telegram / Telethon", f"plugin_telethon:{uuid}")])
-        publication_status = "–ù–µ –æ–ø—É–±–ª–∏–∫–æ–≤–∞–Ω"
-        if publication:
-            if publication["is_official"]:
-                publication_status = "üõ° –æ—Ñ–∏—Ü–∏–∞–ª—å–Ω–∞—è –ø—É–±–ª–∏–∫–∞—Ü–∏—è"
-                rows.append([("üß≠ –û—Ç–∫—Ä—ã—Ç—å –≤ –∫–∞—Ç–∞–ª–æ–≥–µ", f"catalog_view:{uuid}:0")])
-            elif publication["owner_telegram_id"] == callback.from_user.id:
-                publication_status = "‚úÖ –æ–ø—É–±–ª–∏–∫–æ–≤–∞–Ω –≤–∞–º–∏"
-                rows.append([("üìù –û–±–Ω–æ–≤–∏—Ç—å –ø—É–±–ª–∏–∫–∞—Ü–∏—é", f"catalog_publish_start:{uuid}")])
-                rows.append([("–£–±—Ä–∞—Ç—å –∏–∑ –∫–∞—Ç–∞–ª–æ–≥–∞", f"catalog_unpublish_ask:{uuid}")])
-            else:
-                publication_status = "–û–ø—É–±–ª–∏–∫–æ–≤–∞–Ω –¥—Ä—É–≥–∏–º –ø–æ–ª—å–∑–æ–≤–∞—Ç–µ–ª–µ–º"
-                rows.append([("üß≠ –û—Ç–∫—Ä—ã—Ç—å –≤ –∫–∞—Ç–∞–ª–æ–≥–µ", f"catalog_view:{uuid}:0")])
-        elif uuid not in READY_PLUGIN_BY_UUID:
-            rows.append([("üåê –û–ø—É–±–ª–∏–∫–æ–≤–∞—Ç—å –≤ –∫–∞—Ç–∞–ª–æ–≥–µ", f"catalog_publish_start:{uuid}")])
-        rows.extend([
-            [("–í—ã–∫–ª—é—á–∏—Ç—å" if plugin.enabled else "–í–∫–ª—é—á–∏—Ç—å", f"plugin_toggle:{uuid}")],
-            [("üóë –£–¥–∞–ª–∏—Ç—å", f"plugin_delete_ask:{uuid}")],
-            [("‚¨ÖÔ∏è –ú–æ–∏ –ø–ª–∞–≥–∏–Ω—ã", "my_plugins")],
-        ])
-        await callback.message.answer(
-            ("ü§ñ <b>–°–ì–ï–ù–ï–†–ò–†–û–í–ê–ù–û –ò–ò</b>\n" if ai_generated else "")
-            + f"üß© <b>{html.escape(plugin.name)}</b> v{html.escape(plugin.version)}\n"
-            f"{html.escape(plugin.description)}\n\n"
-            f"–ê–≤—Ç–æ—Ä: {html.escape(plugin.credits)}\n"
-            f"UUID: <code>{plugin.uuid}</code>\n"
-            f"–•—É–∫–æ–≤: <b>{hooks_count}</b>\n"
-            f"–°—Ç—Ä–∞–Ω–∏—Ü–∞ –Ω–∞—Å—Ç—Ä–æ–µ–∫ Cardinal: {bool_icon(plugin.settings_page)}\n"
-            f"Telethon: <b>{html.escape(telethon_status)}</b>\n"
-            f"–ö–∞—Ç–∞–ª–æ–≥: {html.escape(publication_status)}\n"
-            f"–°–æ—Å—Ç–æ—è–Ω–∏–µ: {bool_icon(plugin.enabled)}",
-            reply_markup=keyboard(rows),
-        )
-
-    def get_telethon_plugin(user_id: int, uuid: str) -> PluginData | None:
-        plugin_runtime = manager.plugins.runtimes.get(user_id)
-        plugin = plugin_runtime.plugins.get(uuid) if plugin_runtime else None
-        return plugin if plugin and plugin.telethon_enabled else None
-
-    async def show_plugin_telethon(target: Message, user_id: int, uuid: str) -> None:
-        plugin = get_telethon_plugin(user_id, uuid)
-        if not plugin:
-            await target.answer("Telethon –¥–ª—è —ç—Ç–æ–≥–æ –ø–ª–∞–≥–∏–Ω–∞ –Ω–µ –æ–±—ä—è–≤–ª–µ–Ω.")
-            return
-        row = await db.get_plugin_telethon_session(user_id, uuid)
-        client = manager.telethon.get_client(user_id, uuid)
-        if row:
-            try:
-                phone = masked_phone(secrets.decrypt(row["phone_enc"]))
-            except (InvalidToken, ValueError, TypeError):
-                phone = "—Å–∫—Ä—ã—Ç"
-            username = (
-                f"@{row['telegram_username']}"
-                if row["telegram_username"]
-                else f"ID {row['telegram_user_id']}"
-            )
-            status = "üü¢ –∫–ª–∏–µ–Ω—Ç –∑–∞–ø—É—â–µ–Ω" if client and client.is_connected() else "üü° —Å–µ—Å—Å–∏—è —Å–æ—Ö—Ä–∞–Ω–µ–Ω–∞"
-            password_status = (
-                "üîê 2FA —Å–æ—Ö—Ä–∞–Ω—ë–Ω –∑–∞—à–∏—Ñ—Ä–æ–≤–∞–Ω–Ω–æ"
-                if row["password_enc"]
-                else "2FA –Ω–µ —Å–æ—Ö—Ä–∞–Ω—ë–Ω"
-            )
-            text = (
-                f"üì± <b>Telethon ¬∑ {html.escape(plugin.name)}</b>\n\n"
-                f"–ê–∫–∫–∞—É–Ω—Ç: <b>{html.escape(username)}</b>\n"
-                f"–¢–µ–ª–µ—Ñ–æ–Ω: <code>{html.escape(phone)}</code>\n"
-                f"–°—Ç–∞—Ç—É—Å: {status}\n"
-                f"–ü–∞—Ä–æ–ª—å: <b>{password_status}</b>\n\n"
-                "–°–µ—Å—Å–∏—è –∏ –ø–∞—Ä–æ–ª—å 2FA –∑–∞—à–∏—Ñ—Ä–æ–≤–∞–Ω—ã. –ö–æ–¥ –≤—Ö–æ–¥–∞ –Ω–µ —Å–æ—Ö—Ä–∞–Ω—è–µ—Ç—Å—è."
-            )
-            rows = [
-                [("üîÑ –ê–≤—Ç–æ—Ä–∏–∑–æ–≤–∞—Ç—å –∑–∞–Ω–æ–≤–æ", f"plugin_telethon_start:{uuid}")],
-                [(
-                    "üö™ –û—Ç–∫–ª—é—á–∏—Ç—å –∏ —É–¥–∞–ª–∏—Ç—å —Å–µ—Å—Å–∏—é",
-                    f"{PLUGIN_TELETHON_DISCONNECT_ASK_PREFIX}{uuid}",
-                )],
-                [("‚¨ÖÔ∏è –ö –ø–ª–∞–≥–∏–Ω—É", f"plugin_info:{uuid}")],
-            ]
-        else:
-            configured = manager.telethon.configured
-            text = (
-                f"üì± <b>Telethon ¬∑ {html.escape(plugin.name)}</b>\n\n"
-                "Telegram-–∞–∫–∫–∞—É–Ω—Ç –Ω–µ –∞–≤—Ç–æ—Ä–∏–∑–æ–≤–∞–Ω. –ú–∞—Å—Ç–µ—Ä –∑–∞–ø—Ä–æ—Å–∏—Ç –Ω–æ–º–µ—Ä —Ç–µ–ª–µ—Ñ–æ–Ω–∞, "
-                "–∫–æ–¥ –≤—Ö–æ–¥–∞ –∏, –µ—Å–ª–∏ –≤–∫–ª—é—á–µ–Ω–æ, –ø–∞—Ä–æ–ª—å 2FA.\n\n"
-                "–ö–æ–¥ –∏ –ø–∞—Ä–æ–ª—å —É–¥–∞–ª—è—é—Ç—Å—è –∏–∑ —á–∞—Ç–∞. –ü–æ—Å–ª–µ –≤—Ö–æ–¥–∞ —Å–µ—Å—Å–∏—è –∏ –ø–∞—Ä–æ–ª—å 2FA "
-                "—Å–æ—Ö—Ä–∞–Ω—è—é—Ç—Å—è —Ç–æ–ª—å–∫–æ –≤ –∑–∞—à–∏—Ñ—Ä–æ–≤–∞–Ω–Ω–æ–º –≤–∏–¥–µ."
-            )
-            if not configured:
-                text += (
-                    "\n\n‚ö†Ô∏è –ê–¥–º–∏–Ω–∏—Å—Ç—Ä–∞—Ç–æ—Ä –µ—â—ë –Ω–µ –∑–∞–¥–∞–ª –ø–µ—Ä–µ–º–µ–Ω–Ω—ã–µ "
-                    "<code>TELETHON_API_ID</code> –∏ <code>TELETHON_API_HASH</code>."
-                )
-            rows = []
-            if configured and plugin.enabled:
-                rows.append([("üì≤ –ù–∞—á–∞—Ç—å –∞–≤—Ç–æ—Ä–∏–∑–∞—Ü–∏—é", f"plugin_telethon_start:{uuid}")])
-            elif configured:
-                text += "\n\n–ß—Ç–æ–±—ã –Ω–∞—á–∞—Ç—å –∞–≤—Ç–æ—Ä–∏–∑–∞—Ü–∏—é, —Å–Ω–∞—á–∞–ª–∞ –≤–∫–ª—é—á–∏—Ç–µ –ø–ª–∞–≥–∏–Ω."
-            rows.append([("‚¨ÖÔ∏è –ö –ø–ª–∞–≥–∏–Ω—É", f"plugin_info:{uuid}")])
-        await target.answer(text, reply_markup=keyboard(rows))
-
-    async def delete_sensitive_message(message: Message) -> None:
-        try:
-            await message.delete()
-        except TelegramBadRequest:
-            pass
-
-    async def finish_telethon_auth(
-        message: Message,
-        state: FSMContext,
-        uuid: str,
-        phone: str,
-        client: Any,
-        password: str | None = None,
-    ) -> None:
-        try:
-            me = await manager.telethon.activate(
-                message.from_user.id, uuid, phone, client, password=password
-            )
-        except Exception:
-            await client.disconnect()
-            logger.exception("–ù–µ —É–¥–∞–ª–æ—Å—å —Å–æ—Ö—Ä–∞–Ω–∏—Ç—å –∞–≤—Ç–æ—Ä–∏–∑–æ–≤–∞–Ω–Ω—É—é Telethon-—Å–µ—Å—Å–∏—é")
-            await state.clear()
-            await message.answer("‚ùå –í—Ö–æ–¥ –≤—ã–ø–æ–ª–Ω–µ–Ω, –Ω–æ —Å–æ—Ö—Ä–∞–Ω–∏—Ç—å Telethon-—Å–µ—Å—Å–∏—é –Ω–µ —É–¥–∞–ª–æ—Å—å.")
-            return
-        await state.clear()
-        identity = f"@{me.username}" if getattr(me, "username", None) else f"ID {me.id}"
-        await message.answer(
-            f"‚úÖ Telegram-–∞–∫–∫–∞—É–Ω—Ç <b>{html.escape(identity)}</b> –ø–æ–¥–∫–ª—é—á—ë–Ω –∫ –ø–ª–∞–≥–∏–Ω—É."
-        )
-        plugin_runtime = manager.plugins.runtimes.get(message.from_user.id)
-        plugin = get_telethon_plugin(message.from_user.id, uuid)
-        if plugin_runtime and plugin and plugin.enabled:
-            await manager.plugins.dispatch(
-                message.from_user.id,
-                "BIND_TO_TELETHON_READY",
-                plugin_runtime.adapter,
-                client,
-                only=uuid,
-            )
-        else:
-            await manager.telethon.stop_plugin(message.from_user.id, uuid)
-        await show_plugin_telethon(message, message.from_user.id, uuid)
-
-    @router.callback_query(F.data.startswith("plugin_telethon:"))
-    async def plugin_telethon(callback: CallbackQuery, state: FSMContext) -> None:
-        await callback.answer()
-        await state.clear()
-        await show_plugin_telethon(
-            callback.message, callback.from_user.id, callback.data.split(":", 1)[1]
-        )
-
-    @router.callback_query(F.data.startswith("plugin_telethon_start:"))
-    async def plugin_telethon_start(callback: CallbackQuery, state: FSMContext) -> None:
-        uuid = callback.data.split(":", 1)[1]
-        plugin = get_telethon_plugin(callback.from_user.id, uuid)
-        if not plugin:
-            await callback.answer("Telethon-–ø–ª–∞–≥–∏–Ω –Ω–µ –Ω–∞–π–¥–µ–Ω", show_alert=True)
-            return
-        if not plugin.enabled:
-            await callback.answer("–°–Ω–∞—á–∞–ª–∞ –≤–∫–ª—é—á–∏—Ç–µ –ø–ª–∞–≥–∏–Ω", show_alert=True)
-            return
-        try:
-            manager.telethon.require_configured()
-        except TelethonConfigurationError as exc:
-            await callback.answer(str(exc), show_alert=True)
-            return
-        await callback.answer()
-        await state.clear()
-        await state.update_data(telethon_plugin_uuid=uuid)
-        await state.set_state(PluginTelethonState.phone)
-        await callback.message.answer(
-            "üì± <b>–®–∞–≥ 1/3 ¬∑ –ù–æ–º–µ—Ä —Ç–µ–ª–µ—Ñ–æ–Ω–∞</b>\n\n"
-            "–û—Ç–ø—Ä–∞–≤—å—Ç–µ –Ω–æ–º–µ—Ä Telegram –≤ –º–µ–∂–¥—É–Ω–∞—Ä–æ–¥–Ω–æ–º —Ñ–æ—Ä–º–∞—Ç–µ, –Ω–∞–ø—Ä–∏–º–µ—Ä "
-            "<code>+79991234567</code>. –°–æ–æ–±—â–µ–Ω–∏–µ –±—É–¥–µ—Ç —É–¥–∞–ª–µ–Ω–æ. –î–ª—è –æ—Ç–º–µ–Ω—ã: /cancel"
-        )
-
-    @router.message(PluginTelethonState.phone, F.text)
-    async def plugin_telethon_phone(message: Message, state: FSMContext) -> None:
-        phone = re.sub(r"[\s()\-]", "", message.text.strip())
-        await delete_sensitive_message(message)
-        if not re.fullmatch(r"\+\d{7,15}", phone):
-            await message.answer("‚ùå –ù—É–∂–µ–Ω –Ω–æ–º–µ—Ä –≤–∏–¥–∞ <code>+79991234567</code>.")
-            return
-        data = await state.get_data()
-        uuid = str(data.get("telethon_plugin_uuid") or "")
-        if not get_telethon_plugin(message.from_user.id, uuid):
-            await state.clear()
-            await message.answer("‚ùå –ü–ª–∞–≥–∏–Ω –±–æ–ª—å—à–µ –Ω–µ –¥–æ—Å—Ç—É–ø–µ–Ω.")
-            return
-        wait_message = await message.answer("‚è≥ –û—Ç–ø—Ä–∞–≤–ª—è—é –∫–æ–¥ –≤—Ö–æ–¥–∞ —á–µ—Ä–µ–∑ Telegram‚Ä¶")
-        client = None
-        try:
-            client = manager.telethon.create_client()
-            await asyncio.wait_for(client.connect(), timeout=30)
-            sent = await asyncio.wait_for(client.send_code_request(phone), timeout=45)
-            pending_session = client.session.save()
-        except PhoneNumberInvalidError:
-            await wait_message.edit_text("‚ùå Telegram –Ω–µ –ø—Ä–∏–Ω—è–ª —ç—Ç–æ—Ç –Ω–æ–º–µ—Ä. –û—Ç–ø—Ä–∞–≤—å—Ç–µ –¥—Ä—É–≥–æ–π –Ω–æ–º–µ—Ä.")
-            return
-        except FloodWaitError as exc:
-            await wait_message.edit_text(
-                f"‚ùå Telegram –æ–≥—Ä–∞–Ω–∏—á–∏–ª –ø–æ–≤—Ç–æ—Ä–Ω—ã–µ –ø–æ–ø—ã—Ç–∫–∏. –ü–æ–¥–æ–∂–¥–∏—Ç–µ {exc.seconds} —Å–µ–∫."
-            )
-            return
-        except Exception:
-            logger.exception("–ù–µ —É–¥–∞–ª–æ—Å—å –∑–∞–ø—Ä–æ—Å–∏—Ç—å Telethon-–∫–æ–¥")
-            await wait_message.edit_text("‚ùå –ù–µ —É–¥–∞–ª–æ—Å—å –æ—Ç–ø—Ä–∞–≤–∏—Ç—å –∫–æ–¥ –≤—Ö–æ–¥–∞. –ü–æ–ø—Ä–æ–±—É–π—Ç–µ –ø–æ–∑–∂–µ.")
-            return
-        finally:
-            if client:
-                await client.disconnect()
-        await state.update_data(
-            telethon_phone_enc=secrets.encrypt(phone),
-            telethon_pending_session_enc=secrets.encrypt(pending_session),
-            telethon_phone_code_hash=sent.phone_code_hash,
-        )
-        await state.set_state(PluginTelethonState.code)
-        await wait_message.edit_text(
-            "üì© <b>–®–∞–≥ 2/3 ¬∑ –ö–æ–¥ –≤—Ö–æ–¥–∞</b>\n\n"
-            "–û—Ç–ø—Ä–∞–≤—å—Ç–µ –∫–æ–¥, –ø–æ–ª—É—á–µ–Ω–Ω—ã–π –æ—Ç Telegram. –ú–æ–∂–Ω–æ –ø–∏—Å–∞—Ç—å —Å –ø—Ä–æ–±–µ–ª–∞–º–∏. "
-            "–°–æ–æ–±—â–µ–Ω–∏–µ –±—É–¥–µ—Ç —É–¥–∞–ª–µ–Ω–æ."
-        )
-
-    @router.message(PluginTelethonState.code, F.text)
-    async def plugin_telethon_code(message: Message, state: FSMContext) -> None:
-        code = re.sub(r"\D", "", message.text)
-        await delete_sensitive_message(message)
-        if not 4 <= len(code) <= 8:
-            await message.answer("‚ùå –ö–æ–¥ –≤—ã–≥–ª—è–¥–∏—Ç –Ω–µ–∫–æ—Ä—Ä–µ–∫—Ç–Ω–æ. –û—Ç–ø—Ä–∞–≤—å—Ç–µ –µ–≥–æ –µ—â—ë —Ä–∞–∑.")
-            return
-        data = await state.get_data()
-        uuid = str(data.get("telethon_plugin_uuid") or "")
-        try:
-            phone = secrets.decrypt(data["telethon_phone_enc"])
-            pending_session = secrets.decrypt(data["telethon_pending_session_enc"])
-            phone_code_hash = str(data["telethon_phone_code_hash"])
-        except (KeyError, InvalidToken, TypeError):
-            await state.clear()
-            await message.answer("‚ùå –°–µ—Å—Å–∏—è –∞–≤—Ç–æ—Ä–∏–∑–∞—Ü–∏–∏ –∏—Å—Ç–µ–∫–ª–∞. –ù–∞—á–Ω–∏—Ç–µ –∑–∞–Ω–æ–≤–æ.")
-            return
-        try:
-            client = manager.telethon.create_client(pending_session)
-        except TelethonConfigurationError as exc:
-            await state.clear()
-            await message.answer(f"‚ùå {html.escape(str(exc))}")
-            return
-        try:
-            await asyncio.wait_for(client.connect(), timeout=30)
-            await asyncio.wait_for(
-                client.sign_in(
-                    phone=phone,
-                    code=code,
-                    phone_code_hash=phone_code_hash,
-                ),
-                timeout=45,
-            )
-        except SessionPasswordNeededError:
-            await state.update_data(
-                telethon_pending_session_enc=secrets.encrypt(client.session.save())
-            )
-            await client.disconnect()
-            await state.set_state(PluginTelethonState.password)
-            await message.answer(
-                "üîê <b>–®–∞–≥ 3/3 ¬∑ –ü–∞—Ä–æ–ª—å 2FA</b>\n\n"
-                "–ù–∞ –∞–∫–∫–∞—É–Ω—Ç–µ –≤–∫–ª—é—á–µ–Ω–∞ –¥–≤—É—Ö—ç—Ç–∞–ø–Ω–∞—è –∞—É—Ç–µ–Ω—Ç–∏—Ñ–∏–∫–∞—Ü–∏—è. –û—Ç–ø—Ä–∞–≤—å—Ç–µ –ø–∞—Ä–æ–ª—å 2FA. "
-                "–°–æ–æ–±—â–µ–Ω–∏–µ –±—É–¥–µ—Ç —É–¥–∞–ª–µ–Ω–æ, –∞ –ø–∞—Ä–æ–ª—å —Å–æ—Ö—Ä–∞–Ω–∏—Ç—Å—è –∑–∞—à–∏—Ñ—Ä–æ–≤–∞–Ω–Ω–æ –¥–ª—è –∞–≤—Ç–æ–º–∞—Ç–∏—á–µ—Å–∫–∏—Ö "
-                "–æ–ø–µ—Ä–∞—Ü–∏–π –ø–ª–∞–≥–∏–Ω–∞."
-            )
-            return
-        except PhoneCodeInvalidError:
-            await client.disconnect()
-            await message.answer("‚ùå –ù–µ–≤–µ—Ä–Ω—ã–π –∫–æ–¥. –û—Ç–ø—Ä–∞–≤—å—Ç–µ –∫–æ–¥ –µ—â—ë —Ä–∞–∑.")
-            return
-        except PhoneCodeExpiredError:
-            await client.disconnect()
-            await state.clear()
-            await message.answer("‚ùå –ö–æ–¥ –∏—Å—Ç—ë–∫. –û—Ç–∫—Ä–æ–π—Ç–µ –Ω–∞—Å—Ç—Ä–æ–π–∫–∏ –ø–ª–∞–≥–∏–Ω–∞ –∏ –Ω–∞—á–Ω–∏—Ç–µ –∑–∞–Ω–æ–≤–æ.")
-            return
-        except Exception:
-            await client.disconnect()
-            logger.exception("Telethon-–≤—Ö–æ–¥ –ø–æ –∫–æ–¥—É –Ω–µ –≤—ã–ø–æ–ª–Ω–µ–Ω")
-            await state.clear()
-            await message.answer("‚ùå –í–æ–π—Ç–∏ –ø–æ –∫–æ–¥—É –Ω–µ —É–¥–∞–ª–æ—Å—å. –ù–∞—á–Ω–∏—Ç–µ –∞–≤—Ç–æ—Ä–∏–∑–∞—Ü–∏—é –∑–∞–Ω–æ–≤–æ.")
-            return
-        await finish_telethon_auth(message, state, uuid, phone, client)
-
-    @router.message(PluginTelethonState.password, F.text)
-    async def plugin_telethon_password(message: Message, state: FSMContext) -> None:
-        password = message.text
-        await delete_sensitive_message(message)
-        data = await state.get_data()
-        uuid = str(data.get("telethon_plugin_uuid") or "")
-        try:
-            phone = secrets.decrypt(data["telethon_phone_enc"])
-            pending_session = secrets.decrypt(data["telethon_pending_session_enc"])
-        except (KeyError, InvalidToken, TypeError):
-            await state.clear()
-            await message.answer("‚ùå –°–µ—Å—Å–∏—è –∞–≤—Ç–æ—Ä–∏–∑–∞—Ü–∏–∏ –∏—Å—Ç–µ–∫–ª–∞. –ù–∞—á–Ω–∏—Ç–µ –∑–∞–Ω–æ–≤–æ.")
-            return
-        try:
-            client = manager.telethon.create_client(pending_session)
-        except TelethonConfigurationError as exc:
-            await state.clear()
-            await message.answer(f"‚ùå {html.escape(str(exc))}")
-            return
-        try:
-            await asyncio.wait_for(client.connect(), timeout=30)
-            await asyncio.wait_for(client.sign_in(password=password), timeout=45)
-        except PasswordHashInvalidError:
-            await client.disconnect()
-            await message.answer("‚ùå –ù–µ–≤–µ—Ä–Ω—ã–π –ø–∞—Ä–æ–ª—å 2FA. –ü–æ–ø—Ä–æ–±—É–π—Ç–µ –µ—â—ë —Ä–∞–∑ –∏–ª–∏ /cancel.")
-            return
-        except Exception:
-            await client.disconnect()
-            logger.exception("Telethon-–≤—Ö–æ–¥ —Å 2FA –Ω–µ –≤—ã–ø–æ–ª–Ω–µ–Ω")
-            await state.clear()
-            await message.answer("‚ùå –í—Ö–æ–¥ —Å 2FA –Ω–µ –≤—ã–ø–æ–ª–Ω–µ–Ω. –ù–∞—á–Ω–∏—Ç–µ –∞–≤—Ç–æ—Ä–∏–∑–∞—Ü–∏—é –∑–∞–Ω–æ–≤–æ.")
-            return
-        await finish_telethon_auth(
-            message, state, uuid, phone, client, password=password
-        )
-
-    @router.callback_query(
-        F.data.startswith(PLUGIN_TELETHON_DISCONNECT_ASK_PREFIX)
-    )
-    async def plugin_telethon_disconnect_ask(callback: CallbackQuery) -> None:
-        uuid = callback.data.split(":", 1)[1]
-        await callback.answer()
-        await callback.message.answer(
-            "–£–¥–∞–ª–∏—Ç—å –∑–∞—à–∏—Ñ—Ä–æ–≤–∞–Ω–Ω—É—é Telethon-—Å–µ—Å—Å–∏—é —ç—Ç–æ–≥–æ –ø–ª–∞–≥–∏–Ω–∞? "
-            "–î–ª—è –ø–æ–≤—Ç–æ—Ä–Ω–æ–π —Ä–∞–±–æ—Ç—ã –ø–æ–Ω–∞–¥–æ–±–∏—Ç—Å—è –Ω–æ–≤—ã–π –∫–æ–¥ –≤—Ö–æ–¥–∞.",
-            reply_markup=keyboard([
-                [(
-                    "–î–∞, –æ—Ç–∫–ª—é—á–∏—Ç—å",
-                    f"{PLUGIN_TELETHON_DISCONNECT_DO_PREFIX}{uuid}",
-                )],
-                [("–û—Ç–º–µ–Ω–∞", f"plugin_telethon:{uuid}")],
-            ]),
-        )
-
-    @router.callback_query(
-        F.data.startswith(PLUGIN_TELETHON_DISCONNECT_DO_PREFIX)
-    )
-    async def plugin_telethon_disconnect_do(callback: CallbackQuery) -> None:
-        uuid = callback.data.split(":", 1)[1]
-        plugin_runtime = manager.plugins.runtimes.get(callback.from_user.id)
-        client = manager.telethon.get_client(callback.from_user.id, uuid)
-        if plugin_runtime and client:
-            await manager.plugins.dispatch(
-                callback.from_user.id,
-                "BIND_TO_TELETHON_DISCONNECTED",
-                plugin_runtime.adapter,
-                client,
-                only=uuid,
-            )
-        await manager.telethon.stop_plugin(
-            callback.from_user.id, uuid, delete_session=True
-        )
-        await callback.answer("Telethon –æ—Ç–∫–ª—é—á—ë–Ω")
-        await show_plugin_telethon(callback.message, callback.from_user.id, uuid)
-
-    @router.callback_query(F.data.startswith("catalog_publish_start:"))
-    async def catalog_publish_start(callback: CallbackQuery, state: FSMContext) -> None:
-        uuid = callback.data.split(":", 1)[1]
-        plugin = await db.get_plugin(callback.from_user.id, uuid)
-        publication = await db.get_catalog_plugin(uuid)
-        if not plugin:
-            await callback.answer("–£—Å—Ç–∞–Ω–æ–≤–ª–µ–Ω–Ω—ã–π –ø–ª–∞–≥–∏–Ω –Ω–µ –Ω–∞–π–¥–µ–Ω", show_alert=True)
-            return
-        if publication and (
-            publication["is_official"]
-            or publication["owner_telegram_id"] != callback.from_user.id
-        ):
-            await callback.answer("–≠—Ç–æ—Ç UUID —É–∂–µ –æ–ø—É–±–ª–∏–∫–æ–≤–∞–Ω –¥—Ä—É–≥–∏–º –∞–≤—Ç–æ—Ä–æ–º", show_alert=True)
-            return
-        await callback.answer()
-        await state.clear()
-        await state.set_state(CatalogPublishState.description)
-        await state.update_data(catalog_uuid=uuid)
-        current = (
-            f"\n\n–¢–µ–∫—É—â–µ–µ –æ–ø–∏—Å–∞–Ω–∏–µ:\n<i>{html.escape(publication['description'])}</i>"
-            if publication
-            else ""
-        )
-        await callback.message.answer(
-            "üåê <b>–ü—É–±–ª–∏–∫–∞—Ü–∏—è –ø–ª–∞–≥–∏–Ω–∞</b>\n\n"
-            "–û—Ç–ø—Ä–∞–≤—å—Ç–µ –ø–æ–¥—Ä–æ–±–Ω–æ–µ –æ–ø–∏—Å–∞–Ω–∏–µ: —á—Ç–æ –¥–µ–ª–∞–µ—Ç –ø–ª–∞–≥–∏–Ω, –∫–∞–∫ –µ–≥–æ –Ω–∞—Å—Ç—Ä–æ–∏—Ç—å, –∫–∞–∫–∏–µ –∫–æ–º–∞–Ω–¥—ã "
-            "–æ–Ω –¥–æ–±–∞–≤–ª—è–µ—Ç –∏ –∫–∞–∫–∏–µ —Ä–∞–∑—Ä–µ—à–µ–Ω–∏—è –∏–ª–∏ –∑–∞–≤–∏—Å–∏–º–æ—Å—Ç–∏ –µ–º—É –Ω—É–∂–Ω—ã. "
-            f"–û—Ç {PLUGIN_CATALOG_DESCRIPTION_MIN} –¥–æ {PLUGIN_CATALOG_DESCRIPTION_MAX} —Å–∏–º–≤–æ–ª–æ–≤."
-            f"{current}\n\n–î–ª—è –æ—Ç–º–µ–Ω—ã: /cancel"
-        )
-
-    @router.message(CatalogPublishState.description)
-    async def catalog_publish_description(message: Message, state: FSMContext) -> None:
-        try:
-            description = validate_catalog_description(message.text or "")
-        except ValueError as exc:
-            await message.answer(f"‚ùå {html.escape(str(exc))}")
-            return
-        data = await state.get_data()
-        uuid = data.get("catalog_uuid")
-        plugin = await db.get_plugin(message.from_user.id, uuid) if uuid else None
-        if not plugin:
-            await state.clear()
-            await message.answer("‚ùå –ü–ª–∞–≥–∏–Ω –±–æ–ª—å—à–µ –Ω–µ —É—Å—Ç–∞–Ω–æ–≤–ª–µ–Ω.")
-            return
-        await state.update_data(catalog_description=description)
-        ai_badge = "ü§ñ <b>–°–ì–ï–ù–ï–†–ò–†–û–í–ê–ù–û –ò–ò</b>\n" if plugin["ai_generated"] else ""
-        await message.answer(
-            "üîé <b>–ü—Ä–µ–¥–ø—Ä–æ—Å–º–æ—Ç—Ä –ø—É–±–ª–∏–∫–∞—Ü–∏–∏</b>\n\n"
-            f"{ai_badge}"
-            f"<b>{html.escape(clipped(plugin['name'], 100))}</b> "
-            f"v{html.escape(clipped(plugin['version'], 30))}\n"
-            f"<i>{html.escape(clipped(plugin['description'], 500))}</i>\n\n"
-            f"{html.escape(description)}\n\n"
-            f"–ü—É–±–ª–∏—á–Ω—ã–π –∞–≤—Ç–æ—Ä: <b>{html.escape(telegram_publisher_name(message.from_user))}</b>\n"
-            "–ü–æ—Å–ª–µ –ø—É–±–ª–∏–∫–∞—Ü–∏–∏ –ª—é–±–æ–π –ø–æ–ª—å–∑–æ–≤–∞—Ç–µ–ª—å –±–æ—Ç–∞ —Å–º–æ–∂–µ—Ç –ø–æ—Å–º–æ—Ç—Ä–µ—Ç—å –∏ —Å–∫–∞—á–∞—Ç—å –∏—Å—Ö–æ–¥–Ω–∏–∫.",
-            reply_markup=keyboard([
-                [("‚úÖ –û–ø—É–±–ª–∏–∫–æ–≤–∞—Ç—å", f"catalog_publish_do:{uuid}")],
-                [("–û—Ç–º–µ–Ω–∞", f"plugin_info:{uuid}")],
-            ]),
-        )
-
-    @router.callback_query(F.data.startswith("catalog_publish_do:"))
-    async def catalog_publish_do(callback: CallbackQuery, state: FSMContext) -> None:
-        uuid = callback.data.split(":", 1)[1]
-        data = await state.get_data()
-        if data.get("catalog_uuid") != uuid or not data.get("catalog_description"):
-            await callback.answer("–°–µ—Å—Å–∏—è –ø—É–±–ª–∏–∫–∞—Ü–∏–∏ –∏—Å—Ç–µ–∫–ª–∞", show_alert=True)
-            return
-        published = await db.publish_catalog_plugin(
-            callback.from_user.id,
-            uuid,
-            telegram_publisher_name(callback.from_user),
-            data["catalog_description"],
-        )
-        await state.clear()
-        if not published:
-            await callback.answer("–ü—É–±–ª–∏–∫–∞—Ü–∏—è –Ω–µ –≤—ã–ø–æ–ª–Ω–µ–Ω–∞", show_alert=True)
-            await callback.message.answer(
-                "UUID —É–∂–µ –∑–∞–Ω—è—Ç –ª–∏–±–æ —É—Å—Ç–∞–Ω–æ–≤–ª–µ–Ω–Ω—ã–π –ø–ª–∞–≥–∏–Ω –±—ã–ª —É–¥–∞–ª—ë–Ω."
-            )
-            return
-        await callback.answer("–û–ø—É–±–ª–∏–∫–æ–≤–∞–Ω–æ")
-        published_plugin = await db.get_plugin(callback.from_user.id, uuid)
-        await callback.message.answer(
-            "‚úÖ –ü–ª–∞–≥–∏–Ω –æ–ø—É–±–ª–∏–∫–æ–≤–∞–Ω –≤ –æ–±—â–µ–º –∫–∞—Ç–∞–ª–æ–≥–µ. –û–ø–∏—Å–∞–Ω–∏–µ –∏ –∏—Å—Ö–æ–¥–Ω–∏–∫ —Ç–µ–ø–µ—Ä—å –≤–∏–¥–Ω—ã –¥—Ä—É–≥–∏–º –ø–æ–ª—å–∑–æ–≤–∞—Ç–µ–ª—è–º."
-            + (
-                "\nü§ñ –í –∫–∞—Ä—Ç–æ—á–∫–µ –∫–∞—Ç–∞–ª–æ–≥–∞ –¥–æ–±–∞–≤–ª–µ–Ω–∞ –æ–±—è–∑–∞—Ç–µ–ª—å–Ω–∞—è –ø–æ–º–µ—Ç–∫–∞ ¬´–°–ì–ï–ù–ï–†–ò–†–û–í–ê–ù–û –ò–ò¬ª."
-                if published_plugin and published_plugin["ai_generated"]
-                else ""
-            ),
-            reply_markup=keyboard([[('üß≠ –û—Ç–∫—Ä—ã—Ç—å –ø—É–±–ª–∏–∫–∞—Ü–∏—é', f"catalog_view:{uuid}:0")]]),
-        )
-
-    @router.callback_query(F.data.startswith("catalog_unpublish_ask:"))
-    async def catalog_unpublish_ask(callback: CallbackQuery) -> None:
-        uuid = callback.data.split(":", 1)[1]
-        item = await db.get_catalog_plugin(uuid)
-        if not item or item["owner_telegram_id"] != callback.from_user.id or item["is_official"]:
-            await callback.answer("–í—ã –Ω–µ –º–æ–∂–µ—Ç–µ —É–¥–∞–ª–∏—Ç—å —ç—Ç—É –ø—É–±–ª–∏–∫–∞—Ü–∏—é", show_alert=True)
-            return
-        await callback.answer()
-        await callback.message.answer(
-            f"–£–±—Ä–∞—Ç—å <b>{html.escape(item['name'])}</b> –∏–∑ –æ–±—â–µ–≥–æ –∫–∞—Ç–∞–ª–æ–≥–∞? "
-            "–£–∂–µ —É—Å—Ç–∞–Ω–æ–≤–ª–µ–Ω–Ω—ã–µ –∫–æ–ø–∏–∏ —É –¥—Ä—É–≥–∏—Ö –ø–æ–ª—å–∑–æ–≤–∞—Ç–µ–ª–µ–π –æ—Å—Ç–∞–Ω—É—Ç—Å—è.",
-            reply_markup=keyboard([
-                [("–î–∞, —É–±—Ä–∞—Ç—å", f"catalog_unpublish_do:{uuid}")],
-                [("–û—Ç–º–µ–Ω–∞", f"plugin_info:{uuid}")],
-            ]),
-        )
-
-    @router.callback_query(F.data.startswith("catalog_unpublish_do:"))
-    async def catalog_unpublish_do(callback: CallbackQuery) -> None:
-        uuid = callback.data.split(":", 1)[1]
-        removed = await db.unpublish_catalog_plugin(callback.from_user.id, uuid)
-        await callback.answer("–ü—É–±–ª–∏–∫–∞—Ü–∏—è —É–¥–∞–ª–µ–Ω–∞" if removed else "–ü—É–±–ª–∏–∫–∞—Ü–∏—è –Ω–µ –Ω–∞–π–¥–µ–Ω–∞")
-        await callback.message.answer(
-            (
-                "‚úÖ –ü–ª–∞–≥–∏–Ω —É–±—Ä–∞–Ω –∏–∑ –∫–∞—Ç–∞–ª–æ–≥–∞. –í–∞—à–∞ —É—Å—Ç–∞–Ω–æ–≤–ª–µ–Ω–Ω–∞—è –∫–æ–ø–∏—è –Ω–µ –∏–∑–º–µ–Ω–µ–Ω–∞."
-                if removed
-                else "–ü—É–±–ª–∏–∫–∞—Ü–∏—è —É–∂–µ –æ—Ç—Å—É—Ç—Å—Ç–≤—É–µ—Ç –∏–ª–∏ –ø—Ä–∏–Ω–∞–¥–ª–µ–∂–∏—Ç –¥—Ä—É–≥–æ–º—É –ø–æ–ª—å–∑–æ–≤–∞—Ç–µ–ª—é."
-            ),
-            reply_markup=keyboard([[('‚¨ÖÔ∏è –ö –ø–ª–∞–≥–∏–Ω—É', f"plugin_info:{uuid}")]]),
-        )
-
-    @router.callback_query(F.data.startswith("plugin_toggle:"))
-    async def plugin_toggle(callback: CallbackQuery) -> None:
-        uuid = callback.data.split(":", 1)[1]
-        try:
-            enabled = await manager.plugins.toggle(callback.from_user.id, uuid)
-        except KeyError:
-            await callback.answer("–ü–ª–∞–≥–∏–Ω –Ω–µ –Ω–∞–π–¥–µ–Ω", show_alert=True)
-            return
-        await callback.answer("–ü–ª–∞–≥–∏–Ω –≤–∫–ª—é—á—ë–Ω" if enabled else "–ü–ª–∞–≥–∏–Ω –≤—ã–∫–ª—é—á–µ–Ω")
-        await show_my_plugins(callback.message, callback.from_user.id)
-
-    @router.callback_query(
-        F.data.startswith(f"{PLUGIN_SETTINGS_CALLBACK_PREFIX}:")
-    )
-    async def external_plugin_settings(callback: CallbackQuery) -> None:
-        parts = callback.data.split(":", 2)
-        uuid = parts[1] if len(parts) == 3 else ""
-        plugin_runtime = manager.plugins.runtimes.get(callback.from_user.id)
-        plugin = plugin_runtime.plugins.get(uuid) if plugin_runtime else None
-        if not plugin or not plugin.settings_page:
-            await callback.answer("–°—Ç—Ä–∞–Ω–∏—Ü–∞ –Ω–∞—Å—Ç—Ä–æ–µ–∫ –Ω–µ –Ω–∞–π–¥–µ–Ω–∞", show_alert=True)
-            return
-        if not plugin.enabled:
-            await callback.answer(
-                "–°–Ω–∞—á–∞–ª–∞ –≤–∫–ª—é—á–∏—Ç–µ –ø–ª–∞–≥–∏–Ω, –∑–∞—Ç–µ–º –æ—Ç–∫—Ä–æ–π—Ç–µ –Ω–∞—Å—Ç—Ä–æ–π–∫–∏.",
-                show_alert=True,
-            )
-            return
-        try:
-            handled = await manager.plugins.dispatch_telegram_callback(
-                callback.from_user.id, callback
-            )
-        except Exception:
-            logger.exception("–û—à–∏–±–∫–∞ —Å—Ç—Ä–∞–Ω–∏—Ü—ã –Ω–∞—Å—Ç—Ä–æ–µ–∫ –ø–ª–∞–≥–∏–Ω–∞ %s", uuid)
-            await callback.answer(
-                "–ü–ª–∞–≥–∏–Ω –∑–∞–≤–µ—Ä—à–∏–ª —Å—Ç—Ä–∞–Ω–∏—Ü—É –Ω–∞—Å—Ç—Ä–æ–µ–∫ —Å –æ—à–∏–±–∫–æ–π. –ü—Ä–æ–≤–µ—Ä—å—Ç–µ –∂—É—Ä–Ω–∞–ª.",
-                show_alert=True,
-            )
-            return
-        if not handled:
-            await callback.answer(
-                "–ê–≤—Ç–æ—Ä —É–∫–∞–∑–∞–ª SETTINGS_PAGE=True, –Ω–æ –Ω–µ –∑–∞—Ä–µ–≥–∏—Å—Ç—Ä–∏—Ä–æ–≤–∞–ª –æ–±—Ä–∞–±–æ—Ç—á–∏–∫ –Ω–∞—Å—Ç—Ä–æ–µ–∫.",
-                show_alert=True,
-            )
-
-    @router.callback_query(F.data.startswith("plugin_delete_ask:"))
-    async def plugin_delete_ask(callback: CallbackQuery) -> None:
-        uuid = callback.data.split(":", 1)[1]
-        await callback.answer()
-        await callback.message.answer(
-            "–£–¥–∞–ª–∏—Ç—å –ø–ª–∞–≥–∏–Ω, –µ–≥–æ –∏—Å—Ö–æ–¥–Ω–∏–∫ –∏ —Å–æ—Ö—Ä–∞–Ω—ë–Ω–Ω—É—é –∑–∞–ø–∏—Å—å?",
-            reply_markup=keyboard([
-                [("–î–∞, —É–¥–∞–ª–∏—Ç—å", f"plugin_delete_do:{uuid}")],
-                [("–û—Ç–º–µ–Ω–∞", f"plugin_info:{uuid}")],
-            ]),
-        )
-
-    @router.callback_query(F.data.startswith("plugin_delete_do:"))
-    async def plugin_delete_do(callback: CallbackQuery) -> None:
-        uuid = callback.data.split(":", 1)[1]
-        await callback.answer("–£–¥–∞–ª—è—é‚Ä¶")
-        try:
-            await manager.plugins.delete(callback.from_user.id, uuid, callback)
-        except Exception as exc:
-            logger.exception("–û—à–∏–±–∫–∞ –æ–±—Ä–∞–±–æ—Ç—á–∏–∫–∞ —É–¥–∞–ª–µ–Ω–∏—è –ø–ª–∞–≥–∏–Ω–∞")
-            await callback.message.answer(
-                f"‚ùå –ü–ª–∞–≥–∏–Ω –Ω–µ —É–¥–∞–ª—ë–Ω: {html.escape(clipped(exc, 500))}"
-            )
-            return
-        await callback.message.answer("‚úÖ –ü–ª–∞–≥–∏–Ω —É–¥–∞–ª—ë–Ω.")
-        await show_my_plugins(callback.message, callback.from_user.id)
-
-    async def require_builtin_plugin(
-        target: Message, user_id: int, uuid: str
-    ) -> AccountRuntime | None:
-        runtime = await require_runtime(target, user_id)
-        if not runtime:
-            return None
-        if not manager.plugins.is_enabled(user_id, uuid):
-            await target.answer(
-                "–ü–ª–∞–≥–∏–Ω –Ω–µ —É—Å—Ç–∞–Ω–æ–≤–ª–µ–Ω –∏–ª–∏ –≤—ã–∫–ª—é—á–µ–Ω.",
-                reply_markup=keyboard([[("üß≠ –ö–∞—Ç–∞–ª–æ–≥ –ø–ª–∞–≥–∏–Ω–æ–≤", "plugin_catalog:0")]]),
-            )
-            return None
-        return runtime
-
-    async def show_auto_lots_plugin(target: Message, user_id: int) -> None:
-        runtime = await require_builtin_plugin(target, user_id, AUTO_LOTS_PLUGIN_UUID)
-        if not runtime:
-            return
-        try:
-            _, common, currency = await asyncio.to_thread(
-                load_lot_inventory, runtime.account
-            )
-        except Exception:
-            logger.exception("–ù–µ —É–¥–∞–ª–æ—Å—å –ø–æ–ª—É—á–∏—Ç—å –ª–æ—Ç—ã –¥–ª—è AutoLotsPlugin")
-            await target.answer("‚ùå FunPay –Ω–µ –æ—Ç–¥–∞–ª —Å–ø–∏—Å–æ–∫ –ª–æ—Ç–æ–≤.")
-            return
-        all_lots = common + currency
-        active = sum(bool(lot.active) for lot in all_lots)
-        await target.answer(
-            "üóÇ <b>AutoLotsPlugin</b>\n\n"
-            f"–í—Å–µ–≥–æ –ø—Ä–µ–¥–ª–æ–∂–µ–Ω–∏–π: <b>{len(all_lots)}</b>\n"
-            f"–ê–∫—Ç–∏–≤–Ω–æ: <b>{active}</b> ¬∑ –≤—ã–∫–ª—é—á–µ–Ω–æ: <b>{len(all_lots) - active}</b>\n"
-            f"–û–±—ã—á–Ω—ã—Ö –ª–æ—Ç–æ–≤: <b>{len(common)}</b> ¬∑ –≤–∞–ª—é—Ç–Ω—ã—Ö: <b>{len(currency)}</b>\n\n"
-            "–ê–∫—Ç–∏–≤–∞—Ü–∏—è –∏ –¥–µ–∞–∫—Ç–∏–≤–∞—Ü–∏—è –ø—Ä–∏–º–µ–Ω—è—é—Ç—Å—è –∫ –æ–±–æ–∏–º —Ç–∏–ø–∞–º. –ü—Ä–∏ –º–∞—Å—Å–æ–≤–æ–º —É–¥–∞–ª–µ–Ω–∏–∏ "
-            "–æ–±—ã—á–Ω—ã–µ –ª–æ—Ç—ã —É–¥–∞–ª—è—é—Ç—Å—è, –∞ –≤–∞–ª—é—Ç–Ω—ã–µ –ø—Ä–µ–¥–ª–æ–∂–µ–Ω–∏—è –¥–µ–∞–∫—Ç–∏–≤–∏—Ä—É—é—Ç—Å—è, –ø–æ—Å–∫–æ–ª—å–∫—É FunPay "
-            "—Ö—Ä–∞–Ω–∏—Ç –∏—Ö –≥—Ä—É–ø–ø–∞–º–∏.",
-            reply_markup=keyboard([
-                [("‚úÖ –ê–∫—Ç–∏–≤–∏—Ä–æ–≤–∞—Ç—å –≤—Å–µ", "ready_lots:activate")],
-                [("‚õî –î–µ–∞–∫—Ç–∏–≤–∏—Ä–æ–≤–∞—Ç—å –≤—Å–µ", "ready_lots:deactivate")],
-                [("üóë –£–¥–∞–ª–∏—Ç—å –≤—Å–µ", "ready_lots:delete_ask")],
-                [("üîÑ –û–±–Ω–æ–≤–∏—Ç—å", f"builtin_open:{AUTO_LOTS_PLUGIN_UUID}")],
-                [("‚¨ÖÔ∏è –ú–æ–∏ –ø–ª–∞–≥–∏–Ω—ã", "my_plugins")],
-            ]),
-        )
-
-    async def show_status_plugin(target: Message, user_id: int) -> None:
-        if not await require_builtin_plugin(target, user_id, STATUS_PLUGIN_UUID):
-            return
-        status_text = await db.get_plugin_setting(
-            user_id,
-            STATUS_PLUGIN_UUID,
-            "status_text",
-            "üü¢ –ü—Ä–æ–¥–∞–≤–µ—Ü –Ω–∞ —Å–≤—è–∑–∏. –ú–æ–∂–µ—Ç–µ –æ—Ñ–æ—Ä–º–ª—è—Ç—å –∑–∞–∫–∞–∑.",
-        )
-        await target.answer(
-            "üì° <b>Status Plugin</b>\n\n"
-            "–ü–æ–∫—É–ø–∞—Ç–µ–ª—å –¥–æ–ª–∂–µ–Ω –æ—Ç–ø—Ä–∞–≤–∏—Ç—å –≤ –ª–∏—á–Ω–æ–º —á–∞—Ç–µ FunPay –∫–æ–º–∞–Ω–¥—É <code>#status</code>. "
-            "–ë–æ—Ç –æ—Ç–≤–µ—Ç–∏—Ç —Å–ª–µ–¥—É—é—â–∏–º —Ç–µ–∫—Å—Ç–æ–º:\n\n"
-            f"<blockquote>{html.escape(status_text)}</blockquote>\n"
-            "–í —Ç–µ–∫—Å—Ç–µ —Ä–∞–±–æ—Ç–∞—é—Ç –ø–µ—Ä–µ–º–µ–Ω–Ω—ã–µ –∞–≤—Ç–æ–æ—Ç–≤–µ—Ç—á–∏–∫–∞: $username, $chat_name, $account_name, $date –∏ $time.",
-            reply_markup=keyboard([
-                [("‚úèÔ∏è –ò–∑–º–µ–Ω–∏—Ç—å —Å—Ç–∞—Ç—É—Å", "ready_status:edit")],
-                [("‚¨ÖÔ∏è –ú–æ–∏ –ø–ª–∞–≥–∏–Ω—ã", "my_plugins")],
-            ]),
-        )
-
-    async def show_advanced_stats_plugin(target: Message, user_id: int) -> None:
-        if not await require_builtin_plugin(
-            target, user_id, ADVANCED_STATS_PLUGIN_UUID
-        ):
-            return
-        await target.answer(
-            "üìà <b>Advanced Profile Stats</b>\n\n"
-            "–í—ã–±–µ—Ä–∏—Ç–µ –ø–µ—Ä–∏–æ–¥. –ü–ª–∞–≥–∏–Ω –ø–æ—Å—á–∏—Ç–∞–µ—Ç –ø—Ä–æ–¥–∞–∂–∏ –∏ –≤—ã—Ä—É—á–∫—É, –∑–∞—Ç–µ–º –¥–æ–±–∞–≤–∏—Ç –∞–∫—Ç—É–∞–ª—å–Ω—ã–π "
-            "–±–∞–ª–∞–Ω—Å, –¥–æ—Å—Ç—É–ø–Ω—É—é –∫ –≤—ã–≤–æ–¥—É —Å—É–º–º—É –∏ —Å—Ä–µ–¥—Å—Ç–≤–∞ –Ω–∞ —É–¥–µ—Ä–∂–∞–Ω–∏–∏.",
-            reply_markup=keyboard([
-                [("24 —á–∞—Å–∞", "ready_stats:1"), ("7 –¥–Ω–µ–π", "ready_stats:7")],
-                [("30 –¥–Ω–µ–π", "ready_stats:30"), ("90 –¥–Ω–µ–π", "ready_stats:90")],
-                [("–ì–æ–¥", "ready_stats:365"), ("–í—Å—ë –≤—Ä–µ–º—è", "ready_stats:all")],
-                [("‚¨ÖÔ∏è –ú–æ–∏ –ø–ª–∞–≥–∏–Ω—ã", "my_plugins")],
-            ]),
-        )
-
-    @router.callback_query(F.data.startswith("builtin_open:"))
-    async def builtin_plugin_open(callback: CallbackQuery) -> None:
-        await callback.answer()
-        uuid = callback.data.split(":", 1)[1]
-        if uuid == AUTO_LOTS_PLUGIN_UUID:
-            await show_auto_lots_plugin(callback.message, callback.from_user.id)
-        elif uuid == ADVANCED_STATS_PLUGIN_UUID:
-            await show_advanced_stats_plugin(callback.message, callback.from_user.id)
-        elif uuid == STATUS_PLUGIN_UUID:
-            await show_status_plugin(callback.message, callback.from_user.id)
-        else:
-            await callback.message.answer("–î–ª—è —ç—Ç–æ–≥–æ –ø–ª–∞–≥–∏–Ω–∞ –Ω–µ—Ç –≤—Å—Ç—Ä–æ–µ–Ω–Ω–æ–π —Å—Ç—Ä–∞–Ω–∏—Ü—ã –Ω–∞—Å—Ç—Ä–æ–µ–∫.")
-
-    @router.callback_query(F.data.startswith("ready_lots:"))
-    async def ready_lots_action(callback: CallbackQuery) -> None:
-        action = callback.data.split(":", 1)[1]
-        runtime = await require_builtin_plugin(
-            callback.message, callback.from_user.id, AUTO_LOTS_PLUGIN_UUID
-        )
-        if not runtime:
-            await callback.answer()
-            return
-        if action == "delete_ask":
-            await callback.answer()
-            await callback.message.answer(
-                "‚ö†Ô∏è <b>–£–¥–∞–ª–∏—Ç—å –≤—Å–µ –æ–±—ã—á–Ω—ã–µ –ª–æ—Ç—ã?</b>\n\n"
-                "–û–ø–µ—Ä–∞—Ü–∏—è –Ω–µ–æ–±—Ä–∞—Ç–∏–º–∞. –í–∞–ª—é—Ç–Ω—ã–µ –ø—Ä–µ–¥–ª–æ–∂–µ–Ω–∏—è –±—É–¥—É—Ç –¥–µ–∞–∫—Ç–∏–≤–∏—Ä–æ–≤–∞–Ω—ã. "
-                "–ü—Ä–æ–¥–æ–ª–∂–∏—Ç—å?",
-                reply_markup=keyboard([
-                    [("–î–∞, —É–¥–∞–ª–∏—Ç—å –≤—Å–µ", "ready_lots:delete")],
-                    [("–û—Ç–º–µ–Ω–∞", f"builtin_open:{AUTO_LOTS_PLUGIN_UUID}")],
-                ]),
-            )
-            return
-        if action not in {"activate", "deactivate", "delete"}:
-            await callback.answer("–ù–µ–∏–∑–≤–µ—Å—Ç–Ω–æ–µ –¥–µ–π—Å—Ç–≤–∏–µ", show_alert=True)
-            return
-        await callback.answer("–í—ã–ø–æ–ª–Ω—è—é‚Ä¶")
-        progress = await callback.message.answer(
-            "‚è≥ –û–±—Ä–∞–±–∞—Ç—ã–≤–∞—é –ª–æ—Ç—ã –ø–æ—Å–ª–µ–¥–æ–≤–∞—Ç–µ–ª—å–Ω–æ. –≠—Ç–æ –º–æ–∂–µ—Ç –∑–∞–Ω—è—Ç—å –Ω–µ—Å–∫–æ–ª—å–∫–æ –º–∏–Ω—É—Ç."
-        )
-        try:
-            result = await asyncio.to_thread(
-                apply_bulk_lot_action, runtime.account, action
-            )
-        except Exception as exc:
-            logger.exception("–û—à–∏–±–∫–∞ –º–∞—Å—Å–æ–≤–æ–≥–æ —É–ø—Ä–∞–≤–ª–µ–Ω–∏—è –ª–æ—Ç–∞–º–∏")
-            await progress.edit_text(
-                f"‚ùå –û–ø–µ—Ä–∞—Ü–∏—è –Ω–µ –≤—ã–ø–æ–ª–Ω–µ–Ω–∞: {html.escape(clipped(exc, 600))}"
-            )
-            return
-        action_label = {
-            "activate": "–∞–∫—Ç–∏–≤–∏—Ä–æ–≤–∞–Ω–æ",
-            "deactivate": "–¥–µ–∞–∫—Ç–∏–≤–∏—Ä–æ–≤–∞–Ω–æ",
-            "delete": "—É–¥–∞–ª–µ–Ω–æ/–¥–µ–∞–∫—Ç–∏–≤–∏—Ä–æ–≤–∞–Ω–æ",
-        }[action]
-        errors = "\n".join(
-            f"‚Ä¢ {html.escape(error)}" for error in result.errors[:10]
-        )
-        error_text = (
-            f"\n\n–û—à–∏–±–æ–∫: <b>{len(result.errors)}</b>\n{errors}"
-            if result.errors
-            else ""
-        )
-        await progress.edit_text(
-            f"‚úÖ –ó–∞–≤–µ—Ä—à–µ–Ω–æ: {action_label} <b>{result.changed}</b> –ø—Ä–µ–¥–ª–æ–∂–µ–Ω–∏–π.\n"
-            f"–ù–∞–π–¥–µ–Ω–æ –æ–±—ã—á–Ω—ã—Ö: {result.common_total}, –≤–∞–ª—é—Ç–Ω—ã—Ö: {result.currency_total}"
-            f"{error_text}",
-            reply_markup=keyboard([
-                [("üîÑ –û–±–Ω–æ–≤–∏—Ç—å —Å–ø–∏—Å–æ–∫", f"builtin_open:{AUTO_LOTS_PLUGIN_UUID}")]
-            ]),
-        )
-
-    @router.callback_query(F.data.startswith("ready_stats:"))
-    async def ready_stats_period(callback: CallbackQuery) -> None:
-        runtime = await require_builtin_plugin(
-            callback.message, callback.from_user.id, ADVANCED_STATS_PLUGIN_UUID
-        )
-        if not runtime:
-            await callback.answer()
-            return
-        raw_period = callback.data.split(":", 1)[1]
-        days = None if raw_period == "all" else int(raw_period)
-        await callback.answer("–°–æ–±–∏—Ä–∞—é —Å—Ç–∞—Ç–∏—Å—Ç–∏–∫—É‚Ä¶")
-        try:
-            stats = await asyncio.to_thread(load_sales_stats, runtime.account, days)
-        except Exception:
-            logger.exception("Advanced Profile Stats –Ω–µ –ø–æ–ª—É—á–∏–ª –ø—Ä–æ–¥–∞–∂–∏")
-            await callback.message.answer("‚ùå FunPay –Ω–µ –æ—Ç–¥–∞–ª –∏—Å—Ç–æ—Ä–∏—é –ø—Ä–æ–¥–∞–∂.")
-            return
-        try:
-            balance = await asyncio.to_thread(load_detailed_balance, runtime.account)
-            balance_text = (
-                "\n\nüí≥ <b>–°—Ä–µ–¥—Å—Ç–≤–∞</b>\n"
-                f"–ú–æ–∂–Ω–æ –≤—ã–≤–µ—Å—Ç–∏: <b>{format_money(balance.available_rub)} ‚ÇΩ ¬∑ "
-                f"{format_money(balance.available_usd)} $ ¬∑ {format_money(balance.available_eur)} ‚Ç¨</b>\n"
-                f"–ù–∞ —É–¥–µ—Ä–∂–∞–Ω–∏–∏: {format_money(balance.total_rub - balance.available_rub)} ‚ÇΩ ¬∑ "
-                f"{format_money(balance.total_usd - balance.available_usd)} $ ¬∑ "
-                f"{format_money(balance.total_eur - balance.available_eur)} ‚Ç¨\n"
-                f"–í—Å–µ–≥–æ: {format_money(balance.total_rub)} ‚ÇΩ ¬∑ {format_money(balance.total_usd)} $ ¬∑ "
-                f"{format_money(balance.total_eur)} ‚Ç¨"
-            )
-        except Exception:
-            logger.exception("Advanced Profile Stats –Ω–µ –ø–æ–ª—É—á–∏–ª –±–∞–ª–∞–Ω—Å")
-            balance_text = "\n\n‚ö†Ô∏è –ù–µ —É–¥–∞–ª–æ—Å—å –∑–∞–≥—Ä—É–∑–∏—Ç—å –ø–æ–¥—Ä–æ–±–Ω—ã–π –±–∞–ª–∞–Ω—Å."
-        await callback.message.answer(
-            format_sales_stats(stats) + balance_text,
-            reply_markup=keyboard([
-                [("üìÖ –î—Ä—É–≥–æ–π –ø–µ—Ä–∏–æ–¥", f"builtin_open:{ADVANCED_STATS_PLUGIN_UUID}")]
-            ]),
-        )
-
-    @router.callback_query(F.data == "ready_status:edit")
-    async def ready_status_edit(callback: CallbackQuery, state: FSMContext) -> None:
-        if not await require_builtin_plugin(
-            callback.message, callback.from_user.id, STATUS_PLUGIN_UUID
-        ):
-            await callback.answer()
-            return
-        await callback.answer()
-        await state.clear()
-        await state.set_state(StatusPluginState.text)
-        await callback.message.answer(
-            "–û—Ç–ø—Ä–∞–≤—å—Ç–µ –Ω–æ–≤—ã–π —Ç–µ–∫—Å—Ç —Å—Ç–∞—Ç—É—Å–∞: –æ—Ç 1 –¥–æ 600 —Å–∏–º–≤–æ–ª–æ–≤. "
-            "–†–∞–∑—Ä–µ—à–µ–Ω—ã –ø–µ—Ä–µ–º–µ–Ω–Ω—ã–µ –∞–≤—Ç–æ–æ—Ç–≤–µ—Ç—á–∏–∫–∞. –î–ª—è –æ—Ç–º–µ–Ω—ã: /cancel"
-        )
-
-    @router.message(StatusPluginState.text, F.text)
-    async def ready_status_save(message: Message, state: FSMContext) -> None:
-        if not manager.plugins.is_enabled(message.from_user.id, STATUS_PLUGIN_UUID):
-            await state.clear()
-            await message.answer("Status Plugin –≤—ã–∫–ª—é—á–µ–Ω –∏–ª–∏ —É–¥–∞–ª—ë–Ω.")
-            return
-        value = message.text.strip()
-        if not 1 <= len(value) <= 600:
-            await message.answer("–¢–µ–∫—Å—Ç –¥–æ–ª–∂–µ–Ω —Å–æ–¥–µ—Ä–∂–∞—Ç—å –æ—Ç 1 –¥–æ 600 —Å–∏–º–≤–æ–ª–æ–≤.")
-            return
-        await db.set_plugin_setting(
-            message.from_user.id, STATUS_PLUGIN_UUID, "status_text", value
-        )
-        await state.clear()
-        await message.answer("‚úÖ –°—Ç–∞—Ç—É—Å —Å–æ—Ö—Ä–∞–Ω—ë–Ω.")
-        await show_status_plugin(message, message.from_user.id)
-
-    async def show_chat_carousel(target: Message, user_id: int, index: int) -> None:
-        runtime = await require_runtime(target, user_id)
-        if not runtime:
-            return
-        try:
-            chats_map = await asyncio.to_thread(runtime.account.get_chats, True)
-        except Exception:
-            logger.exception("–ù–µ —É–¥–∞–ª–æ—Å—å –ø–æ–ª—É—á–∏—Ç—å —á–∞—Ç—ã")
-            await target.answer("‚ùå –ù–µ —É–¥–∞–ª–æ—Å—å –ø–æ–ª—É—á–∏—Ç—å —Å–ø–∏—Å–æ–∫ —á–∞—Ç–æ–≤.")
-            return
-        chats_list = list(chats_map.values())
-        if not chats_list:
-            await target.answer("–ß–∞—Ç–æ–≤ –ø–æ–∫–∞ –Ω–µ—Ç.", reply_markup=keyboard([[("‚¨ÖÔ∏è –ú–µ–Ω—é", "menu")]]))
-            return
-        index %= len(chats_list)
-        chat = chats_list[index]
-        previous_index = (index - 1) % len(chats_list)
-        next_index = (index + 1) % len(chats_list)
-        unread = "üü† –µ—Å—Ç—å –Ω–µ–ø—Ä–æ—á–∏—Ç–∞–Ω–Ω—ã–µ" if chat.unread else "‚ö™ –ø—Ä–æ—á–∏—Ç–∞–Ω"
-        text = (
-            f"üí¨ <b>{html.escape(chat.name or '‚Äî')}</b>\n"
-            f"–ß–∞—Ç: <code>{chat.id}</code> ¬∑ {unread}\n"
-            f"–ü–æ–∑–∏—Ü–∏—è: <b>{index + 1}/{len(chats_list)}</b>\n\n"
-            f"<pre>{html.escape(clipped(chat.last_message_text or '[–∏–∑–æ–±—Ä–∞–∂–µ–Ω–∏–µ]', 1800))}</pre>"
-        )
-        markup = InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text="‚¨ÖÔ∏è", callback_data=f"chat_view:{previous_index}"),
-                InlineKeyboardButton(text=f"{index + 1}/{len(chats_list)}", callback_data="noop"),
-                InlineKeyboardButton(text="‚û°Ô∏è", callback_data=f"chat_view:{next_index}"),
-            ],
-            [InlineKeyboardButton(text="üìñ –í–µ—Å—å –∫—Ä–∞—Å–∏–≤—ã–π —á–∞—Ç", callback_data=f"chat_full:{chat.id}:{index}")],
-            [
-                InlineKeyboardButton(text="‚Ü©Ô∏è –û—Ç–≤–µ—Ç–∏—Ç—å", callback_data=f"reply:{chat.id}"),
-                InlineKeyboardButton(text="üì∑ –§–æ—Ç–æ", callback_data=f"image_chat:{chat.id}"),
-            ],
-            [
-                InlineKeyboardButton(text="üåê FunPay", url=f"https://funpay.com/chat/?node={chat.id}"),
-                InlineKeyboardButton(text="‚¨ÖÔ∏è –ú–µ–Ω—é", callback_data="menu"),
-            ],
-        ])
-        try:
-            await target.edit_text(text, reply_markup=markup)
-        except TelegramBadRequest:
-            await target.answer(text, reply_markup=markup)
-
-    @router.callback_query(F.data == "chats")
-    async def chats(callback: CallbackQuery) -> None:
-        await callback.answer("–ó–∞–≥—Ä—É–∂–∞—é‚Ä¶")
-        await show_chat_carousel(callback.message, callback.from_user.id, 0)
-
-    @router.callback_query(F.data.startswith("chat_view:"))
-    async def chat_view(callback: CallbackQuery) -> None:
-        await callback.answer()
-        await show_chat_carousel(callback.message, callback.from_user.id, int(callback.data.split(":")[1]))
-
-    @router.callback_query(F.data.startswith("chat_full:"))
-    async def chat_full(callback: CallbackQuery) -> None:
-        await callback.answer("–ó–∞–≥—Ä—É–∂–∞—é –∏—Å—Ç–æ—Ä–∏—é‚Ä¶")
-        _, raw_chat_id, raw_index = callback.data.split(":", 2)
-        runtime = await require_runtime(callback.message, callback.from_user.id)
-        if not runtime:
-            return
-        try:
-            chat, truncated = await asyncio.to_thread(
-                load_full_chat, runtime.account, int(raw_chat_id)
-            )
-            chunks = format_chat_history(chat, runtime.account.id)
-        except Exception:
-            logger.exception("–ù–µ —É–¥–∞–ª–æ—Å—å –ø–æ–ª—É—á–∏—Ç—å –ø–æ–ª–Ω—É—é –∏—Å—Ç–æ—Ä–∏—é —á–∞—Ç–∞ %s", raw_chat_id)
-            await callback.message.answer("‚ùå FunPay –Ω–µ –æ—Ç–¥–∞–ª –∏—Å—Ç–æ—Ä–∏—é —ç—Ç–æ–≥–æ —á–∞—Ç–∞.")
-            return
-        if truncated:
-            await callback.message.answer(
-                "‚ÑπÔ∏è –ü–æ–∫–∞–∑–∞–Ω—ã –ø–æ—Å–ª–µ–¥–Ω–∏–µ 2000 —Å–æ–æ–±—â–µ–Ω–∏–π: —ç—Ç–æ –∑–∞—â–∏—Ç–Ω—ã–π –ª–∏–º–∏—Ç –¥–ª—è –æ—á–µ–Ω—å –¥–ª–∏–Ω–Ω—ã—Ö —á–∞—Ç–æ–≤."
-            )
-        for index, chunk in enumerate(chunks):
-            markup = None
-            if index == len(chunks) - 1:
-                markup = keyboard([
-                    [("‚Ü©Ô∏è –û—Ç–≤–µ—Ç–∏—Ç—å", f"reply:{raw_chat_id}"), ("üì∑ –§–æ—Ç–æ", f"image_chat:{raw_chat_id}")],
-                    [("‚Ü©Ô∏è –ö –∫–∞—Ä—Ç–æ—á–∫–µ —á–∞—Ç–∞", f"chat_view:{raw_index}")],
-                ])
-            await callback.message.answer(chunk, reply_markup=markup, disable_web_page_preview=True)
-
-    @router.callback_query(F.data.startswith("reply:"))
-    async def reply_from_notification(callback: CallbackQuery, state: FSMContext) -> None:
-        await callback.answer()
-        chat_id = callback.data.split(":", 1)[1]
-        if not chat_id.isdigit() or not await require_runtime(callback.message, callback.from_user.id):
-            return
-        await state.clear()
-        await state.set_state(SendMessageState.text)
-        await state.update_data(chat_id=int(chat_id))
-        await callback.message.answer(
-            "–í–≤–µ–¥–∏—Ç–µ –æ—Ç–≤–µ—Ç –ø–æ–∫—É–ø–∞—Ç–µ–ª—é. –ú–æ–∂–Ω–æ –∏—Å–ø–æ–ª—å–∑–æ–≤–∞—Ç—å –ø–µ—Ä–µ–º–µ–Ω–Ω—ã–µ –∏–∑ —Ä–∞–∑–¥–µ–ª–∞ –∞–≤—Ç–æ–æ—Ç–≤–µ—Ç—á–∏–∫–∞ –∏–ª–∏ /cancel."
-        )
-
-    @router.callback_query(F.data == "send_message")
-    async def send_message_begin(callback: CallbackQuery, state: FSMContext) -> None:
-        await callback.answer()
-        if not await require_runtime(callback.message, callback.from_user.id):
-            return
-        await state.clear()
-        await state.set_state(SendMessageState.chat_id)
-        await callback.message.answer("–í–≤–µ–¥–∏—Ç–µ —á–∏—Å–ª–æ–≤–æ–π ID —á–∞—Ç–∞ –∏–∑ —Ä–∞–∑–¥–µ–ª–∞ ¬´–ü–æ—Å–ª–µ–¥–Ω–∏–µ —á–∞—Ç—ã¬ª –∏–ª–∏ /cancel.")
-
-    @router.message(SendMessageState.chat_id, F.text)
-    async def send_message_chat(message: Message, state: FSMContext) -> None:
-        value = message.text.strip()
-        if not value.isdigit():
-            await message.answer("ID —á–∞—Ç–∞ –¥–æ–ª–∂–µ–Ω —Å–æ—Å—Ç–æ—è—Ç—å –∏–∑ —Ü–∏—Ñ—Ä.")
-            return
-        await state.update_data(chat_id=int(value))
-        await state.set_state(SendMessageState.text)
-        await message.answer("–¢–µ–ø–µ—Ä—å –æ—Ç–ø—Ä–∞–≤—å—Ç–µ —Ç–µ–∫—Å—Ç —Å–æ–æ–±—â–µ–Ω–∏—è (–¥–æ 4000 —Å–∏–º–≤–æ–ª–æ–≤).")
-
-    @router.message(SendMessageState.text, F.text)
-    async def send_message_text(message: Message, state: FSMContext) -> None:
-        value = message.text.strip()
-        if not value or len(value) > 4000:
-            await message.answer("–¢–µ–∫—Å—Ç –¥–æ–ª–∂–µ–Ω —Å–æ–¥–µ—Ä–∂–∞—Ç—å –æ—Ç 1 –¥–æ 4000 —Å–∏–º–≤–æ–ª–æ–≤.")
-            return
-        runtime = await require_runtime(message, message.from_user.id)
-        if not runtime:
-            await state.clear()
-            return
-        data = await state.get_data()
-        chat = runtime.account.get_chat_by_id(data["chat_id"])
-        order = None
-        if data.get("order_id"):
-            try:
-                order = await asyncio.to_thread(runtime.account.get_order, data["order_id"])
-            except Exception:
-                logger.warning(
-                    "–ù–µ —É–¥–∞–ª–æ—Å—å –∑–∞–≥—Ä—É–∑–∏—Ç—å –∑–∞–∫–∞–∑ %s –¥–ª—è –ø–µ—Ä–µ–º–µ–Ω–Ω—ã—Ö —Å–æ–æ–±—â–µ–Ω–∏—è",
-                    data["order_id"],
-                    exc_info=True,
-                )
-        rendered = render_template(
-            value,
-            account=runtime.account,
-            chat_id=data["chat_id"],
-            chat_name=chat.name if chat else None,
-            order=order,
-        )
-        try:
-            await asyncio.to_thread(
-                runtime.account.send_message,
-                data["chat_id"],
-                rendered,
-                chat.name if chat else None,
-            )
-        except Exception as exc:
-            logger.exception("–†—É—á–Ω–æ–µ —Å–æ–æ–±—â–µ–Ω–∏–µ –Ω–µ –æ—Ç–ø—Ä–∞–≤–ª–µ–Ω–æ")
-            await message.answer(f"‚ùå FunPay –Ω–µ –æ—Ç–ø—Ä–∞–≤–∏–ª —Å–æ–æ–±—â–µ–Ω–∏–µ: {html.escape(clipped(exc, 300))}")
-            return
-        chat_id = data["chat_id"]
-        await state.clear()
-        await message.answer(
-            "‚úÖ –°–æ–æ–±—â–µ–Ω–∏–µ –æ—Ç–ø—Ä–∞–≤–ª–µ–Ω–æ. –ú–æ–∂–Ω–æ –ø—Ä–æ–¥–æ–ª–∂–∏—Ç—å –ø–µ—Ä–µ–ø–∏—Å–∫—É –∏–ª–∏ –æ—Ç–∫—Ä—ã—Ç—å –≤–µ—Å—å –¥–∏–∞–ª–æ–≥.",
-            reply_markup=conversation_actions_keyboard(chat_id),
-        )
-
-    async def ask_for_image(target: Message, state: FSMContext, state_value: State, destination: str) -> None:
-        await state.set_state(state_value)
-        await target.answer(
-            f"–û—Ç–ø—Ä–∞–≤—å—Ç–µ –∏–∑–æ–±—Ä–∞–∂–µ–Ω–∏–µ –¥–ª—è {destination} –∫–∞–∫ —Ñ–æ—Ç–æ –∏–ª–∏ –≥—Ä–∞—Ñ–∏—á–µ—Å–∫–∏–π —Ñ–∞–π–ª –¥–æ 20 –ú–ë. –î–ª—è –æ—Ç–º–µ–Ω—ã: /cancel"
-        )
-
-    async def download_telegram_image(message: Message) -> bytes | None:
-        file_obj = message.photo[-1] if message.photo else message.document
-        if not file_obj:
-            await message.answer("‚ùå –û—Ç–ø—Ä–∞–≤—å—Ç–µ —Ñ–æ—Ç–æ –∏–ª–∏ —Ñ–∞–π–ª –∏–∑–æ–±—Ä–∞–∂–µ–Ω–∏—è.")
-            return None
-        if message.document and not (message.document.mime_type or "").startswith("image/"):
-            await message.answer("‚ùå –î–æ–∫—É–º–µ–Ω—Ç –¥–æ–ª–∂–µ–Ω –±—ã—Ç—å –∏–∑–æ–±—Ä–∞–∂–µ–Ω–∏–µ–º PNG, JPG, WEBP –∏–ª–∏ GIF.")
-            return None
-        if file_obj.file_size and file_obj.file_size >= 20 * 1024 * 1024:
-            await message.answer("‚ùå –†–∞–∑–º–µ—Ä –∏–∑–æ–±—Ä–∞–∂–µ–Ω–∏—è –¥–æ–ª–∂–µ–Ω –±—ã—Ç—å –º–µ–Ω—å—à–µ 20 –ú–ë.")
-            return None
-        buffer = BytesIO()
-        await message.bot.download(file_obj, destination=buffer)
-        return buffer.getvalue()
-
-    @router.callback_query(F.data == "images")
-    async def images_menu(callback: CallbackQuery) -> None:
-        await callback.answer()
-        await callback.message.answer(
-            "üñº <b>–ò–∑–æ–±—Ä–∞–∂–µ–Ω–∏—è FunPay</b>\n\n"
-            "–§–æ—Ç–æ –º–æ–∂–Ω–æ —Å—Ä–∞–∑—É –æ—Ç–ø—Ä–∞–≤–∏—Ç—å –ø–æ–∫—É–ø–∞—Ç–µ–ª—é –ª–∏–±–æ –∑–∞–≥—Ä—É–∑–∏—Ç—å –∏ –ø—Ä–∏–∫—Ä–µ–ø–∏—Ç—å –∫ —Å—É—â–µ—Å—Ç–≤—É—é—â–µ–º—É –ª–æ—Ç—É.",
-            reply_markup=keyboard([
-                [("üí¨ –û—Ç–ø—Ä–∞–≤–∏—Ç—å –≤ —á–∞—Ç", "image_chat_begin")],
-                [("üõí –î–æ–±–∞–≤–∏—Ç—å –≤ –ª–æ—Ç", "image_lot_begin")],
-                [("‚¨ÖÔ∏è –ú–µ–Ω—é", "menu")],
-            ]),
-        )
-
-    @router.callback_query(F.data == "image_chat_begin")
-    async def image_chat_begin(callback: CallbackQuery, state: FSMContext) -> None:
-        await callback.answer()
-        await state.set_state(UploadImageState.chat_id)
-        await callback.message.answer("–í–≤–µ–¥–∏—Ç–µ —á–∏—Å–ª–æ–≤–æ–π ID —á–∞—Ç–∞, –∫—É–¥–∞ –æ—Ç–ø—Ä–∞–≤–∏—Ç—å –∏–∑–æ–±—Ä–∞–∂–µ–Ω–∏–µ.")
-
-    @router.message(UploadImageState.chat_id, F.text)
-    async def image_chat_id(message: Message, state: FSMContext) -> None:
-        if not message.text.strip().isdigit():
-            await message.answer("ID —á–∞—Ç–∞ –¥–æ–ª–∂–µ–Ω —Å–æ—Å—Ç–æ—è—Ç—å –∏–∑ —Ü–∏—Ñ—Ä.")
-            return
-        await state.update_data(chat_id=int(message.text.strip()))
-        await ask_for_image(message, state, UploadImageState.chat_file, "—á–∞—Ç–∞")
-
-    @router.callback_query(F.data.startswith("image_chat:"))
-    async def image_chat_direct(callback: CallbackQuery, state: FSMContext) -> None:
-        await callback.answer()
-        chat_id = callback.data.split(":", 1)[1]
-        if not chat_id.isdigit():
-            return
-        await state.update_data(chat_id=int(chat_id))
-        await ask_for_image(callback.message, state, UploadImageState.chat_file, "—á–∞—Ç–∞")
-
-    @router.message(UploadImageState.chat_file)
-    async def image_chat_file(message: Message, state: FSMContext) -> None:
-        runtime = await require_runtime(message, message.from_user.id)
-        if not runtime:
-            await state.clear()
-            return
-        image_data = await download_telegram_image(message)
-        if image_data is None:
-            return
-        data = await state.get_data()
-        try:
-            await asyncio.to_thread(runtime.account.send_image, data["chat_id"], image_data)
-        except Exception as exc:
-            logger.exception("–ù–µ —É–¥–∞–ª–æ—Å—å –æ—Ç–ø—Ä–∞–≤–∏—Ç—å –∏–∑–æ–±—Ä–∞–∂–µ–Ω–∏–µ –≤ —á–∞—Ç")
-            await message.answer(f"‚ùå FunPay –Ω–µ –ø—Ä–∏–Ω—è–ª –∏–∑–æ–±—Ä–∞–∂–µ–Ω–∏–µ: {html.escape(clipped(exc, 400))}")
-            return
-        chat_id = data["chat_id"]
-        await state.clear()
-        await message.answer(
-            "‚úÖ –ò–∑–æ–±—Ä–∞–∂–µ–Ω–∏–µ –æ—Ç–ø—Ä–∞–≤–ª–µ–Ω–æ –≤ —á–∞—Ç FunPay.",
-            reply_markup=conversation_actions_keyboard(chat_id),
-        )
-
-    @router.callback_query(F.data == "image_lot_begin")
-    async def image_lot_begin(callback: CallbackQuery, state: FSMContext) -> None:
-        await callback.answer()
-        await state.set_state(UploadImageState.lot_id)
-        await callback.message.answer("–í–≤–µ–¥–∏—Ç–µ ID —Å—É—â–µ—Å—Ç–≤—É—é—â–µ–≥–æ –ª–æ—Ç–∞, –∫ –∫–æ—Ç–æ—Ä–æ–º—É –¥–æ–±–∞–≤–∏—Ç—å –∏–∑–æ–±—Ä–∞–∂–µ–Ω–∏–µ.")
-
-    @router.message(UploadImageState.lot_id, F.text)
-    async def image_lot_id(message: Message, state: FSMContext) -> None:
-        if not message.text.strip().isdigit():
-            await message.answer("ID –ª–æ—Ç–∞ –¥–æ–ª–∂–µ–Ω —Å–æ—Å—Ç–æ—è—Ç—å –∏–∑ —Ü–∏—Ñ—Ä.")
-            return
-        await state.update_data(lot_id=int(message.text.strip()))
-        await ask_for_image(message, state, UploadImageState.lot_file, "–ª–æ—Ç–∞")
-
-    @router.message(UploadImageState.lot_file)
-    async def image_lot_file(message: Message, state: FSMContext) -> None:
-        runtime = await require_runtime(message, message.from_user.id)
-        if not runtime:
-            await state.clear()
-            return
-        image_data = await download_telegram_image(message)
-        if image_data is None:
-            return
-        data = await state.get_data()
-        try:
-            image_id = await asyncio.to_thread(runtime.account.upload_image, image_data, "offer")
-            lot_fields = await asyncio.to_thread(runtime.account.get_lot_fields, data["lot_id"])
-            if image_id not in lot_fields.images:
-                lot_fields.images.append(image_id)
-            await asyncio.to_thread(runtime.account.save_lot, lot_fields.renew_fields())
-        except Exception as exc:
-            logger.exception("–ù–µ —É–¥–∞–ª–æ—Å—å –¥–æ–±–∞–≤–∏—Ç—å –∏–∑–æ–±—Ä–∞–∂–µ–Ω–∏–µ –∫ –ª–æ—Ç—É")
-            await message.answer(f"‚ùå –ù–µ —É–¥–∞–ª–æ—Å—å –æ–±–Ω–æ–≤–∏—Ç—å –ª–æ—Ç: {html.escape(clipped(exc, 400))}")
-            return
-        await state.clear()
-        await message.answer(
-            f"‚úÖ –ò–∑–æ–±—Ä–∞–∂–µ–Ω–∏–µ <code>{image_id}</code> –¥–æ–±–∞–≤–ª–µ–Ω–æ –∫ –ª–æ—Ç—É <code>{data['lot_id']}</code>.",
-            reply_markup=main_keyboard(),
-        )
-
-    @router.callback_query(F.data == "noop")
-    async def noop(callback: CallbackQuery) -> None:
-        await callback.answer()
-
-    async def show_order(target: Message, user_id: int, order_id: str) -> None:
-        runtime = await require_runtime(target, user_id)
-        if not runtime:
-            return
-        try:
-            order = await asyncio.to_thread(runtime.account.get_order, order_id)
-            if runtime.account.id not in {order.seller_id, order.buyer_id}:
-                raise RuntimeError("–∑–∞–∫–∞–∑ –Ω–µ –ø—Ä–∏–Ω–∞–¥–ª–µ–∂–∏—Ç –ø–æ–¥–∫–ª—é—á—ë–Ω–Ω–æ–º—É –∞–∫–∫–∞—É–Ω—Ç—É")
-        except Exception as exc:
-            logger.exception("–ù–µ —É–¥–∞–ª–æ—Å—å –ø–æ–ª—É—á–∏—Ç—å –∑–∞–∫–∞–∑ %s", order_id)
-            await target.answer(
-                f"‚ùå –ù–µ —É–¥–∞–ª–æ—Å—å –∑–∞–≥—Ä—É–∑–∏—Ç—å –∑–∞–∫–∞–∑: {html.escape(clipped(exc, 400))}",
-                reply_markup=keyboard([[("‚¨ÖÔ∏è –ú–µ–Ω—é", "menu")]]),
-            )
-            return
-
-        buttons: list[list[InlineKeyboardButton]] = []
-        if str(order.chat_id).isdigit():
-            buttons.append([
-                InlineKeyboardButton(
-                    text="‚Ü©Ô∏è –û—Ç–≤–µ—Ç–∏—Ç—å", callback_data=f"order_reply:{order.id}"
-                ),
-                InlineKeyboardButton(text="üí¨ –í–µ—Å—å —á–∞—Ç", callback_data=f"chat_full:{order.chat_id}:0"),
-            ])
-        if order.seller_id == runtime.account.id and order.status is types.OrderStatuses.PAID:
-            buttons.append([
-                InlineKeyboardButton(text="üí∏ –í–µ—Ä–Ω—É—Ç—å –¥–µ–Ω—å–≥–∏", callback_data=f"refund_ask:{order.id}")
-            ])
-        buttons.append([
-            InlineKeyboardButton(text="üåê –û—Ç–∫—Ä—ã—Ç—å –Ω–∞ FunPay", url=f"https://funpay.com/orders/{order.id}/")
-        ])
-        buttons.append([InlineKeyboardButton(text="‚¨ÖÔ∏è –ú–µ–Ω—é", callback_data="menu")])
-        await target.answer(
-            format_order(order),
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
-            disable_web_page_preview=True,
-        )
-
-    @router.callback_query(F.data == "order_lookup")
-    async def order_lookup(callback: CallbackQuery, state: FSMContext) -> None:
-        await callback.answer()
-        if not await require_runtime(callback.message, callback.from_user.id):
-            return
-        await state.set_state(OrderState.order_id)
-        await callback.message.answer("–í–≤–µ–¥–∏—Ç–µ ID –∑–∞–∫–∞–∑–∞ –±–µ–∑ —Å–∏–º–≤–æ–ª–∞ #. –î–ª—è –æ—Ç–º–µ–Ω—ã: /cancel")
-
-    @router.message(OrderState.order_id, F.text)
-    async def order_lookup_id(message: Message, state: FSMContext) -> None:
-        order_id = message.text.strip().removeprefix("#")
-        if not re.fullmatch(r"[A-Za-z0-9_-]{4,40}", order_id):
-            await message.answer("ID –∑–∞–∫–∞–∑–∞ –≤—ã–≥–ª—è–¥–∏—Ç –Ω–µ–∫–æ—Ä—Ä–µ–∫—Ç–Ω–æ. –í–≤–µ–¥–∏—Ç–µ –µ–≥–æ –µ—â—ë —Ä–∞–∑ –∏–ª–∏ –Ω–∞–∂–º–∏—Ç–µ /cancel.")
-            return
-        await state.clear()
-        await show_order(message, message.from_user.id, order_id)
-
-    @router.callback_query(F.data.startswith("order_view:"))
-    async def order_view(callback: CallbackQuery) -> None:
-        await callback.answer("–ó–∞–≥—Ä—É–∂–∞—é –∑–∞–∫–∞–∑‚Ä¶")
-        order_id = callback.data.split(":", 1)[1]
-        await show_order(callback.message, callback.from_user.id, order_id)
-
-    @router.callback_query(F.data.startswith("order_reply:"))
-    async def order_reply(callback: CallbackQuery, state: FSMContext) -> None:
-        await callback.answer("–ó–∞–≥—Ä—É–∂–∞—é –∑–∞–∫–∞–∑‚Ä¶")
-        order_id = callback.data.split(":", 1)[1]
-        runtime = await require_runtime(callback.message, callback.from_user.id)
-        if not runtime:
-            return
-        try:
-            order = await asyncio.to_thread(runtime.account.get_order, order_id)
-            if runtime.account.id not in {order.seller_id, order.buyer_id}:
-                raise RuntimeError("–∑–∞–∫–∞–∑ –Ω–µ –ø—Ä–∏–Ω–∞–¥–ª–µ–∂–∏—Ç –ø–æ–¥–∫–ª—é—á—ë–Ω–Ω–æ–º—É –∞–∫–∫–∞—É–Ω—Ç—É")
-            if not str(order.chat_id).isdigit():
-                raise RuntimeError("—É –∑–∞–∫–∞–∑–∞ –Ω–µ—Ç –ª–∏—á–Ω–æ–≥–æ —á–∞—Ç–∞")
-        except Exception as exc:
-            logger.warning("–ù–µ —É–¥–∞–ª–æ—Å—å –æ—Ç–∫—Ä—ã—Ç—å –æ—Ç–≤–µ—Ç –ø–æ –∑–∞–∫–∞–∑—É %s", order_id, exc_info=True)
-            await callback.message.answer(
-                f"‚ùå –ù–µ–ª—å–∑—è –æ—Ç–∫—Ä—ã—Ç—å –æ—Ç–≤–µ—Ç –ø–æ –∑–∞–∫–∞–∑—É: {html.escape(clipped(exc, 400))}"
-            )
-            return
-        await state.clear()
-        await state.set_state(SendMessageState.text)
-        await state.update_data(chat_id=int(order.chat_id), order_id=order.id)
-        await callback.message.answer(
-            "–í–≤–µ–¥–∏—Ç–µ –æ—Ç–≤–µ—Ç –ø–æ–∫—É–ø–∞—Ç–µ–ª—é. –ü–µ—Ä–µ–º–µ–Ω–Ω—ã–µ –∑–∞–∫–∞–∑–∞ –∏ —á–∞—Ç–∞ –±—É–¥—É—Ç –ø–æ–¥—Å—Ç–∞–≤–ª–µ–Ω—ã –∞–≤—Ç–æ–º–∞—Ç–∏—á–µ—Å–∫–∏."
-        )
-
-    @router.callback_query(F.data.startswith("review_manual:"))
-    async def review_manual(callback: CallbackQuery, state: FSMContext) -> None:
-        await callback.answer()
-        order_id = callback.data.split(":", 1)[1]
-        if not await require_runtime(callback.message, callback.from_user.id):
-            return
-        await state.clear()
-        await state.update_data(order_id=order_id)
-        await state.set_state(ReviewReplyState.text)
-        await callback.message.answer(
-            "–í–≤–µ–¥–∏—Ç–µ –æ—Ç–≤–µ—Ç –Ω–∞ –æ—Ç–∑—ã–≤ –¥–æ 999 —Å–∏–º–≤–æ–ª–æ–≤. –ú–æ–∂–Ω–æ –∏—Å–ø–æ–ª—å–∑–æ–≤–∞—Ç—å –ø–µ—Ä–µ–º–µ–Ω–Ω—ã–µ. –î–ª—è –æ—Ç–º–µ–Ω—ã: /cancel"
-        )
-
-    @router.message(ReviewReplyState.text, F.text)
-    async def review_manual_text(message: Message, state: FSMContext) -> None:
-        runtime = await require_runtime(message, message.from_user.id)
-        if not runtime:
-            await state.clear()
-            return
-        data = await state.get_data()
-        try:
-            order = await asyncio.to_thread(runtime.account.get_order, data["order_id"])
-            if order.seller_id != runtime.account.id or not order.review:
-                raise RuntimeError("—É –∑–∞–∫–∞–∑–∞ –Ω–µ—Ç –¥–æ—Å—Ç—É–ø–Ω–æ–≥–æ –æ—Ç–∑—ã–≤–∞ –ø–æ–∫—É–ø–∞—Ç–µ–ª—è")
-            text = normalize_review_reply(
-                render_template(
-                    message.text,
-                    order=order,
-                    review=order.review,
-                    account=runtime.account,
-                )
-            )
-            if not text:
-                raise RuntimeError("–æ—Ç–≤–µ—Ç –Ω–µ –º–æ–∂–µ—Ç –±—ã—Ç—å –ø—É—Å—Ç—ã–º")
-            await asyncio.to_thread(runtime.account.send_review, order.id, text)
-        except Exception as exc:
-            logger.exception("–ù–µ —É–¥–∞–ª–æ—Å—å –æ—Ç–ø—Ä–∞–≤–∏—Ç—å —Ä—É—á–Ω–æ–π –æ—Ç–≤–µ—Ç –Ω–∞ –æ—Ç–∑—ã–≤")
-            await message.answer(
-                f"‚ùå –û—Ç–≤–µ—Ç –Ω–µ –æ—Ç–ø—Ä–∞–≤–ª–µ–Ω: {html.escape(clipped(exc, 500))}"
-            )
-            return
-        order_id = data["order_id"]
-        await state.clear()
-        await message.answer(
-            "‚úÖ –û—Ç–≤–µ—Ç –Ω–∞ –æ—Ç–∑—ã–≤ –æ—Ç–ø—Ä–∞–≤–ª–µ–Ω.",
-            reply_markup=keyboard([
-                [("üì¶ –û—Ç–∫—Ä—ã—Ç—å –∑–∞–∫–∞–∑", f"order_view:{order_id}")],
-                [("‚≠ê –ù–∞—Å—Ç—Ä–æ–π–∫–∏ –∞–≤—Ç–æ–æ—Ç–≤–µ—Ç–æ–≤", "review_replies")],
-            ]),
-        )
-
-    @router.callback_query(F.data.startswith("refund_ask:"))
-    async def refund_ask(callback: CallbackQuery) -> None:
-        order_id = callback.data.split(":", 1)[1]
-        await callback.answer()
-        await callback.message.answer(
-            f"‚ö†Ô∏è –í–µ—Ä–Ω—É—Ç—å –ø–æ–∫—É–ø–∞—Ç–µ–ª—é –≤—Å—é —Å—É–º–º—É –∑–∞–∫–∞–∑–∞ <code>{html.escape(order_id)}</code>?\n"
-            "–î–µ–π—Å—Ç–≤–∏–µ –≤—ã–ø–æ–ª–Ω—è–µ—Ç—Å—è –Ω–∞ FunPay –∏ –Ω–µ–æ–±—Ä–∞—Ç–∏–º–æ.",
-            reply_markup=keyboard([
-                [("–î–∞, –≤–µ—Ä–Ω—É—Ç—å –¥–µ–Ω—å–≥–∏", f"refund_do:{order_id}")],
-                [("–û—Ç–º–µ–Ω–∞", f"refund_cancel:{order_id}")],
-            ]),
-        )
-
-    @router.callback_query(F.data.startswith("refund_cancel:"))
-    async def refund_cancel(callback: CallbackQuery) -> None:
-        await callback.answer("–í–æ–∑–≤—Ä–∞—Ç –æ—Ç–º–µ–Ω—ë–Ω")
-        await callback.message.edit_text("–í–æ–∑–≤—Ä–∞—Ç –æ—Ç–º–µ–Ω—ë–Ω.")
-
-    @router.callback_query(F.data.startswith("refund_do:"))
-    async def refund_do(callback: CallbackQuery) -> None:
-        order_id = callback.data.split(":", 1)[1]
-        await callback.answer("–ü—Ä–æ–≤–µ—Ä—è—é –∑–∞–∫–∞–∑‚Ä¶")
-        runtime = await require_runtime(callback.message, callback.from_user.id)
-        if not runtime:
-            return
-        try:
-            order = await asyncio.to_thread(runtime.account.get_order, order_id)
-            if order.seller_id != runtime.account.id:
-                raise RuntimeError("–∑–∞–∫–∞–∑ –Ω–µ –ø—Ä–∏–Ω–∞–¥–ª–µ–∂–∏—Ç –ø–æ–¥–∫–ª—é—á—ë–Ω–Ω–æ–º—É –ø—Ä–æ–¥–∞–≤—Ü—É")
-            if order.status is not types.OrderStatuses.PAID:
-                raise RuntimeError(f"–≤–æ–∑–≤—Ä–∞—Ç –Ω–µ–¥–æ—Å—Ç—É–ø–µ–Ω –¥–ª—è —Å—Ç–∞—Ç—É—Å–∞ {order.status.name}")
-            await asyncio.to_thread(runtime.account.refund, order_id)
-        except Exception as exc:
-            logger.exception("–í–æ–∑–≤—Ä–∞—Ç –∑–∞–∫–∞–∑–∞ %s –Ω–µ –≤—ã–ø–æ–ª–Ω–µ–Ω", order_id)
-            await callback.message.edit_text(
-                f"‚ùå –í–æ–∑–≤—Ä–∞—Ç –∑–∞–∫–∞–∑–∞ <code>{html.escape(order_id)}</code> –Ω–µ –≤—ã–ø–æ–ª–Ω–µ–Ω: "
-                f"{html.escape(clipped(exc, 500))}"
-            )
-            return
-        await callback.message.edit_text(
-            f"‚úÖ –î–µ–Ω—å–≥–∏ –ø–æ –∑–∞–∫–∞–∑—É <code>{html.escape(order_id)}</code> –≤–æ–∑–≤—Ä–∞—â–µ–Ω—ã –ø–æ–∫—É–ø–∞—Ç–µ–ª—é.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="üåê –û—Ç–∫—Ä—ã—Ç—å –∑–∞–∫–∞–∑", url=f"https://funpay.com/orders/{order_id}/")
-            ]]),
-        )
-
-    async def show_account(target: Message, user_id: int) -> None:
-        row = await db.get_user(user_id)
-        account_row = await db.get_active_marketplace_account(user_id, "funpay")
-        accounts = await db.list_marketplace_accounts(user_id, "funpay")
-        if not row or not account_row:
-            await target.answer("–ê–∫–∫–∞—É–Ω—Ç –Ω–µ –ø–æ–¥–∫–ª—é—á—ë–Ω.", reply_markup=keyboard([[("üîó –ü–æ–¥–∫–ª—é—á–∏—Ç—å", "connect")]]))
-            return
-        try:
-            proxy = proxy_label(secrets.decrypt(account_row["proxy_enc"]))
-        except (InvalidToken, ValueError, TypeError):
-            proxy = "–Ω–µ —É–¥–∞–ª–æ—Å—å —Ä–∞—Å—à–∏—Ñ—Ä–æ–≤–∞—Ç—å"
-        status = "üü¢ —Ä–∞–±–æ—Ç–∞–µ—Ç" if manager.get(user_id) else "üî¥ –æ—Å—Ç–∞–Ω–æ–≤–ª–µ–Ω"
-        await target.answer(
-            "‚öôÔ∏è <b>–ê–∫–∫–∞—É–Ω—Ç</b>\n"
-            f"FunPay: <b>{html.escape(account_row['username'] or '‚Äî')}</b> "
-            f"(<code>{account_row['external_id']}</code>)\n"
-            f"–í—Å–µ–≥–æ –∞–∫–∫–∞—É–Ω—Ç–æ–≤: <b>{len(accounts)}</b>\n"
-            f"–ü—Ä–æ–∫—Å–∏: <code>{html.escape(proxy)}</code>\n"
-            f"Runner: {status}\n"
-            f"–í–µ—á–Ω—ã–π –æ–Ω–ª–∞–π–Ω / –æ–±–Ω–æ–≤–ª–µ–Ω–∏–µ —Å–µ—Å—Å–∏–∏: {bool_icon(row['keep_online_enabled'])}",
-            reply_markup=keyboard([
-                [(f"{bool_icon(row['keep_online_enabled'])} –ü–æ–¥–¥–µ—Ä–∂–∏–≤–∞—Ç—å —Å–µ—Å—Å–∏—é", "toggle:keep_online_enabled")],
-                [("üë• –ü–µ—Ä–µ–∫–ª—é—á–∏—Ç—å –∞–∫–∫–∞—É–Ω—Ç", "account_switch:funpay")],
-                [("‚ûï –î–æ–±–∞–≤–∏—Ç—å", "connect"), ("üîÑ –ü–µ—Ä–µ–ø–æ–¥–∫–ª—é—á–∏—Ç—å", "reconnect")],
-                [("üîë –ò–∑–º–µ–Ω–∏—Ç—å –¥–∞–Ω–Ω—ã–µ", "connect")],
-                [("üóë –û—Ç–∫–ª—é—á–∏—Ç—å –∞–∫–∫–∞—É–Ω—Ç", "disconnect_confirm")],
-                [("‚¨ÖÔ∏è –ú–µ–Ω—é", "menu")],
-            ]),
-        )
-
-    @router.callback_query(F.data == "account")
-    async def account(callback: CallbackQuery) -> None:
-        await callback.answer()
-        await show_account(callback.message, callback.from_user.id)
-
-    @router.callback_query(F.data == "reconnect")
-    async def reconnect(callback: CallbackQuery) -> None:
-        await callback.answer("–ü–µ—Ä–µ–ø–æ–¥–∫–ª—é—á–∞—é‚Ä¶")
-        try:
-            account_row = await db.get_active_marketplace_account(
-                callback.from_user.id, "funpay"
-            )
-            if not account_row:
-                raise RuntimeError("–∞–∫–∫–∞—É–Ω—Ç –Ω–µ –Ω–∞–π–¥–µ–Ω")
-            await manager.start(callback.from_user.id, row=account_row)
-        except Exception as exc:
-            logger.exception("–ü–µ—Ä–µ–ø–æ–¥–∫–ª—é—á–µ–Ω–∏–µ –Ω–µ —É–¥–∞–ª–æ—Å—å")
-            await callback.message.answer(
-                f"‚ùå –ü–µ—Ä–µ–ø–æ–¥–∫–ª—é—á–∏—Ç—å—Å—è –Ω–µ —É–¥–∞–ª–æ—Å—å. {funpay_connection_error_message(exc)}"
-            )
-            return
-        await callback.message.answer("‚úÖ –ü–æ–¥–∫–ª—é—á–µ–Ω–∏–µ –≤–æ—Å—Å—Ç–∞–Ω–æ–≤–ª–µ–Ω–æ.")
-        await show_main(callback.message, callback.from_user.id)
-
-    @router.callback_query(F.data == "disconnect_confirm")
-    async def disconnect_confirm(callback: CallbackQuery) -> None:
-        await callback.answer()
-        await callback.message.answer(
-            "–£–¥–∞–ª–∏—Ç—å —Å–æ—Ö—Ä–∞–Ω—ë–Ω–Ω—ã–µ –ø—Ä–æ–∫—Å–∏ –∏ golden_key –∏ –æ—Å—Ç–∞–Ω–æ–≤–∏—Ç—å –∞–≤—Ç–æ–º–∞—Ç–∏–∑–∞—Ü–∏—é?",
-            reply_markup=keyboard([[("–î–∞, –æ—Ç–∫–ª—é—á–∏—Ç—å", "disconnect"), ("–ù–µ—Ç", "account")]]),
-        )
-
-    @router.callback_query(F.data == "disconnect")
-    async def disconnect(callback: CallbackQuery, state: FSMContext) -> None:
-        await callback.answer()
-        account_row = await db.get_active_marketplace_account(
-            callback.from_user.id, "funpay"
-        )
-        if account_row:
-            account_id = int(account_row["id"])
-            await manager.stop_funpay_account(account_id)
-            replacement = await db.delete_marketplace_account(
-                callback.from_user.id, "funpay", account_id
-            )
-            if replacement:
-                await manager.activate_account(
-                    callback.from_user.id, "funpay", int(replacement["id"])
-                )
-        await state.clear()
-        await callback.message.answer(
-            "–¢–µ–∫—É—â–∏–π FunPay-–∞–∫–∫–∞—É–Ω—Ç, –µ–≥–æ –ø—Ä–æ–∫—Å–∏ –∏ golden_key —É–¥–∞–ª–µ–Ω—ã.",
-        )
-        await show_main(callback.message, callback.from_user.id)
-
-    @router.message()
-    async def fallback(message: Message) -> None:
-        try:
-            if await manager.plugins.dispatch_telegram_message(
-                message.from_user.id, message
-            ):
-                return
-        except Exception:
-            logger.exception("–û—à–∏–±–∫–∞ Telegram-—Ö—ç–Ω–¥–ª–µ—Ä–∞ –ø–ª–∞–≥–∏–Ω–∞")
-        await show_main(message, message.from_user.id)
-
-    @router.callback_query()
-    async def plugin_callback_fallback(callback: CallbackQuery) -> None:
-        try:
-            if await manager.plugins.dispatch_telegram_callback(
-                callback.from_user.id, callback
-            ):
-                return
-        except Exception:
-            logger.exception("–û—à–∏–±–∫–∞ callback-—Ö—ç–Ω–¥–ª–µ—Ä–∞ –ø–ª–∞–≥–∏–Ω–∞")
-        await callback.answer("–î–µ–π—Å—Ç–≤–∏–µ —É—Å—Ç–∞—Ä–µ–ª–æ –∏–ª–∏ –Ω–µ –ø–æ–¥–¥–µ—Ä–∂–∏–≤–∞–µ—Ç—Å—è", show_alert=True)
-
-    return router
-
-
-async def main() -> None:
-    config = Config.from_env()
-    db = Database(config.database_url)
-    await db.connect()
-    bot = Bot(config.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    secrets = SecretBox(config.app_secret)
-    manager = RuntimeManager(bot, db, secrets)
-    dispatcher = Dispatcher()
-    dispatcher.include_router(build_router(db, manager, secrets))
-    await bot.set_my_commands([
-        BotCommand(command="start", description="–û—Ç–∫—Ä—ã—Ç—å –º–µ–Ω—é"),
-        BotCommand(command="cancel", description="–û—Ç–º–µ–Ω–∏—Ç—å —Ç–µ–∫—É—â–µ–µ –¥–µ–π—Å—Ç–≤–∏–µ"),
-    ])
-    try:
-        try:
-            await manager.start_saved()
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception(
-                "–í–æ—Å—Å—Ç–∞–Ω–æ–≤–ª–µ–Ω–∏–µ —Å–æ—Ö—Ä–∞–Ω—ë–Ω–Ω—ã—Ö –∞–∫–∫–∞—É–Ω—Ç–æ–≤ –∑–∞–≤–µ—Ä—à–∏–ª–æ—Å—å —Å –æ—à–∏–±–∫–æ–π; "
-                "Telegram polling –≤—Å—ë —Ä–∞–≤–Ω–æ –±—É–¥–µ—Ç –∑–∞–ø—É—â–µ–Ω"
-            )
-        await dispatcher.start_polling(bot, allowed_updates=dispatcher.resolve_used_update_types())
-    finally:
-        await manager.close()
-        await db.close()
-        await bot.session.close()
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+Y™Áäx-ÆÈ‹j◊ù¢Îi∫⁄+äßj[hëÈ‹¢ÈÌ◊Øu˜DËµ©h∫⁄n∂XßzÕYúõ€H◊Ÿù]\ôW◊»[\‹ù[õõ›][€ú¬Çö[\‹ù\ﬁ[ò⁄[¬ö[\‹ùò\ŸMçö[\‹ù\⁄XÇö[\‹ù[ö[\‹ùŸŸ⁄[ô¬ö[\‹ù‹¬ö[\‹ùôBö[\‹ùôXY[ô¬ôúõ€H€€X›[€ú»[\‹ù€›[ù\ãYò][X›ôúõ€H]X€\‹Ÿ\»[\‹ù]X€\‹ÀöY[ôúõ€H]][YH[\‹ù]][YK[YY[K[Y^õ€ôBôúõ€Hò€€⁄⁄Y\»[\‹ù€€⁄⁄YQ\úõ‹ã⁄[\P€€⁄⁄YBôúõ€H[»[\‹ùû]\“S¬ôúõ€H]Xà[\‹ù]ôúõ€H\\»[\‹ù⁄[\Sò[Y\‹XŸBôúõ€H\[ô»[\‹ù[ûBôúõ€H\õXãú\úŸH[\‹ù\õ‹]Çö[\‹ù\ﬁ[ò‹¬ö[\‹ùŸ\ùYöBôúõ€HZ[Ÿ‹ò[H[\‹ùõ›\‹]⁄\ããõ›]\Çôúõ€HZ[Ÿ‹ò[Kò€Y[ùôYò][[\‹ùYò][õ›õ‹\ùY\¬ôúõ€HZ[Ÿ‹ò[Kô[ù[\»[\‹ù⁄]\K\úŸS[ŸBôúõ€HZ[Ÿ‹ò[Kô^Ÿ\[€ú»[\‹ù[Y‹ò[PòYô\]Y\›ôúõ€HZ[Ÿ‹ò[Kôö[\ú»[\‹ù€€[X[ô€€[X[ô›\ùôúõ€HZ[Ÿ‹ò[Kôú€Kò€€ù^[\‹ùî”P€€ù^ôúõ€HZ[Ÿ‹ò[Kôú€Kú›]H[\‹ù›]K›]\—‹õ›\ôúõ€HZ[Ÿ‹ò[Kù\\»[\‹ù
+àõ›€€[X[ôàùYôô\ôY[ú]ö[Kàÿ[òX⁄‘]Y\ûKà\úõ‹ë]ô[ùàî“[ú]ö[Kà[õ[ôRŸ^Xõÿ\ôù]€ãà[õ[ôRŸ^Xõÿ\ôX\ö›\àY\‹ÿYŸKäBôúõ€H‹û\Ÿ‹ò\Kôô\õô][\‹ùô\õô][ùò[Y⁄Ÿ[Çôúõ€H[]€ãô\úõ‹ú»[\‹ù
+àõ€ŸÿZ]\úõ‹ãà\‹›€‹ô\⁄[ùò[Y\úõ‹ãà€ôP€ŸQ^\ôY\úõ‹ãà€ôP€ŸR[ùò[Y\úõ‹ãà€ôSù[Xô\í[ùò[Y\úõ‹ãàŸ\‹⁄[€î\‹›€‹ôôYYY\úõ‹ãäBÇôúõ€Hù[î^PTH[\‹ùXÿ€›[ùù[õô\ã]ô[ùÀ\\¬ôúõ€Hù[î^PTH[\‹ù^Ÿ\[€ú»\»úŸ^Ÿ\[€ú¬ôúõ€HZW‹Y⁄[óÿùZ[\à[\‹ù
+àQêUS–TW–êT—W’Tì\»RW–ïRSTó—QêUS–TW–êT—W’TìàRTY⁄[êùZ[\ë\úõ‹ãà[ùõ‹X‘Y⁄[êùZ[\ãàŸ[ô\ò]YŸö[[ò[YKà[ú‹X›ŸŸ[ô\ò]Y‹€›\òŸKàò[Y]Wÿ\Wÿò\ŸW›\õ\»ò[Y]WÿZWÿùZ[\óÿ\Wÿò\ŸW›\õàò[Y]W€[Ÿ[⁄Y\»ò[Y]WÿZWÿùZ[\ó€[Ÿ[⁄Yàò[Y]W‹Y⁄[ó‹ô\]Y\›äBôúõ€H^Y\õ⁄◊‹Y⁄[ó‹ﬁ\›[H[\‹ù
+àVQTì“◊‘ëPQW‘Q“Só–ñW’URQàVQTì“◊‘ëPQW‘Q“SîÀà^Y\õ⁄‘Y⁄[ë]Kà^Y\õ⁄‘Y⁄[ìX[òYŸ\ãà^Y\õ⁄‘Y⁄[ïò[Y][€ë\úõ‹ãà^Y\õ⁄◊‹ôXYW‹Y⁄[ó‹€›\òŸKà^Y\õ⁄◊‹Ÿ][ô◊€Xô[äBôúõ€HY⁄[ó‹ﬁ\›[H[\‹ùY⁄[ë]KY⁄[ìX[òYŸ\ãY⁄[ïò[Y][€ë\úõ‹Çôúõ€H[]€ó‹Y⁄[à[\‹ùY⁄[ï[]€îŸ\ùöXŸK[]€ê€€ôöY›\ò][€ë\úõ‹ÇÇîVQTì“◊“ST‘ï—Tîì‘éà[\‹ù\úõ‹àõ€ôHHõ€ôBùûNÇàúõ€H^Y\õ⁄ÿ\KòXÿ€›[ù[\‹ùXÿ€›[ù\»^Y\õ⁄–Xÿ€›[ùàúõ€H^Y\õ⁄ÿ\Kô[ù[\»[\‹ù][QX[\ôX›[€ú»\»^Y\õ⁄“][QX[\ôX›[€ú¬àúõ€H^Y\õ⁄ÿ\Kô[ù[\»[\‹ù][QX[›]\Ÿ\»\»^Y\õ⁄“][QX[›]\Ÿ\¬àúõ€H^Y\õ⁄ÿ\Kô[ù[\»[\‹ù][T›]\Ÿ\»\»^Y\õ⁄“][T›]\Ÿ\¬ô^Ÿ\[\‹ù\úõ‹à\»^Œà»4'¥`t`¥,4,¥.ÙcÙ-t/ù[î^H4-4/¥`t`¥`Ù/Ù/tbÙ/4/Ù`4.4/t-t/Ù/¥.Ù/t/¥.H4.Ù/¥.¥,4.Ùc4/t/¥.H4`t,t/¥`4.¥-KÇàVQTì“◊“ST‘ï—Tîì‘àH^¬à^Y\õ⁄–Xÿ€›[ùHõ€ôBà^Y\õ⁄“][QX[\ôX›[€ú»Hõ€ôBà^Y\õ⁄“][QX[›]\Ÿ\»Hõ€ôBà^Y\õ⁄“][T›]\Ÿ\»Hõ€ôBÇõŸŸ⁄[ôÀòò\⁄X–€€ôöY à]ô[[‹ÀôŸ][ùäì—◊”UëSãíSëì»äKù\\ä
+Kàõ‹õX]HâJ\ÿ›[YJ\»	J]ô[ò[YJ\»	Jò[YJ\»	JY\‹ÿYŸJ\»ãäBõŸŸŸ\àHŸŸ⁄[ôÀôŸ]ŸŸŸ\äôù[ú^Wÿõ›äBÇïT—Tó–Q—SïH
+àì[ﬁö[KÕKå
+LN»[ù^óÕç
+H\UŸXí⁄]ÕLÕÀåÕàÇàä“SZŸHŸX⁄€ H⁄õ€YKÃLçãåÿYò\öKÕLÕÀåÕàÇäBîQ“Só—–’SQSïUS”ó‘UH]
+◊Ÿö[W◊ Kù⁄]€ò[YJîQ“Só—UëS‘QSïõYäBîVQTì“◊‘Q“Só—–’SQSïUS”ó‘UH]
+◊Ÿö[W◊ Kù⁄]€ò[YJàîVQTì“◊‘Q“Só—UëS‘QSïõYÇäBÇêUU◊”’◊‘Q“Só’URQHçÕÿåMYLLLÿLKMLLãNXÕLãLÿMÿéÿNXåLHÇêQêSê—Q‘’U◊‘Q“Só’URQHòÕMXMÃãYXXéMÀNåMÀXåLLYMéòååàÇî’UT◊‘Q“Só’URQHòåNLÃŒXòãNåLÀMXÿãXMÃKLÿMMYLXÿÃÃ»ÇïSQ‘êSW–“SìëS–ì”‘’‘Q“Só’URQHåŸçÕéKLŒMÀMKXXòMãXÕéXXMåÿåôLÇêUU◊‘”SW‘Q“Só’URQHçòMÕåçKYçMòÃÀNNKYÃLççåÿç»ÇêRW–T‘“T’Sï‘Q“Só’URQHåYÃãMòÀMNKNYYãNÿôòLLŸôLHÇîQ“Só‘—USë‘◊––SêP“◊‘ëQíVHç»ÇîQ“Só’SU”ó—T–””ìëP’–T“◊‘ëQíVHúŸ\ÿ◊ÿ\⁄ŒàÇîQ“Só’SU”ó—T–””ìëP’—◊‘ëQíVHúŸ\ÿ◊ŸŒàÇîQ“Só––US—◊‘Q—W‘“VëHHÇîQ“Só––US—◊—T–‘íTS”ó”RSàHîQ“Só––US—◊—T–‘íTS”ó”PVHåêRW–ïRSTó’“—Só”PT“»H∏†(∏†(∏†(∏†(∏†(∏†(∏†(∏†(àÇîVQTì“◊‘”‘—P””ë»HåîVQTì“◊–UU◊‘PìT“‘—P””ë»HÃîQ“Só‘’‘’SQS’UHLîQ“Só”–Q’SQS’UHåÇÇê]X€\‹ úõﬁô[èUùYK€›œUùYJBò€\‹»ôXYTY⁄[î‹XŒÇà]ZYà›Çàö[[ò[YNà›Çàò[YNà›Çàô\ú⁄[€éà›Çà\ÿ‹ö\[€éà›Çà]Z[Œà›Çà€›\òŸWŸö[Nà›àõ€ôHHõ€ôBàùZ[[ó‹Ÿ][ô‹Œàõ€€HùYBÇÇîëPQW‘Q“Sî»H
+àôXYTY⁄[î‹X àUU◊”’◊‘Q“Só’URQàê]]”›‘Y⁄[ãúHãàê]]”›‘Y⁄[àãàåKååãà¥'4,4`t`t/¥,¥/¥-H4`Ù/Ù`4,4,¥.Ù-t/t.4-H4.Ù/¥`¥,4/4.ãà¥'Ù/¥.¥,4-ÙbÙ,¥,4-t`à4,4.¥`¥.4,¥/tbÙ-H4.4,¥bÙ.¥.Ùc¥aÙ-t/t/tbÙ-H4.Ù/¥`¥bÀ4/4,4`t`t/¥,¥/à4,4.¥`¥.4,¥.4`4`Ù-t`à4.4.Ù.Çà¥-4-t,4.¥`¥.4,¥.4`4`Ù-t`à4/¥,tbÙaÙ/tbÙ-H4.4,¥,4.Ùc¥`¥/tbÙ-H4/Ù`4-t-4.Ù/¥-¥-t/t.4cÀà4'¥,tbÙaÙ/tbÙ-H4.Ù/¥`¥b»4/4/¥-¥/t/à4/4,4`t`t/¥,¥/à4`Ù-4,4.Ù.4`¥c»Çà¥,¥,4.Ùc¥`¥/tbÙ-H4/Ù`4-t-4.Ù/¥-¥-t/t.4c»4/Ù`4.4`Ù-4,4.Ù-t/t.4.4,t-t-Ù/¥/Ù,4`t/t/à4-4-t,4.¥`¥.4,¥.4`4`Ùc¥`¥`tcÀàãà
+KàôXYTY⁄[î‹X àQêSê—Q‘’U◊‘Q“Só’URQàêYò[òŸYõŸö[T›]ÀúHãàêYò[òŸYõŸö[H›]»ãàåKååãà¥(4,4`tb4.4`4-t/t/t,4c»4`t`¥,4`¥.4`t`¥.4.¥,4/Ù`4/¥a4.4.Ùc»ãà¥(taÙ.4`¥,4-t`à4/Ù`4/¥-4,4-¥.4-Ù,4.¥`4bÙ`¥bÙ-H4.4,¥/¥-Ù,¥`4,4btdt/t/tbÙ-H4-Ù,4.¥,4-ÙbÀ4`Ù/t.4.¥,4.Ùc4/tbÙaH4/Ù/¥.¥`Ù/Ù,4`¥-t.Ù-t.KÇà¥,¥bÙ`4`ÙaÙ.¥`»4.4/Ù/¥/Ù`Ù.ÙcÙ`4/tbÙ-H4.Ù/¥`¥b»4-Ù,4,¥bÙ,t`4,4/t/tbÙ.H4/Ù-t`4.4/¥-à4%4/¥/Ù/¥.Ù/t.4`¥-t.Ùc4/t/à4/Ù/¥.¥,4-ÙbÙ,¥,4-t`à4/¥,tbt.4.HÇà¥,t,4.Ù,4/t`K4-4/¥`t`¥`Ù/Ù/t`Ùcà4.à4,¥bÙ,¥/¥-4`»4`t`Ù/4/4`»4.4`t`4-t-4`t`¥,¥,4/t,4`Ù-4-t`4-¥,4/t.4.àãà
+KàôXYTY⁄[î‹X à’UT◊‘Q“Só’URQàî›]\‘Y⁄[ãúHãàî›]\»Y⁄[àãàåKååãà¥(t`¥,4`¥`Ù`H4/Ù`4/¥-4,4,¥a¥,4,à4aÙ,4`¥,4aHù[î^Hãà¥'Ù/¥-Ù,¥/¥.ÙcÙ-t`à4-Ù,4-4,4`¥c4`t/¥,t`t`¥,¥-t/t/tbÙ.H4`¥-t.¥`t`à4`t`¥,4`¥`Ù`t,à4'Ù/¥.¥`Ù/Ù,4`¥-t.Ùc4/¥`¥/Ù`4,4,¥.ÙcÙ-t`à4,à4.Ù.4aÙ/t/¥/4aÙ,4`¥-HÇàëù[î^H4.¥/¥/4,4/t-4`»‹›]\»4.4/4,Ù/t/¥,¥-t/t/t/à4/Ù/¥.Ù`ÙaÙ,4-t`à4/t,4`t`¥`4/¥-t/t/tbÙ.H4/¥`¥,¥-t`ãàãà
+KàôXYTY⁄[î‹X àSQ‘êSW–“SìëS–ì”‘’‘Q“Só’URQàï[Y‹ò[P⁄[õô[õ€‹›úHãàï[Y‹ò[H⁄[õô[õ€‹›ãàåKåãåãà¥(t.¥.Ù,4-[Y‹ò[Kt.¥,4/t,4.Ù/¥,à4-4.Ùc»4/t-t`t.¥/¥.Ùc4.¥.4aH4.Ù/¥`¥/¥,à4.4,4.¥.¥,4`Ù/t`¥/¥,àãà¥(4,4`t/Ù`4-t-4-t.ÙcÙ-t`à4/Ù/¥-4,Ù/¥`¥/¥,¥.¥`»4/4-t-¥-4`»4/t-t`t.¥/¥.Ùc4.¥.4/4.[]€ãt,4.¥.¥,4`Ù/t`¥,4/4.4.4/Ù/¥-4-4-t`4-¥.4,¥,4-t`à4/¥`¥-4-t.Ùc4/tbÙ.HÇà¥`4-t-Ù-t`4,à4/Ù`Ù,t.Ù.4aÙ/tbÙaH4.¥,4/t,4.Ù/¥,à4-4.Ùc»4.¥,4-¥-4/¥,Ù/à4/Ù`4.4,¥cÙ-Ù,4/t/t/¥,Ù/à4.Ù/¥`¥,àÇà¥`4,4-»4,à4/ÙcÙ`¥c4/4.4/t`Ù`à4/Ù`4/¥,¥-t`4cÙ-t`à4`4-t,4.Ùc4/t/¥-H4aÙ.4`t.Ù/à4/Ù/¥-4/Ù.4`taÙ.4.¥/¥,à4.4-Ù,4/Ù`4,4b4.4,¥,4-t`àôYö[4/Ù`4.4/Ù`4/¥`t,4-4.¥-KàÇà¥'Ù/¥`t.Ù-H4/Ù/¥.¥`Ù/Ù.¥.4/4,Ù/t/¥,¥-t/t/t/à4`4-t-Ù-t`4,¥.4`4`Ù-t`à4,Ù/¥`¥/¥,¥bÙ.H4.¥,4/t,4.À4/Ù/¥-4`¥,¥-t`4-¥-4,4-t`à\Ÿ\õò[YH4/Ù/¥.¥`Ù/Ù,4`¥-t.Ùc»Çà¥.4,t-t-Ù/¥/Ù,4`t/t/à4/Ù-t`4-t-4,4dt`à4-t/4`»4,¥.Ù,4-4-t.Ùc4a¥,àãà€›\òŸWŸö[OHï[Y‹ò[P⁄[õô[õ€‹›úHãàùZ[[ó‹Ÿ][ô‹œQò[ŸKà
+KàôXYTY⁄[î‹X àUU◊‘”SW‘Q“Só’URQàê]]‘€[KúHãàê]]‘€[HãàåKåKåãà¥$4,¥`¥/¥/4,4`¥.4aÙ-t`t.¥.4-H”SKt-Ù,4.¥,4-Ùb»4-4.Ùc»4/t-t`t.¥/¥.Ùc4.¥.4aH4.Ù/¥`¥/¥,àãà¥'Ù/¥-Ù,¥/¥.ÙcÙ-t`à4/Ù`4.4,¥cÙ-Ù,4`¥c4/t-t`t.¥/¥.Ùc4.¥/à4.Ù/¥`¥/¥,àù[î^H4.à4`4,4-Ù/tbÙ/4`Ù`t.Ù`Ù,Ù,4/4`t/¥,¥/4-t`t`¥.4/4/¥,Ù/à”SHTKàÇà¥%4.Ùc»4.¥,4-¥-4/¥.H4/Ù`4.4,¥cÙ-Ù.¥.4-Ù,4-4,4c¥`¥`tc»Q4`Ù`t.Ù`Ù,Ù.4.4.¥/¥.Ù.4aÙ-t`t`¥,¥/à4/t,4/¥-4/t`»4.¥`Ù/Ù.Ù-t/t/t`Ùcà4-t-4.4/t.4a¥`Œ»Çà¥/Ù.Ù,4,Ù.4/H4/Ù/¥-4`¥,¥-t`4-¥-4,4-t`à4`t`tbÙ.Ù.¥`À4`t/¥-Ù-4,4dt`à4-Ù,4.¥,4-À4/¥`¥`t.Ù-t-¥.4,¥,4-t`à4`t`¥,4`¥`Ù`H4.4/Ù/à4/t,4`t`¥`4/¥.t.¥-H4.Ù/¥`¥,Çà¥/Ù/¥-Ù,¥/¥.ÙcÙ-t`à4/Ù/¥.¥`Ù/Ù,4`¥-t.Ùcà4-Ù,4/Ù`4/¥`t.4`¥c4`4-ta4.4.Ù.»4.¥/¥/4,4/t-4/¥.HÙ`4-ta4.4.Ù.Ààãà€›\òŸWŸö[OHê]]‘€[KúHãàùZ[[ó‹Ÿ][ô‹œQò[ŸKà
+KàôXYTY⁄[î‹X àRW–T‘“T’Sï‘Q“Só’URQàêRP\‹⁄\›[ùúHãàêRH\‹⁄\›[ùãàåKååãàêRKt/Ù/¥/4/¥bt/t.4.à4/Ù/¥.¥`Ù/Ù,4`¥-t.ÙcÙ/4-4.Ùc»4,¥bÙ,t`4,4/t/tbÙaH4.Ù/¥`¥/¥,àãà¥'Ù/¥-4.¥.Ùc¥aÙ,4-t`¥`tc»4.à[ùõ‹XÀt`t/¥,¥/4-t`t`¥.4/4/¥/4`»Y\‹ÿYŸ\»TH4aÙ-t`4-t-»4/¥a4.4a¥.4,4.Ùc4/tbÙ.H]€à—ÀàÇà¥%4.Ùc»4.¥,4-¥-4/¥,Ù/à4.Ù/¥`¥,4at`4,4/t.4`à4/¥`¥-4-t.Ùc4/tbÙ.H4`t.4`t`¥-t/4/tbÙ.H4/Ù`4/¥/4/Ù`à4.4/¥`¥,¥-taÙ,4-t`à4/Ù/¥.¥`Ù/Ù,4`¥-t.Ùcã4.¥/¥,Ù-4,Çà¥`¥/¥`à4`t/4/¥`¥`4.4`à4/Ù`4.4,¥cÙ-Ù,4/t/tbÙ.H4`¥/¥,¥,4`4.4.Ù.4`Ù-¥-H4/¥a4/¥`4/4.4.»4/Ù/à4/t-t/4`»4-Ù,4.¥,4-Ààãà€›\òŸWŸö[OHêRP\‹⁄\›[ùúHãàùZ[[ó‹Ÿ][ô‹œQò[ŸKà
+KäBîëPQW‘Q“Só–ñW’URQH‹Y⁄[ãù]ZYàY⁄[àõ‹àY⁄[à[àëPQW‘Q“SîﬂBÇÇôYàôXYW‹Y⁄[ó‹€›\òŸJY⁄[éàôXYTY⁄[î‹X HOà›éÇààà¥$¥/¥-Ù,¥`4,4bt,4-t`à4,¥,4.Ù.4-4/tbÙ.H4/¥-4/t/¥a4,4.t.Ù/¥,¥bÙ.H4/4/¥-4`Ù.Ùc4a4/¥`4/4,4`¥,ù[î^Pÿ\ô[ò[àààÇàYàY⁄[ãú€›\òŸWŸö[NÇàô]\õà
+à]
+◊Ÿö[W◊ Kù⁄]€ò[YJúôXYW‹Y⁄[ú»äH»Y⁄[ãú€›\òŸWŸö[Bà
+KúôXY›^
+[ò€Ÿ[ôœHù]ãNäBàô]\õà
+ààìêSQHH‹Y⁄[ãõò[YH\üWàÇààïëTî“S”àH‹Y⁄[ãùô\ú⁄[€à\üWàÇààëT–‘íTS”àH‹Y⁄[ãô\ÿ‹ö\[€à\üWàÇàê‘ëQU»H	—ù[î^HZ[Ÿ‹ò[Hõ›	◊àÇàî—USë‘◊‘Q—HHùYWàÇààïURQH‹Y⁄[ãù]ZY\üWàÇàêíSë’◊—SUHHõ€ôWàÇà
+BÇÇôYàY⁄[ó‹Ÿ][ô‹◊ÿÿ[òX⁄◊Ÿ]JY⁄[éàY⁄[ë]JHOà›àõ€ôNÇààà¥$¥/¥-Ù,¥`4,4bt,4-t`à4/Ù/¥`t`¥/¥cÙ/t/tbÙ.Hÿ[òX⁄»4`t`¥`4,4/t.4a¥b»4/t,4`t`¥`4/¥-t.à4`Ù`t`¥,4/t/¥,¥.Ù-t/t/t/¥,Ù/à4/Ù.Ù,4,Ù.4/t,àààÇàYàõ›Y⁄[ãúŸ][ô‹◊‹YŸNÇàô]\õàõ€ôBàôXYW‹Y⁄[àHëPQW‘Q“Só–ñW’URQôŸ]
+Y⁄[ãù]ZY
+BàYàôXYW‹Y⁄[à[ôôXYW‹Y⁄[ãòùZ[[ó‹Ÿ][ô‹ŒÇàô]\õààòùZ[[ó€‹[éû‹Y⁄[ãù]ZYHÇàô]\õààû‘Q“Só‘—USë‘◊––SêP“◊‘ëQíVNû‹Y⁄[ãù]ZYNåÇÇÇôYàò[Y]Wÿÿ][Ÿ◊Ÿ\ÿ‹ö\[€äò[YNà›äHOà›éÇà\ÿ‹ö\[€àHò[YKú›ö\
+
+BàYàõ›Q“Só––US—◊—T–‘íTS”ó”RSàH[ä\ÿ‹ö\[€äHHQ“Só––US—◊—T–‘íTS”ó”PVÇàòZ\ŸHò[YQ\úõ‹äàà¥'¥/Ù.4`t,4/t.4-H4-4/¥.Ù-¥/t/à4`t/¥-4-t`4-¥,4`¥c4/¥`à‘Q“Só––US—◊—T–‘íTS”ó”RSüHÇàà¥-4/à‘Q“Só––US—◊—T–‘íTS”ó”PVH4`t.4/4,¥/¥.Ù/¥,ãàÇà
+Bàô]\õà\ÿ‹ö\[€ÇÇÇôYà[Y‹ò[W‹Xõ\⁄\ó€ò[YJ\Ÿ\éà[ûJHOà›éÇàYàŸ]]ä\Ÿ\ãù\Ÿ\õò[YHãõ€ôJNÇàô]\õààê›\Ÿ\ãù\Ÿ\õò[Y_HÇàô]\õà€\Y
+Ÿ]]ä\Ÿ\ãôù[€ò[YHã¥'Ù/¥.Ùc4-Ù/¥,¥,4`¥-t.Ùc[Y‹ò[HäKL
+BÇÇê]X€\‹ €›œUùYJBò€\‹»€€ôöYŒÇàõ››⁄Ÿ[éà›Çà]Xò\ŸW›\õà›Çà\‹ŸX‹ô]à›ÇÇà€\‹€Y]ŸàYàúõ€WŸ[ùä€ HOà€€ôöYŒÇà⁄Ÿ[àH‹ÀôŸ][ùäêì’’“—SàãàäKú›ö\
+
+Bà]Xò\ŸW›\õH‹ÀôŸ][ùäëUPêT—W’TìãàäKú›ö\
+
+BàYàõ›⁄Ÿ[éÇàòZ\ŸHù[ù[YQ\úõ‹ä¥'t-H4-Ù,4-4,4/t,4/Ù-t`4-t/4-t/t/t,4c»4/¥.¥`4`Ù-¥-t/t.4c»ì’’“—SàäBàYàõ›]Xò\ŸW›\õÇàòZ\ŸHù[ù[YQ\úõ‹ä¥'t-H4-Ù,4-4,4/t,4/Ù-t`4-t/4-t/t/t,4c»4/¥.¥`4`Ù-¥-t/t.4c»UPêT—W’TìäBàYà]Xò\ŸW›\õú›\ù›⁄]
+ú‹›‹ô\ŒãÀ»äNÇà]Xò\ŸW›\õHú‹›‹ô\‹[ãÀ»à
+»]Xò\ŸW›\õúô[[›ô\ôYö^
+ú‹›‹ô\ŒãÀ»äBàô]\õà€ ⁄Ÿ[ã]Xò\ŸW›\õ‹ÀôŸ][ùäêT‘—P‘ëUã⁄Ÿ[äJBÇÇò€\‹»ŸX‹ô]õﬁÇààà¥*4.4a4`4`Ù-t`à4aÙ`Ù,¥`t`¥,¥.4`¥-t.Ùc4/tbÙ-H4/Ù/¥.Ùc»4/Ù-t`4-t-4`t/¥at`4,4/t-t/t.4-t/4,à‹›‹ôT‘SàààÇÇàYà◊⁄[ö]◊ Ÿ[ãŸX‹ô]à›äNÇàŸ^HHò\ŸMçù\õÿYôWÿçç[ò€ŸJ\⁄Xãú⁄LçMäŸX‹ô]ô[ò€ŸJ
+JKôYŸ\›
+
+JBàŸ[ãóŸô\õô]Hô\õô]
+Ÿ^JBÇàYà[ò‹û\
+Ÿ[ãò[YNà›äHOà›éÇàô]\õàŸ[ãóŸô\õô]ô[ò‹û\
+ò[YKô[ò€ŸJ
+JKôX€ŸJ
+BÇàYàX‹û\
+Ÿ[ãò[YNà›äHOà›éÇàô]\õàŸ[ãóŸô\õô]ôX‹û\
+ò[YKô[ò€ŸJ
+JKôX€ŸJ
+BÇÇò€\‹»]Xò\ŸNÇàYà◊⁄[ö]◊ Ÿ[ã\õà›äNÇàŸ[ãù\õH\õàŸ[ãú€€à\ﬁ[ò‹Àî€€õ€ôHHõ€ôBÇà\ﬁ[ò»Yà€€õôX›
+Ÿ[äHOàõ€ôNÇàŸ[ãú€€H]ÿZ]\ﬁ[ò‹Àò‹ôX]W‹€€
+Ÿ[ãù\õZ[ó‹⁄^ôOLKX^‹⁄^ôOLL€€[X[ô›[Y[›]LÃ
+Bà]ÿZ]Ÿ[ãô^X›]JàààÇà‘ëPUHPìHQàì’VT’»ù[ú^W›\Ÿ\ú»
+à[Y‹ò[W⁄YíQ“SïíSPTñH—VKàõﬁWŸ[ò»Và€€[ó⁄Ÿ^WŸ[ò»Vàù[ú^W⁄YíQ“Sïàù[ú^W›\Ÿ\õò[YHVàXÿ€›[ùÿX›]ôHì””PSàì’ïSQêUSêS—KàX›]ôW€X\öŸ]XŸHVì’ïSQêUS	Ÿù[ú^IÀàX›]ôWŸù[ú^WÿXÿ€›[ù⁄YíQ“SïàX›]ôW‹^Y\õ⁄◊ÿXÿ€›[ù⁄YíQ“Sïà^Y\õ⁄◊‹õﬁWŸ[ò»Và^Y\õ⁄◊ÿ€€⁄⁄YWŸ[ò»Và^Y\õ⁄◊⁄YVà^Y\õ⁄◊›\Ÿ\õò[YHVà^Y\õ⁄◊ÿX›]ôHì””PSàì’ïSQêUSêS—Kà^Y\õ⁄◊€õ›YûW€Y\‹ÿYŸ\»ì””PSàì’ïSQêUSïQKà^Y\õ⁄◊€õ›YûWŸX[»ì””PSàì’ïSQêUSïQKà^Y\õ⁄◊€õ›YûW‹ô]öY]‹»ì””PSàì’ïSQêUSïQKà^Y\õ⁄◊€õ›YûW‹ﬁ\›[Hì””PSàì’ïSQêUSïQKà^Y\õ⁄◊ÿ]]◊‹Xõ\⁄Ÿ[òXõYì””PSàì’ïSQêUSêS—Kà^Y\õ⁄◊ÿ]]‹ô\WŸ[òXõYì””PSàì’ïSQêUSêS—Kà^Y\õ⁄◊ÿ]]‹ô\W›^Vì’ïSQêUS	Ù%Ù-4`4,4,¥`t`¥,¥`Ù.t`¥-HH4(t/Ù,4`t.4,t/à4-Ù,4`t/¥/¥,tbt-t/t.4-Kà4(t.¥/¥`4/à4/¥`¥,¥-taÙ`ÀâÀà^Y\õ⁄◊ÿ]]‹ô\Wÿ€€€›€ó€Z[ù]\»SïQ—Tàì’ïSQêUSÃà^Y\õ⁄◊ÿ]]‹ô\WŸ[^W‹ŸX€€ô»SïQ—Tàì’ïSQêUSà^Y\õ⁄◊ÿ]]‹ô\W›€‹ö◊‹›\ù”PSSïì’ïSQêUSà^Y\õ⁄◊ÿ]]‹ô\W›€‹ö◊Ÿ[ô”PSSïì’ïSQêUSçà^Y\õ⁄◊ÿ]]◊Ÿ[]ô\ûWŸ[òXõYì””PSàì’ïSQêUSêS—Kà^Y\õ⁄◊ÿ]]◊ÿ€€ôö\õWŸ[òXõYì””PSàì’ïSQêUSêS—Kà^Y\õ⁄◊€õ›YûWŸ[]ô\ûHì””PSàì’ïSQêUSïQKàõ›YûW€Y\‹ÿYŸ\»ì””PSàì’ïSQêUSïQKàõ›YûW€ô]◊€‹ô\ú»ì””PSàì’ïSQêUSïQKàõ›YûW€‹ô\ó‹›]\»ì””PSàì’ïSQêUSïQKàõ›YûW‹ô]öY]‹»ì””PSàì’ïSQêUSïQKàõ›YûW€›◊‹òZ\ŸHì””PSàì’ïSQêUSïQKàõ›YûW‹ﬁ\›[Hì””PSàì’ïSQêUSïQKà]]◊‹òZ\ŸWŸ[òXõYì””PSàì’ïSQêUSêS—KàŸY\€€õ[ôWŸ[òXõYì””PSàì’ïSQêUSïQKà]]‹ô\WŸ[òXõYì””PSàì’ïSQêUSêS—Kà]]‹ô\W›^Vì’ïSQêUS	Ù%Ù-4`4,4,¥`t`¥,¥`Ù.t`¥-HH4(t/Ù,4`t.4,t/à4-Ù,4`t/¥/¥,tbt-t/t.4-Kà4(t.¥/¥`4/à4/¥`¥,¥-taÙ`ÀâÀà]]‹ô\Wÿ€€€›€ó€Z[ù]\»SïQ—Tàì’ïSQêUSÃà]]‹ô\WŸ[^W‹ŸX€€ô»SïQ—Tàì’ïSQêUSà]]‹ô\W€ô]◊ÿ⁄]◊€€õHì””PSàì’ïSQêUSêS—Kà]]‹ô\W›€‹ö◊‹›\ù”PSSïì’ïSQêUSà]]‹ô\W›€‹ö◊Ÿ[ô”PSSïì’ïSQêUSçàô]öY]◊‹ô\WŸ[òXõYì””PSàì’ïSQêUSêS—Kàô]öY]◊‹ô\WÃHVì’ïSQêUS	Ù(t/Ù,4`t.4,t/à4-Ù,4/¥,t`4,4`¥/t`Ùcà4`t,¥cÙ-Ùcà4'4b»4`4,4-Ù,t-t`4dt/4`tc»4,à4`t.4`¥`Ù,4a¥.4.âÀàô]öY]◊‹ô\WÃàVì’ïSQêUS	Ù(t/Ù,4`t.4,t/à4-Ù,4/¥`¥-ÙbÙ,ãà4't,4/4-¥,4.Ùc4aÙ`¥/à4-Ù,4.¥,4-»4,¥,4`H4`4,4-Ù/¥aÙ,4`4/¥,¥,4.ÀâÀàô]öY]◊‹ô\WÃ»Vì’ïSQêUS	Ù(t/Ù,4`t.4,t/à4-Ù,4/¥`¥-ÙbÙ,àH4(ÙaÙ`¥dt/4,¥,4b4.4-Ù,4/4-taÙ,4/t.4cÀâÀàô]öY]◊‹ô\WÕVì’ïSQêUS	Ù(t/Ù,4`t.4,t/à4-Ù,4at/¥`4/¥b4`Ùcà4/¥a¥-t/t.¥`»4.4,¥,4b4-Ù,4.¥,4-»IÀàô]öY]◊‹ô\WÕHVì’ïSQêUS	Ù(t/Ù,4`t.4,t/à4-Ù,4/¥`¥.Ù.4aÙ/t`Ùcà4/¥a¥-t/t.¥`»H4$t`Ù-4-t/4`4,4-4b»4,¥.4-4-t`¥c4,¥,4`H4`t/t/¥,¥,âÀà]]◊Ÿ[]ô\ûWŸ[òXõYì””PSàì’ïSQêUSêS—Kà][WŸ[]ô\ûWŸ[òXõYì””PSàì’ïSQêUSïQKà[]ô\ûWÿ]]◊‹ô\›‹ôHì””PSàì’ïSQêUSïQKà[]ô\ûWÿ]]◊Ÿ\ÿXõHì””PSàì’ïSQêUSïQKàõ›YûWŸ[]ô\ûHì””PSàì’ïSQêUSïQKà‹ôX]Yÿ]SQT’STàì’ïSQêUSì’ 
+Kà\]Yÿ]SQT’STàì’ïSQêUSì’ 
+Bà
+N¬ÇàSTàPìHù[ú^W›\Ÿ\ú»Q””SSàQàì’VT’»õ›YûW‹ô]öY]‹»ì””PSàì’ïSQêUSïQN¬àSTàPìHù[ú^W›\Ÿ\ú»Q””SSàQàì’VT’»X›]ôW€X\öŸ]XŸHVì’ïSQêUS	Ÿù[ú^IŒ¬àSTàPìHù[ú^W›\Ÿ\ú»Q””SSàQàì’VT’»X›]ôWŸù[ú^WÿXÿ€›[ù⁄YíQ“Sï¬àSTàPìHù[ú^W›\Ÿ\ú»Q””SSàQàì’VT’»X›]ôW‹^Y\õ⁄◊ÿXÿ€›[ù⁄YíQ“Sï¬àSTàPìHù[ú^W›\Ÿ\ú»Q””SSàQàì’VT’»^Y\õ⁄◊‹õﬁWŸ[ò»V¬àSTàPìHù[ú^W›\Ÿ\ú»Q””SSàQàì’VT’»^Y\õ⁄◊ÿ€€⁄⁄YWŸ[ò»V¬àSTàPìHù[ú^W›\Ÿ\ú»Q””SSàQàì’VT’»^Y\õ⁄◊⁄YV¬àSTàPìHù[ú^W›\Ÿ\ú»Q””SSàQàì’VT’»^Y\õ⁄◊›\Ÿ\õò[YHV¬àSTàPìHù[ú^W›\Ÿ\ú»Q””SSàQàì’VT’»^Y\õ⁄◊ÿX›]ôHì””PSàì’ïSQêUSêS—N¬àSTàPìHù[ú^W›\Ÿ\ú»Q””SSàQàì’VT’»^Y\õ⁄◊€õ›YûW€Y\‹ÿYŸ\»ì””PSàì’ïSQêUSïQN¬àSTàPìHù[ú^W›\Ÿ\ú»Q””SSàQàì’VT’»^Y\õ⁄◊€õ›YûWŸX[»ì””PSàì’ïSQêUSïQN¬àSTàPìHù[ú^W›\Ÿ\ú»Q””SSàQàì’VT’»^Y\õ⁄◊€õ›YûW‹ô]öY]‹»ì””PSàì’ïSQêUSïQN¬àSTàPìHù[ú^W›\Ÿ\ú»Q””SSàQàì’VT’»^Y\õ⁄◊€õ›YûW‹ﬁ\›[Hì””PSàì’ïSQêUSïQN¬àSTàPìHù[ú^W›\Ÿ\ú»Q””SSàQàì’VT’»^Y\õ⁄◊ÿ]]◊‹Xõ\⁄Ÿ[òXõYì””PSàì’ïSQêUSêS—N¬àSTàPìHù[ú^W›\Ÿ\ú»Q””SSàQàì’VT’»^Y\õ⁄◊ÿ]]‹ô\WŸ[òXõYì””PSàì’ïSQêUSêS—N¬àSTàPìHù[ú^W›\Ÿ\ú»Q””SSàQàì’VT’»^Y\õ⁄◊ÿ]]‹ô\W›^Vì’ïSQêUS	Ù%Ù-4`4,4,¥`t`¥,¥`Ù.t`¥-HH4(t/Ù,4`t.4,t/à4-Ù,4`t/¥/¥,tbt-t/t.4-Kà4(t.¥/¥`4/à4/¥`¥,¥-taÙ`ÀâŒ¬àSTàPìHù[ú^W›\Ÿ\ú»Q””SSàQàì’VT’»^Y\õ⁄◊ÿ]]‹ô\Wÿ€€€›€ó€Z[ù]\»SïQ—Tàì’ïSQêUSÃ¬àSTàPìHù[ú^W›\Ÿ\ú»Q””SSàQàì’VT’»^Y\õ⁄◊ÿ]]‹ô\WŸ[^W‹ŸX€€ô»SïQ—Tàì’ïSQêUS¬àSTàPìHù[ú^W›\Ÿ\ú»Q””SSàQàì’VT’»^Y\õ⁄◊ÿ]]‹ô\W›€‹ö◊‹›\ù”PSSïì’ïSQêUS¬àSTàPìHù[ú^W›\Ÿ\ú»Q””SSàQàì’VT’»^Y\õ⁄◊ÿ]]‹ô\W›€‹ö◊Ÿ[ô”PSSïì’ïSQêUSç¬àSTàPìHù[ú^W›\Ÿ\ú»Q””SSàQàì’VT’»^Y\õ⁄◊ÿ]]◊Ÿ[]ô\ûWŸ[òXõYì””PSàì’ïSQêUSêS—N¬àSTàPìHù[ú^W›\Ÿ\ú»Q””SSàQàì’VT’»^Y\õ⁄◊ÿ]]◊ÿ€€ôö\õWŸ[òXõYì””PSàì’ïSQêUSêS—N¬àSTàPìHù[ú^W›\Ÿ\ú»Q””SSàQàì’VT’»^Y\õ⁄◊€õ›YûWŸ[]ô\ûHì””PSàì’ïSQêUSïQN¬àSTàPìHù[ú^W›\Ÿ\ú»Q””SSàQàì’VT’»]]◊Ÿ[]ô\ûWŸ[òXõYì””PSàì’ïSQêUSêS—N¬àSTàPìHù[ú^W›\Ÿ\ú»Q””SSàQàì’VT’»][WŸ[]ô\ûWŸ[òXõYì””PSàì’ïSQêUSïQN¬àSTàPìHù[ú^W›\Ÿ\ú»Q””SSàQàì’VT’»[]ô\ûWÿ]]◊‹ô\›‹ôHì””PSàì’ïSQêUSïQN¬àSTàPìHù[ú^W›\Ÿ\ú»Q””SSàQàì’VT’»[]ô\ûWÿ]]◊Ÿ\ÿXõHì””PSàì’ïSQêUSïQN¬àSTàPìHù[ú^W›\Ÿ\ú»Q””SSàQàì’VT’»õ›YûWŸ[]ô\ûHì””PSàì’ïSQêUSïQN¬àSTàPìHù[ú^W›\Ÿ\ú»Q””SSàQàì’VT’»õ›YûW€›◊‹òZ\ŸHì””PSàì’ïSQêUSïQN¬àSTàPìHù[ú^W›\Ÿ\ú»Q””SSàQàì’VT’»õ›YûW‹ﬁ\›[Hì””PSàì’ïSQêUSïQN¬àSTàPìHù[ú^W›\Ÿ\ú»Q””SSàQàì’VT’»]]◊‹òZ\ŸWŸ[òXõYì””PSàì’ïSQêUSêS—N¬àSTàPìHù[ú^W›\Ÿ\ú»Q””SSàQàì’VT’»ŸY\€€õ[ôWŸ[òXõYì””PSàì’ïSQêUSïQN¬àSTàPìHù[ú^W›\Ÿ\ú»Q””SSàQàì’VT’»]]‹ô\Wÿ€€€›€ó€Z[ù]\»SïQ—Tàì’ïSQêUSÃ¬àSTàPìHù[ú^W›\Ÿ\ú»Q””SSàQàì’VT’»]]‹ô\WŸ[^W‹ŸX€€ô»SïQ—Tàì’ïSQêUS¬àSTàPìHù[ú^W›\Ÿ\ú»Q””SSàQàì’VT’»]]‹ô\W€ô]◊ÿ⁄]◊€€õHì””PSàì’ïSQêUSêS—N¬àSTàPìHù[ú^W›\Ÿ\ú»Q””SSàQàì’VT’»]]‹ô\W›€‹ö◊‹›\ù”PSSïì’ïSQêUS¬àSTàPìHù[ú^W›\Ÿ\ú»Q””SSàQàì’VT’»]]‹ô\W›€‹ö◊Ÿ[ô”PSSïì’ïSQêUSç¬àSTàPìHù[ú^W›\Ÿ\ú»Q””SSàQàì’VT’»ô]öY]◊‹ô\WŸ[òXõYì””PSàì’ïSQêUSêS—N¬àSTàPìHù[ú^W›\Ÿ\ú»Q””SSàQàì’VT’»ô]öY]◊‹ô\WÃHVì’ïSQêUS	Ù(t/Ù,4`t.4,t/à4-Ù,4/¥,t`4,4`¥/t`Ùcà4`t,¥cÙ-Ùcà4'4b»4`4,4-Ù,t-t`4dt/4`tc»4,à4`t.4`¥`Ù,4a¥.4.âŒ¬àSTàPìHù[ú^W›\Ÿ\ú»Q””SSàQàì’VT’»ô]öY]◊‹ô\WÃàVì’ïSQêUS	Ù(t/Ù,4`t.4,t/à4-Ù,4/¥`¥-ÙbÙ,ãà4't,4/4-¥,4.Ùc4aÙ`¥/à4-Ù,4.¥,4-»4,¥,4`H4`4,4-Ù/¥aÙ,4`4/¥,¥,4.ÀâŒ¬àSTàPìHù[ú^W›\Ÿ\ú»Q””SSàQàì’VT’»ô]öY]◊‹ô\WÃ»Vì’ïSQêUS	Ù(t/Ù,4`t.4,t/à4-Ù,4/¥`¥-ÙbÙ,àH4(ÙaÙ`¥dt/4,¥,4b4.4-Ù,4/4-taÙ,4/t.4cÀâŒ¬àSTàPìHù[ú^W›\Ÿ\ú»Q””SSàQàì’VT’»ô]öY]◊‹ô\WÕVì’ïSQêUS	Ù(t/Ù,4`t.4,t/à4-Ù,4at/¥`4/¥b4`Ùcà4/¥a¥-t/t.¥`»4.4,¥,4b4-Ù,4.¥,4-»IŒ¬àSTàPìHù[ú^W›\Ÿ\ú»Q””SSàQàì’VT’»ô]öY]◊‹ô\WÕHVì’ïSQêUS	Ù(t/Ù,4`t.4,t/à4-Ù,4/¥`¥.Ù.4aÙ/t`Ùcà4/¥a¥-t/t.¥`»H4$t`Ù-4-t/4`4,4-4b»4,¥.4-4-t`¥c4,¥,4`H4`t/t/¥,¥,âŒ¬Çà‘ëPUHPìHQàì’VT’»X\öŸ]XŸWÿXÿ€›[ù»
+àYíQ‘—TíPSíSPTñH—VKà[Y‹ò[W⁄YíQ“Sïì’ïSëQëTëSê—T»ù[ú^W›\Ÿ\ú [Y‹ò[W⁄Y
+H”àSUH–T––QKàX\öŸ]XŸHVì’ïS“P“»
+X\öŸ]XŸHSà
+	Ÿù[ú^IÀ	‹^Y\õ⁄… JKàXô[Vì’ïSà^\õò[⁄YVì’ïSà\Ÿ\õò[YHVàõﬁWŸ[ò»Vì’ïSà‹ôY[ùX[Ÿ[ò»Vì’ïSà]]€Y]ŸVì’ïSQêUS	ÿ€€⁄⁄YIÀà[òXõYì””PSàì’ïSQêUSïQKà‹ôX]Yÿ]SQT’STàì’ïSQêUSì’ 
+Kà\]Yÿ]SQT’STàì’ïSQêUSì’ 
+KàSíTUQH
+[Y‹ò[W⁄YX\öŸ]XŸK^\õò[⁄Y
+Bà
+N¬Çà‘ëPUHSëVQàì’VT’»X\öŸ]XŸWÿXÿ€›[ù◊›\Ÿ\ó⁄Yà”àX\öŸ]XŸWÿXÿ€›[ù»
+[Y‹ò[W⁄YX\öŸ]XŸK[òXõY‹ôX]Yÿ]
+N¬Çà‘ëPUHPìHQàì’VT’»ù[ú^Wÿ]]‹ô\W€Ÿ»
+à[Y‹ò[W⁄YíQ“Sïì’ïSëQëTëSê—T»ù[ú^W›\Ÿ\ú [Y‹ò[W⁄Y
+H”àSUH–T––QKà⁄]⁄YVì’ïSà\›‹Ÿ[ùSQT’STàì’ïSQêUSì’ 
+KàíSPTñH—VH
+[Y‹ò[W⁄Y⁄]⁄Y
+Bà
+N¬Çà‘ëPUHPìHQàì’VT’»ù[ú^W‹Y⁄[ú»
+à[Y‹ò[W⁄YíQ“Sïì’ïSëQëTëSê—T»ù[ú^W›\Ÿ\ú [Y‹ò[W⁄Y
+H”àSUH–T––QKà]ZYVì’ïSàö[[ò[YHVì’ïSàò[YHVì’ïSàô\ú⁄[€àVì’ïSà\ÿ‹ö\[€àVì’ïSà‹ôY]»Vì’ïSàŸ][ô‹◊‹YŸHì””PSàì’ïSQêUSêS—Kà€›\òŸHVì’ïSà[òXõYì””PSàì’ïSQêUSïQKàZWŸŸ[ô\ò]Yì””PSàì’ïSQêUSêS—KàZW‹õ€\VàZW‹›[[X\ûHVàZW‹ô]ö\⁄[€àSïQ—Tàì’ïSQêUSàZW›\]Yÿ]SQT’STãà\ÿYYÿ]SQT’STàì’ïSQêUSì’ 
+KàíSPTñH—VH
+[Y‹ò[W⁄Y]ZY
+Bà
+N¬ÇàSTàPìHù[ú^W‹Y⁄[ú¬àQ””SSàQàì’VT’»ZWŸŸ[ô\ò]Yì””PSàì’ïSQêUSêS—N¬àSTàPìHù[ú^W‹Y⁄[ú»Q””SSàQàì’VT’»ZW‹õ€\V¬àSTàPìHù[ú^W‹Y⁄[ú»Q””SSàQàì’VT’»ZW‹›[[X\ûHV¬àSTàPìHù[ú^W‹Y⁄[ú¬àQ””SSàQàì’VT’»ZW‹ô]ö\⁄[€àSïQ—Tàì’ïSQêUS¬àSTàPìHù[ú^W‹Y⁄[ú»Q””SSàQàì’VT’»ZW›\]Yÿ]SQT’STé¬Çà‘ëPUHPìHQàì’VT’»ù[ú^W‹Y⁄[ó‹Ÿ][ô‹»
+à[Y‹ò[W⁄YíQ“Sïì’ïSàY⁄[ó›]ZYVì’ïSàŸ][ô◊⁄Ÿ^HVì’ïSàŸ][ô◊›ò[YHVì’ïSà\]Yÿ]SQT’STàì’ïSQêUSì’ 
+KàíSPTñH—VH
+[Y‹ò[W⁄YY⁄[ó›]ZYŸ][ô◊⁄Ÿ^JKàì‘ëRQ”à—VH
+[Y‹ò[W⁄YY⁄[ó›]ZY
+BàëQëTëSê—T»ù[ú^W‹Y⁄[ú [Y‹ò[W⁄Y]ZY
+H”àSUH–T––QBà
+N¬Çà‘ëPUHPìHQàì’VT’»ù[ú^W‹Y⁄[ó›[]€ó‹Ÿ\‹⁄[€ú»
+àYíQ‘—TíPSà[Y‹ò[W⁄YíQ“Sïì’ïSàY⁄[ó›]ZYVì’ïSà€ôWŸ[ò»Vì’ïSàŸ\‹⁄[€óŸ[ò»Vì’ïSà\‹›€‹ôŸ[ò»Và[Y‹ò[W›\Ÿ\ó⁄YíQ“Sïì’ïSà[Y‹ò[W›\Ÿ\õò[YHVà\]Yÿ]SQT’STàì’ïSQêUSì’ 
+KàíSPTñH—VH
+Y
+Kàì‘ëRQ”à—VH
+[Y‹ò[W⁄YY⁄[ó›]ZY
+BàëQëTëSê—T»ù[ú^W‹Y⁄[ú [Y‹ò[W⁄Y]ZY
+H”àSUH–T––QBà
+N¬ÇàSTàPìHù[ú^W‹Y⁄[ó›[]€ó‹Ÿ\‹⁄[€ú¬àQ””SSàQàì’VT’»\‹›€‹ôŸ[ò»V¬àSTàPìHù[ú^W‹Y⁄[ó›[]€ó‹Ÿ\‹⁄[€ú¬àQ””SSàQàì’VT’»YíQ‘—TíPS¬à»		àëQ“SÇàQàVT’»
+à—SP’Hîì”H◊ÿ€€ú›òZ[ùà“TëH€€õò[YOIŸù[ú^W‹Y⁄[ó›[]€ó‹Ÿ\‹⁄[€ú◊‹Ÿ^I¬àSë€€úô[YIŸù[ú^W‹Y⁄[ó›[]€ó‹Ÿ\‹⁄[€ú…ŒéúôYÿ€\‹¬àSëÿ\ô[ò[]J€€öŸ^JOLÇà
+HSÇàSTàPìHù[ú^W‹Y⁄[ó›[]€ó‹Ÿ\‹⁄[€ú¬àì‘””î’êRSïù[ú^W‹Y⁄[ó›[]€ó‹Ÿ\‹⁄[€ú◊‹Ÿ^N¬àSëQé¬àQàì’VT’»
+à—SP’Hîì”H◊ÿ€€ú›òZ[ùà“TëH€€õò[YOIŸù[ú^W‹Y⁄[ó›[]€ó‹Ÿ\‹⁄[€ú◊‹Ÿ^I¬àSë€€úô[YIŸù[ú^W‹Y⁄[ó›[]€ó‹Ÿ\‹⁄[€ú…ŒéúôYÿ€\‹¬à
+HSÇàSTàPìHù[ú^W‹Y⁄[ó›[]€ó‹Ÿ\‹⁄[€ú¬àQ””î’êRSïù[ú^W‹Y⁄[ó›[]€ó‹Ÿ\‹⁄[€ú◊‹Ÿ^HíSPTñH—VH
+Y
+N¬àSëQé¬àSë		¬à‘ëPUHSíTUQHSëVQàì’VT’»ù[ú^W‹Y⁄[ó›[]€óÿXÿ€›[ù›ZYà”àù[ú^W‹Y⁄[ó›[]€ó‹Ÿ\‹⁄[€ú¬à
+[Y‹ò[W⁄YY⁄[ó›]ZY[Y‹ò[W›\Ÿ\ó⁄Y
+N¬Çà‘ëPUHPìHQàì’VT’»ù[ú^W‹Y⁄[óÿÿ][Ÿ»
+à]ZYVíSPTñH—VKà›€ô\ó›[Y‹ò[W⁄YíQ“SïëQëTëSê—T»ù[ú^W›\Ÿ\ú [Y‹ò[W⁄Y
+H”àSUH–T––QKàXõ\⁄\ó€ò[YHVì’ïSàö[[ò[YHVì’ïSàò[YHVì’ïSàô\ú⁄[€àVì’ïSà⁄‹ùŸ\ÿ‹ö\[€àVì’ïSà\ÿ‹ö\[€àVì’ïSà‹ôY]»Vì’ïSà€›\òŸHVì’ïSà\◊€ŸôöX⁄X[ì””PSàì’ïSQêUSêS—KàZWŸŸ[ô\ò]Yì””PSàì’ïSQêUSêS—Kà[ú›[ÿ€›[ùíQ“Sïì’ïSQêUSàXõ\⁄Yÿ]SQT’STàì’ïSQêUSì’ 
+Kà\]Yÿ]SQT’STàì’ïSQêUSì’ 
+Bà
+N¬ÇàSTàPìHù[ú^W‹Y⁄[óÿÿ][Ÿ¬àQ””SSàQàì’VT’»ZWŸŸ[ô\ò]Yì””PSàì’ïSQêUSêS—N¬Çà‘ëPUHPìHQàì’VT’»ù[ú^W‹Y⁄[óÿùZ[\ó‹Ÿ][ô‹»
+à[Y‹ò[W⁄YíQ“SïíSPTñH—VBàëQëTëSê—T»ù[ú^W›\Ÿ\ú [Y‹ò[W⁄Y
+H”àSUH–T––QKà\Wÿò\ŸW›\õVì’ïSQêUS	⁄ŒãÀÿ\Kò[ùõ‹XÀò€€IÀà\W›⁄Ÿ[óŸ[ò»Và[Ÿ[⁄YVà\]Yÿ]SQT’STàì’ïSQêUSì’ 
+Bà
+N¬Çà‘ëPUHSëVQàì’VT’»ù[ú^W‹Y⁄[óÿÿ][Ÿ◊€‹ô\ó⁄Yà”àù[ú^W‹Y⁄[óÿÿ][Ÿ»
+\◊€ŸôöX⁄X[T–À[ú›[ÿ€›[ùT–À\]Yÿ]T– N¬Çà‘ëPUHPìHQàì’VT’»ù[ú^WŸ[]ô\ûW‹ù[\»
+àYíQ‘—TíPSíSPTñH—VKà[Y‹ò[W⁄YíQ“Sïì’ïSëQëTëSê—T»ù[ú^W›\Ÿ\ú [Y‹ò[W⁄Y
+H”àSUH–T––QKà›⁄YíQ“Sïì’ïSà››]HVì’ïSàô\‹€úŸHVì’ïSàõŸX›»V◊Hì’ïSQêUSTîêVV◊NéïV◊Kà[òXõYì””PSàì’ïSQêUSïQKà\ÿXõWÿ]]◊‹ô\›‹ôHì””PSàì’ïSQêUSêS—Kà\ÿXõWÿ]]◊Ÿ\ÿXõHì””PSàì’ïSQêUSêS—Kà‹ôX]Yÿ]SQT’STàì’ïSQêUSì’ 
+Kà\]Yÿ]SQT’STàì’ïSQêUSì’ 
+KàSíTUQH
+[Y‹ò[W⁄Y›⁄Y
+Bà
+N¬Çà‘ëPUHPìHQàì’VT’»ù[ú^WŸ[]ô\ûW€Ÿ»
+à[Y‹ò[W⁄YíQ“Sïì’ïSëQëTëSê—T»ù[ú^W›\Ÿ\ú [Y‹ò[W⁄Y
+H”àSUH–T––QKà‹ô\ó⁄YVì’ïSàù[W⁄YíQ“SïëQëTëSê—T»ù[ú^WŸ[]ô\ûW‹ù[\ Y
+H”àSUH—UïSà›]\»Vì’ïSà]Z[»Và‹ôX]Yÿ]SQT’STàì’ïSQêUSì’ 
+KàíSPTñH—VH
+[Y‹ò[W⁄Y‹ô\ó⁄Y
+Bà
+N¬Çà‘ëPUHPìHQàì’VT’»ù[ú^Wÿ€€[X[ô‹ô\Y\»
+àYíQ‘—TíPSíSPTñH—VKà[Y‹ò[W⁄YíQ“Sïì’ïSëQëTëSê—T»ù[ú^W›\Ÿ\ú [Y‹ò[W⁄Y
+H”àSUH–T––QKàöYŸŸ\àVì’ïSàô\‹€úŸHVì’ïSà[òXõYì””PSàì’ïSQêUSïQKàõ›YûHì””PSàì’ïSQêUSïQKà‹ôX]Yÿ]SQT’STàì’ïSQêUSì’ 
+Kà\]Yÿ]SQT’STàì’ïSQêUSì’ 
+KàSíTUQH
+[Y‹ò[W⁄YöYŸŸ\äBà
+N¬Çà‘ëPUHPìHQàì’VT’»ù[ú^W€õ›YöXÿ][€ó›\ôŸ]»
+à[Y‹ò[W⁄YíQ“Sïì’ïSëQëTëSê—T»ù[ú^W›\Ÿ\ú [Y‹ò[W⁄Y
+H”àSUH–T––QKà⁄]⁄YíQ“Sïì’ïSà]HVì’ïSà[òXõYì””PSàì’ïSQêUSïQKà‹ôX]Yÿ]SQT’STàì’ïSQêUSì’ 
+KàíSPTñH—VH
+[Y‹ò[W⁄Y⁄]⁄Y
+Bà
+N¬Çà‘ëPUHPìHQàì’VT’»^Y\õ⁄◊ÿ]]‹ô\W€Ÿ»
+à[Y‹ò[W⁄YíQ“Sïì’ïSëQëTëSê—T»ù[ú^W›\Ÿ\ú [Y‹ò[W⁄Y
+H”àSUH–T––QKà⁄]⁄YVì’ïSà\›‹Ÿ[ùSQT’STàì’ïSQêUSì’ 
+KàíSPTñH—VH
+[Y‹ò[W⁄Y⁄]⁄Y
+Bà
+N¬Çà‘ëPUHPìHQàì’VT’»^Y\õ⁄◊ÿ€€[X[ô‹ô\Y\»
+àYíQ‘—TíPSíSPTñH—VKà[Y‹ò[W⁄YíQ“Sïì’ïSëQëTëSê—T»ù[ú^W›\Ÿ\ú [Y‹ò[W⁄Y
+H”àSUH–T––QKàöYŸŸ\àVì’ïSàô\‹€úŸHVì’ïSà[òXõYì””PSàì’ïSQêUSïQKàõ›YûHì””PSàì’ïSQêUSïQKà‹ôX]Yÿ]SQT’STàì’ïSQêUSì’ 
+Kà\]Yÿ]SQT’STàì’ïSQêUSì’ 
+KàSíTUQH
+[Y‹ò[W⁄YöYŸŸ\äBà
+N¬Çà‘ëPUHPìHQàì’VT’»^Y\õ⁄◊Ÿ[]ô\ûW‹ù[\»
+àYíQ‘—TíPSíSPTñH—VKà[Y‹ò[W⁄YíQ“Sïì’ïSëQëTëSê—T»ù[ú^W›\Ÿ\ú [Y‹ò[W⁄Y
+H”àSUH–T––QKà][W⁄YVì’ïSà][W›]HVì’ïSàô\‹€úŸHVì’ïSàõŸX›»V◊Hì’ïSQêUSTîêVV◊NéïV◊Kà[òXõYì””PSàì’ïSQêUSïQKà‹ôX]Yÿ]SQT’STàì’ïSQêUSì’ 
+Kà\]Yÿ]SQT’STàì’ïSQêUSì’ 
+KàSíTUQH
+[Y‹ò[W⁄Y][W⁄Y
+Bà
+N¬Çà‘ëPUHPìHQàì’VT’»^Y\õ⁄◊Ÿ[]ô\ûW€Ÿ»
+à[Y‹ò[W⁄YíQ“Sïì’ïSëQëTëSê—T»ù[ú^W›\Ÿ\ú [Y‹ò[W⁄Y
+H”àSUH–T––QKàX[⁄YVì’ïSàù[W⁄YíQ“SïëQëTëSê—T»^Y\õ⁄◊Ÿ[]ô\ûW‹ù[\ Y
+H”àSUH—UïSà›]\»Vì’ïSà]Z[»Và‹ôX]Yÿ]SQT’STàì’ïSQêUSì’ 
+KàíSPTñH—VH
+[Y‹ò[W⁄YX[⁄Y
+Bà
+N¬Çà‘ëPUHPìHQàì’VT’»^Y\õ⁄◊‹õ€[›[€ó‹ô\]Y\›»
+à⁄Ÿ[àVíSPTñH—VKà[Y‹ò[W⁄YíQ“Sïì’ïSëQëTëSê—T»ù[ú^W›\Ÿ\ú [Y‹ò[W⁄Y
+H”àSUH–T––QKàXÿ€›[ù⁄YíQ“Sïì’ïSëQëTëSê—T»X\öŸ]XŸWÿXÿ€›[ù Y
+H”àSUH–T––QKà][W⁄YVì’ïSà][W›]HVì’ïSàö[‹ö]W‹›]\◊⁄YVì’ïSàö[‹ö]W€ò[YHVì’ïSà^X›Y‹öXŸHSïQ—Tàì’ïS“P“»
+^X›Y‹öXŸHà
+Kà\ö[ŸŸ^\»SïQ—Tàì’ïSQêUSà›]\»Vì’ïSQêUS	‹[ô[ô…¬à“P“»
+›]\»Sà
+	‹[ô[ô…À	‹õÿŸ\‹⁄[ô…À	‹›XÿŸYYY	À	ŸòZ[Y	 JKà\úõ‹ó›^Và‹ôX]Yÿ]SQT’STàì’ïSQêUSì’ 
+Kà\]Yÿ]SQT’STàì’ïSQêUSì’ 
+Bà
+N¬Çà‘ëPUHSëVQàì’VT’»^Y\õ⁄◊‹õ€[›[€ó‹ô\]Y\›◊›\Ÿ\ó⁄Yà”à^Y\õ⁄◊‹õ€[›[€ó‹ô\]Y\›»
+[Y‹ò[W⁄Y‹ôX]Yÿ]T– N¬Çà‘ëPUHPìHQàì’VT’»^Y\õ⁄◊‹Y⁄[ú»
+à[Y‹ò[W⁄YíQ“Sïì’ïSëQëTëSê—T»ù[ú^W›\Ÿ\ú [Y‹ò[W⁄Y
+H”àSUH–T––QKà]ZYVì’ïSàö[[ò[YHVì’ïSàò[YHVì’ïSàô\ú⁄[€àVì’ïSà\ÿ‹ö\[€àVì’ïSà‹ôY]»Vì’ïSàŸ][ô‹◊‹YŸHì””PSàì’ïSQêUSêS—Kà€›\òŸHVì’ïSà[òXõYì””PSàì’ïSQêUSïQKà\ÿYYÿ]SQT’STàì’ïSQêUSì’ 
+KàíSPTñH—VH
+[Y‹ò[W⁄Y]ZY
+Bà
+N¬Çà‘ëPUHPìHQàì’VT’»^Y\õ⁄◊‹Y⁄[ó‹Ÿ][ô‹»
+à[Y‹ò[W⁄YíQ“Sïì’ïSàY⁄[ó›]ZYVì’ïSàŸ][ô◊⁄Ÿ^HVì’ïSàŸ][ô◊›ò[YHVì’ïSà\]Yÿ]SQT’STàì’ïSQêUSì’ 
+KàíSPTñH—VH
+[Y‹ò[W⁄YY⁄[ó›]ZYŸ][ô◊⁄Ÿ^JKàì‘ëRQ”à—VH
+[Y‹ò[W⁄YY⁄[ó›]ZY
+BàëQëTëSê—T»^Y\õ⁄◊‹Y⁄[ú [Y‹ò[W⁄Y]ZY
+H”àSUH–T––QBà
+N¬Çà‘ëPUHPìHQàì’VT’»^Y\õ⁄◊‹Y⁄[óÿÿ][Ÿ»
+à]ZYVíSPTñH—VKà›€ô\ó›[Y‹ò[W⁄YíQ“SïëQëTëSê—T»ù[ú^W›\Ÿ\ú [Y‹ò[W⁄Y
+H”àSUH–T––QKàXõ\⁄\ó€ò[YHVì’ïSàö[[ò[YHVì’ïSàò[YHVì’ïSàô\ú⁄[€àVì’ïSà⁄‹ùŸ\ÿ‹ö\[€àVì’ïSà\ÿ‹ö\[€àVì’ïSà‹ôY]»Vì’ïSà€›\òŸHVì’ïSà\◊€ŸôöX⁄X[ì””PSàì’ïSQêUSêS—Kà[ú›[ÿ€›[ùíQ“Sïì’ïSQêUSàXõ\⁄Yÿ]SQT’STàì’ïSQêUSì’ 
+Kà\]Yÿ]SQT’STàì’ïSQêUSì’ 
+Bà
+N¬Çà‘ëPUHSëVQàì’VT’»^Y\õ⁄◊‹Y⁄[óÿÿ][Ÿ◊€‹ô\ó⁄Yà”à^Y\õ⁄◊‹Y⁄[óÿÿ][Ÿ¬à
+\◊€ŸôöX⁄X[T–À[ú›[ÿ€›[ùT–À\]Yÿ]T– N¬àààÇà
+Bà]ÿZ]Ÿ[ãõZY‹ò]W€YÿXﬁW€X\öŸ]XŸWÿXÿ€›[ù 
+Bà]ÿZ]Ÿ[ãúŸYY€ŸôöX⁄X[‹Y⁄[ú 
+Bà]ÿZ]Ÿ[ãúŸYY€ŸôöX⁄X[‹^Y\õ⁄◊‹Y⁄[ú 
+BÇà\ﬁ[ò»Yà€‹ŸJŸ[äHOàõ€ôNÇàYàŸ[ãú€€Çà]ÿZ]Ÿ[ãú€€ò€‹ŸJ
+BÇà\ﬁ[ò»Yà^X›]JŸ[ã]Y\ûNà›ã
+ò\ô‹Œà[ûJHOà›éÇàYàõ›Ÿ[ãú€€ÇàòZ\ŸHù[ù[YQ\úõ‹ä¥$t,4-Ù,4-4,4/t/tbÙaH4/t-H4/Ù/¥-4.¥.Ùc¥aÙ-t/t,äBàô]\õà]ÿZ]Ÿ[ãú€€ô^X›]J]Y\ûK
+ò\ô‹ BÇà\ﬁ[ò»Yàô]⁄õ› Ÿ[ã]Y\ûNà›ã
+ò\ô‹Œà[ûJHOà\ﬁ[ò‹ÀîôX€‹ôõ€ôNÇàYàõ›Ÿ[ãú€€ÇàòZ\ŸHù[ù[YQ\úõ‹ä¥$t,4-Ù,4-4,4/t/tbÙaH4/t-H4/Ù/¥-4.¥.Ùc¥aÙ-t/t,äBàô]\õà]ÿZ]Ÿ[ãú€€ôô]⁄õ› ]Y\ûK
+ò\ô‹ BÇà\ﬁ[ò»Yàô]⁄
+Ÿ[ã]Y\ûNà›ã
+ò\ô‹Œà[ûJHOà\›ÿ\ﬁ[ò‹ÀîôX€‹ôNÇàYàõ›Ÿ[ãú€€ÇàòZ\ŸHù[ù[YQ\úõ‹ä¥$t,4-Ù,4-4,4/t/tbÙaH4/t-H4/Ù/¥-4.¥.Ùc¥aÙ-t/t,äBàô]\õà]ÿZ]Ÿ[ãú€€ôô]⁄
+]Y\ûK
+ò\ô‹ BÇà\ﬁ[ò»Yà[ú›\ôW›\Ÿ\äŸ[ã[Y‹ò[W⁄Yà[ù
+HOàõ€ôNÇà]ÿZ]Ÿ[ãô^X›]JàíSî—TïSï»ù[ú^W›\Ÿ\ú»
+[Y‹ò[W⁄Y
+HêSQT»
+	JH”à””ëìP’»ì’Së»ãà[Y‹ò[W⁄Yà
+BÇà\ﬁ[ò»YàŸ]›\Ÿ\äŸ[ã[Y‹ò[W⁄Yà[ù
+HOà\ﬁ[ò‹ÀîôX€‹ôõ€ôNÇàô]\õà]ÿZ]Ÿ[ãôô]⁄õ› î—SP’
+àîì”Hù[ú^W›\Ÿ\ú»“TëH[Y‹ò[W⁄YIHã[Y‹ò[W⁄Y
+BÇà\ﬁ[ò»YàZY‹ò]W€YÿXﬁW€X\öŸ]XŸWÿXÿ€›[ù Ÿ[äHOàõ€ôNÇààà¥'¥-4/t/¥.¥`4,4`¥/t/à4/Ù-t`4-t/t/¥`t.4`à4`t`¥,4`4bÙ-H4/¥-4.4/t/¥aÙ/tbÙ-H4/Ù/¥-4.¥.Ùc¥aÙ-t/t.4c»4,t-t-»4`4,4`t.¥`4bÙ`¥.4c»4`t-t.¥`4-t`¥/¥,ãàààÇà]ÿZ]Ÿ[ãô^X›]JàààÇàSî—TïSï»X\öŸ]XŸWÿXÿ€›[ù¬à
+[Y‹ò[W⁄YX\öŸ]XŸKXô[^\õò[⁄Y\Ÿ\õò[YKàõﬁWŸ[òÀ‹ôY[ùX[Ÿ[òÀ]]€Y]Ÿ
+Bà—SP’[Y‹ò[W⁄Y	Ÿù[ú^IÀ”–ST–—Jù[ú^W›\Ÿ\õò[YK	—ù[î^I Kàù[ú^W⁄YéïVù[ú^W›\Ÿ\õò[YKõﬁWŸ[òÀ€€[ó⁄Ÿ^WŸ[òÀ	Ÿ€€[ó⁄Ÿ^I¬àîì”Hù[ú^W›\Ÿ\ú»Bà“TëHXÿ€›[ùÿX›]ôOUïQHSëõﬁWŸ[ò»T»ì’ïSàSë€€[ó⁄Ÿ^WŸ[ò»T»ì’ïSSëù[ú^W⁄YT»ì’ïSà”à””ëìP’
+[Y‹ò[W⁄YX\öŸ]XŸK^\õò[⁄Y
+H»ì’SëŒ¬ÇàSî—TïSï»X\öŸ]XŸWÿXÿ€›[ù¬à
+[Y‹ò[W⁄YX\öŸ]XŸKXô[^\õò[⁄Y\Ÿ\õò[YKàõﬁWŸ[òÀ‹ôY[ùX[Ÿ[òÀ]]€Y]Ÿ
+Bà—SP’[Y‹ò[W⁄Y	‹^Y\õ⁄…À”–ST–—J^Y\õ⁄◊›\Ÿ\õò[YK	‘^Y\õ⁄… Kà^Y\õ⁄◊⁄Y^Y\õ⁄◊›\Ÿ\õò[YK^Y\õ⁄◊‹õﬁWŸ[òÀà^Y\õ⁄◊ÿ€€⁄⁄YWŸ[òÀ	ÿ€€⁄⁄YI¬àîì”Hù[ú^W›\Ÿ\ú»Bà“TëH^Y\õ⁄◊ÿX›]ôOUïQHSë^Y\õ⁄◊‹õﬁWŸ[ò»T»ì’ïSàSë^Y\õ⁄◊ÿ€€⁄⁄YWŸ[ò»T»ì’ïSSë^Y\õ⁄◊⁄YT»ì’ïSà”à””ëìP’
+[Y‹ò[W⁄YX\öŸ]XŸK^\õò[⁄Y
+H»ì’SëŒ¬ÇàTUHù[ú^W›\Ÿ\ú»Bà—UX›]ôWŸù[ú^WÿXÿ€›[ù⁄YH”–ST–—JàX›]ôWŸù[ú^WÿXÿ€›[ù⁄Yà
+—SP’KöYîì”HX\öŸ]XŸWÿXÿ€›[ù»Bà“TëHKù[Y‹ò[W⁄Y]Kù[Y‹ò[W⁄YSëKõX\öŸ]XŸOIŸù[ú^I¬à‘ëTàñHKò‹ôX]Yÿ]KöYSRUJBà
+KàX›]ôW‹^Y\õ⁄◊ÿXÿ€›[ù⁄YH”–ST–—JàX›]ôW‹^Y\õ⁄◊ÿXÿ€›[ù⁄Yà
+—SP’KöYîì”HX\öŸ]XŸWÿXÿ€›[ù»Bà“TëHKù[Y‹ò[W⁄Y]Kù[Y‹ò[W⁄YSëKõX\öŸ]XŸOI‹^Y\õ⁄…¬à‘ëTàñHKò‹ôX]Yÿ]KöYSRUJBà
+N¬àààÇà
+BÇà›]X€Y]ŸàYàÿX›]ôWÿXÿ€›[ùÿ€€[[äX\öŸ]XŸNà›äHOà›éÇàYàX\öŸ]XŸHOHôù[ú^HéÇàô]\õàòX›]ôWŸù[ú^WÿXÿ€›[ù⁄YÇàYàX\öŸ]XŸHOHú^Y\õ⁄»éÇàô]\õàòX›]ôW‹^Y\õ⁄◊ÿXÿ€›[ù⁄YÇàòZ\ŸHò[YQ\úõ‹ä¥'t-t.4-Ù,¥-t`t`¥/t,4c»4/Ù.Ù/¥bt,4-4.¥,äBÇà\ﬁ[ò»Yà\›€X\öŸ]XŸWÿXÿ€›[ù àŸ[ã[Y‹ò[W⁄Yà[ùX\öŸ]XŸNà›Çà
+HOà\›ÿ\ﬁ[ò‹ÀîôX€‹ôNÇàŸ[ãóÿX›]ôWÿXÿ€›[ùÿ€€[[äX\öŸ]XŸJBàô]\õà]ÿZ]Ÿ[ãôô]⁄
+àààÇà—SP’
+àîì”HX\öŸ]XŸWÿXÿ€›[ù¬à“TëH[Y‹ò[W⁄YIHSëX\öŸ]XŸOIàSë[òXõYUïQBà‘ëTàñH‹ôX]Yÿ]Yàààãà[Y‹ò[W⁄YàX\öŸ]XŸKà
+BÇà\ﬁ[ò»YàŸ]€X\öŸ]XŸWÿXÿ€›[ù
+àŸ[ã[Y‹ò[W⁄Yà[ùX\öŸ]XŸNà›ãXÿ€›[ù⁄Yà[ùà
+HOà\ﬁ[ò‹ÀîôX€‹ôõ€ôNÇàŸ[ãóÿX›]ôWÿXÿ€›[ùÿ€€[[äX\öŸ]XŸJBàô]\õà]ÿZ]Ÿ[ãôô]⁄õ› àààÇà—SP’
+àîì”HX\öŸ]XŸWÿXÿ€›[ù¬à“TëH[Y‹ò[W⁄YIHSëX\öŸ]XŸOIàSëYI»Së[òXõYUïQBàààãà[Y‹ò[W⁄YàX\öŸ]XŸKàXÿ€›[ù⁄Yà
+BÇà\ﬁ[ò»YàŸ]ÿX›]ôW€X\öŸ]XŸWÿXÿ€›[ù
+àŸ[ã[Y‹ò[W⁄Yà[ùX\öŸ]XŸNà›Çà
+HOà\ﬁ[ò‹ÀîôX€‹ôõ€ôNÇà€€[[àHŸ[ãóÿX›]ôWÿXÿ€›[ùÿ€€[[äX\öŸ]XŸJBàõ›»H]ÿZ]Ÿ[ãôô]⁄õ› ààààÇà—SP’Käàîì”HX\öŸ]XŸWÿXÿ€›[ù»Bàì“Sàù[ú^W›\Ÿ\ú»H”àKù[Y‹ò[W⁄YXKù[Y‹ò[W⁄Yà“TëHKù[Y‹ò[W⁄YIHSëKõX\öŸ]XŸOIàSëKô[òXõYUïQBà‘ëTàñH
+KöY]Kûÿ€€[[üJHT–ÀKò‹ôX]Yÿ]KöYàSRUBàààãà[Y‹ò[W⁄YàX\öŸ]XŸKà
+BàYàõ›ŒÇà]ÿZ]Ÿ[ãô^X›]JààïTUHù[ú^W›\Ÿ\ú»—Uÿ€€[[üOIà“TëH[Y‹ò[W⁄YIHãà[Y‹ò[W⁄Yàõ›÷»öYóKà
+Bàô]\õàõ›¬Çà\ﬁ[ò»YàY€X\öŸ]XŸWÿXÿ€›[ù
+àŸ[ãà[Y‹ò[W⁄Yà[ùàX\öŸ]XŸNà›ãàõﬁWŸ[òŒà›ãà‹ôY[ùX[Ÿ[òŒà›ãà^\õò[⁄Yà›ãà\Ÿ\õò[YNà›àõ€ôKà
+ãà]]€Y]Ÿà›ãà
+HOà\ﬁ[ò‹ÀîôX€‹ôÇà€€[[àHŸ[ãóÿX›]ôWÿXÿ€›[ùÿ€€[[äX\öŸ]XŸJBà]ÿZ]Ÿ[ãô[ú›\ôW›\Ÿ\ä[Y‹ò[W⁄Y
+BàXô[H
+\Ÿ\õò[YH‹ààû€X\öŸ]XŸKù]J
+_HŸ^\õò[⁄YHäKú›ö\
+
+VŒåLåBàõ›»H]ÿZ]Ÿ[ãôô]⁄õ› àààÇàSî—TïSï»X\öŸ]XŸWÿXÿ€›[ù¬à
+[Y‹ò[W⁄YX\öŸ]XŸKXô[^\õò[⁄Y\Ÿ\õò[YKàõﬁWŸ[òÀ‹ôY[ùX[Ÿ[òÀ]]€Y]Ÿ[òXõY\]Yÿ]
+BàêSQT»
+	K	ã	À		K	ã	À	ïQKì’ 
+JBà”à””ëìP’
+[Y‹ò[W⁄YX\öŸ]XŸK^\õò[⁄Y
+H»TUBà—UXô[QV”QQõXô[\Ÿ\õò[YOQV”QQù\Ÿ\õò[YKàõﬁWŸ[òœQV”QQúõﬁWŸ[òÀà‹ôY[ùX[Ÿ[òœQV”QQò‹ôY[ùX[Ÿ[òÀà]]€Y]ŸQV”QQò]]€Y]Ÿ[òXõYUïQK\]Yÿ]Sì’ 
+BàëUTìíSë»
+Çàààãà[Y‹ò[W⁄YàX\öŸ]XŸKàXô[à›ä^\õò[⁄Y
+Kà\Ÿ\õò[YKàõﬁWŸ[òÀà‹ôY[ùX[Ÿ[òÀà]]€Y]Ÿà
+Bà]ÿZ]Ÿ[ãô^X›]JààààÇàTUHù[ú^W›\Ÿ\ú¬à—Uÿ€€[[üOIãX›]ôW€X\öŸ]XŸOIÀàXÿ€›[ùÿX›]ôOP–T—H“Sà	œIŸù[ú^I»SàïQHS—HXÿ€›[ùÿX›]ôHSëà^Y\õ⁄◊ÿX›]ôOP–T—H“Sà	œI‹^Y\õ⁄…»SàïQHS—H^Y\õ⁄◊ÿX›]ôHSëà\]Yÿ]Sì’ 
+Bà“TëH[Y‹ò[W⁄YIBàààãà[Y‹ò[W⁄Yàõ›÷»öYóKàX\öŸ]XŸKà
+Bàô]\õàõ›¬Çà\ﬁ[ò»YàŸ]ÿX›]ôWÿXÿ€›[ù
+àŸ[ã[Y‹ò[W⁄Yà[ùX\öŸ]XŸNà›ãXÿ€›[ù⁄Yà[ùà
+HOà\ﬁ[ò‹ÀîôX€‹ôÇà€€[[àHŸ[ãóÿX›]ôWÿXÿ€›[ùÿ€€[[äX\öŸ]XŸJBàõ›»H]ÿZ]Ÿ[ãôŸ]€X\öŸ]XŸWÿXÿ€›[ù
+[Y‹ò[W⁄YX\öŸ]XŸKXÿ€›[ù⁄Y
+BàYàõ›õ›ŒÇàòZ\ŸHò[YQ\úõ‹ä¥$4.¥.¥,4`Ù/t`à4/t-H4/t,4.t-4-t/HäBà]ÿZ]Ÿ[ãô^X›]JààààÇàTUHù[ú^W›\Ÿ\ú»—Uÿ€€[[üOIãX›]ôW€X\öŸ]XŸOIÀ\]Yÿ]Sì’ 
+Bà“TëH[Y‹ò[W⁄YIBàààãà[Y‹ò[W⁄YàXÿ€›[ù⁄YàX\öŸ]XŸKà
+Bàô]\õàõ›¬Çà\ﬁ[ò»Yà[]W€X\öŸ]XŸWÿXÿ€›[ù
+àŸ[ã[Y‹ò[W⁄Yà[ùX\öŸ]XŸNà›ãXÿ€›[ù⁄Yà[ùà
+HOà\ﬁ[ò‹ÀîôX€‹ôõ€ôNÇà€€[[àHŸ[ãóÿX›]ôWÿXÿ€›[ùÿ€€[[äX\öŸ]XŸJBà]ÿZ]Ÿ[ãô^X›]JàààÇàSUHîì”HX\öŸ]XŸWÿXÿ€›[ù¬à“TëH[Y‹ò[W⁄YIHSëX\öŸ]XŸOIàSëYI¬àààãà[Y‹ò[W⁄YàX\öŸ]XŸKàXÿ€›[ù⁄Yà
+Bàô\XŸ[Y[ùH]ÿZ]Ÿ[ãôô]⁄õ› àààÇà—SP’
+àîì”HX\öŸ]XŸWÿXÿ€›[ù¬à“TëH[Y‹ò[W⁄YIHSëX\öŸ]XŸOIàSë[òXõYUïQBà‘ëTàñH‹ôX]Yÿ]YSRUBàààãà[Y‹ò[W⁄YàX\öŸ]XŸKà
+Bà]ÿZ]Ÿ[ãô^X›]JààààÇàTUHù[ú^W›\Ÿ\ú¬à—Uÿ€€[[üOIãàXÿ€›[ùÿX›]ôOP–T—H“Sà	œIŸù[ú^I»Sà
+	ééêíQ“SïT»ì’ïS
+HS—HXÿ€›[ùÿX›]ôHSëà^Y\õ⁄◊ÿX›]ôOP–T—H“Sà	œI‹^Y\õ⁄…»Sà
+	ééêíQ“SïT»ì’ïS
+HS—H^Y\õ⁄◊ÿX›]ôHSëà\]Yÿ]Sì’ 
+Bà“TëH[Y‹ò[W⁄YIBàààãà[Y‹ò[W⁄Yàô\XŸ[Y[ù»öYóHYàô\XŸ[Y[ù[ŸHõ€ôKàX\öŸ]XŸKà
+Bàô]\õàô\XŸ[Y[ùÇà\ﬁ[ò»Yàÿ]ôWÿXÿ€›[ù
+àŸ[ãà[Y‹ò[W⁄Yà[ùàõﬁWŸ[òŒà›ãà€€[ó⁄Ÿ^WŸ[òŒà›ãàXÿ€›[ùàXÿ€›[ùà
+HOà\ﬁ[ò‹ÀîôX€‹ôÇàô]\õà]ÿZ]Ÿ[ãòY€X\öŸ]XŸWÿXÿ€›[ù
+à[Y‹ò[W⁄Yàôù[ú^HãàõﬁWŸ[òÀà€€[ó⁄Ÿ^WŸ[òÀà›äXÿ€›[ùöY
+KàXÿ€›[ùù\Ÿ\õò[YKà]]€Y]ŸHô€€[ó⁄Ÿ^Hãà
+BÇà\ﬁ[ò»Yà\ÿ€€õôX›ÿXÿ€›[ù
+Ÿ[ã[Y‹ò[W⁄Yà[ù
+HOàõ€ôNÇàXÿ€›[ùH]ÿZ]Ÿ[ãôŸ]ÿX›]ôW€X\öŸ]XŸWÿXÿ€›[ù
+[Y‹ò[W⁄Yôù[ú^HäBàYàXÿ€›[ùÇà]ÿZ]Ÿ[ãô[]W€X\öŸ]XŸWÿXÿ€›[ù
+[Y‹ò[W⁄Yôù[ú^Hã[ù
+Xÿ€›[ù»öYóJJBÇà\ﬁ[ò»Yàÿ]ôW‹^Y\õ⁄◊ÿXÿ€›[ù
+àŸ[ãà[Y‹ò[W⁄Yà[ùàõﬁWŸ[òŒà›ãà€€⁄⁄YWŸ[òŒà›ãàXÿ€›[ùà[ûKà]]€Y]Ÿà›àHò€€⁄⁄YHãà
+HOà\ﬁ[ò‹ÀîôX€‹ôÇàô]\õà]ÿZ]Ÿ[ãòY€X\öŸ]XŸWÿXÿ€›[ù
+à[Y‹ò[W⁄Yàú^Y\õ⁄»ãàõﬁWŸ[òÀà€€⁄⁄YWŸ[òÀà›äXÿ€›[ùöY
+KàXÿ€›[ùù\Ÿ\õò[YKà]]€Y]ŸX]]€Y]Ÿà
+BÇà\ﬁ[ò»Yà\ÿ€€õôX›‹^Y\õ⁄◊ÿXÿ€›[ù
+Ÿ[ã[Y‹ò[W⁄Yà[ù
+HOàõ€ôNÇàXÿ€›[ùH]ÿZ]Ÿ[ãôŸ]ÿX›]ôW€X\öŸ]XŸWÿXÿ€›[ù
+[Y‹ò[W⁄Yú^Y\õ⁄»äBàYàXÿ€›[ùÇà]ÿZ]Ÿ[ãô[]W€X\öŸ]XŸWÿXÿ€›[ù
+[Y‹ò[W⁄Yú^Y\õ⁄»ã[ù
+Xÿ€›[ù»öYóJJBÇà\ﬁ[ò»YàŸ]ÿX›]ôW€X\öŸ]XŸJŸ[ã[Y‹ò[W⁄Yà[ùX\öŸ]XŸNà›äHOàõ€ôNÇàYàX\öŸ]XŸHõ›[à»ôù[ú^Hãú^Y\õ⁄»üNÇàòZ\ŸHò[YQ\úõ‹ä¥'t-t.4-Ù,¥-t`t`¥/t,4c»4/Ù.Ù/¥bt,4-4.¥,äBà]ÿZ]Ÿ[ãô^X›]JàïTUHù[ú^W›\Ÿ\ú»—UX›]ôW€X\öŸ]XŸOIã\]Yÿ]Sì’ 
+H“TëH[Y‹ò[W⁄YIHãà[Y‹ò[W⁄YàX\öŸ]XŸKà
+BÇà\ﬁ[ò»YàŸ]ŸõY Ÿ[ã[Y‹ò[W⁄Yà[ù€€[[éà›ãò[YNàõ€€
+HOàõ€ôNÇà[›ŸYH¬àõõ›YûW€Y\‹ÿYŸ\»ãàõõ›YûW€ô]◊€‹ô\ú»ãàõõ›YûW€‹ô\ó‹›]\»ãàõõ›YûW‹ô]öY]‹»ãàõõ›YûW€›◊‹òZ\ŸHãàõõ›YûW‹ﬁ\›[Hãàò]]◊‹òZ\ŸWŸ[òXõYãàöŸY\€€õ[ôWŸ[òXõYãàò]]‹ô\WŸ[òXõYãàò]]‹ô\W€ô]◊ÿ⁄]◊€€õHãàúô]öY]◊‹ô\WŸ[òXõYãàú^Y\õ⁄◊€õ›YûW€Y\‹ÿYŸ\»ãàú^Y\õ⁄◊€õ›YûWŸX[»ãàú^Y\õ⁄◊€õ›YûW‹ô]öY]‹»ãàú^Y\õ⁄◊€õ›YûW‹ﬁ\›[Hãàú^Y\õ⁄◊ÿ]]◊‹Xõ\⁄Ÿ[òXõYãàú^Y\õ⁄◊ÿ]]‹ô\WŸ[òXõYãàú^Y\õ⁄◊ÿ]]◊Ÿ[]ô\ûWŸ[òXõYãàú^Y\õ⁄◊ÿ]]◊ÿ€€ôö\õWŸ[òXõYãàú^Y\õ⁄◊€õ›YûWŸ[]ô\ûHãàò]]◊Ÿ[]ô\ûWŸ[òXõYãàõ][WŸ[]ô\ûWŸ[òXõYãàô[]ô\ûWÿ]]◊‹ô\›‹ôHãàô[]ô\ûWÿ]]◊Ÿ\ÿXõHãàõõ›YûWŸ[]ô\ûHãàBàYà€€[[àõ›[à[›ŸYÇàòZ\ŸHò[YQ\úõ‹ä¥'t-t-4/¥/Ù`Ù`t`¥.4/4,4c»4/t,4`t`¥`4/¥.t.¥,äBà]ÿZ]Ÿ[ãô^X›]JààïTUHù[ú^W›\Ÿ\ú»—Uÿ€€[[üOIã\]Yÿ]Sì’ 
+H“TëH[Y‹ò[W⁄YIHãà[Y‹ò[W⁄Yàò[YKà
+BÇà\ﬁ[ò»YàŸ]ÿ]]‹ô\W›^
+Ÿ[ã[Y‹ò[W⁄Yà[ù^à›äHOàõ€ôNÇà]ÿZ]Ÿ[ãô^X›]JàïTUHù[ú^W›\Ÿ\ú»—U]]‹ô\W›^Iã\]Yÿ]Sì’ 
+H“TëH[Y‹ò[W⁄YIHãà[Y‹ò[W⁄Yà^à
+BÇà\ﬁ[ò»YàŸ]‹^Y\õ⁄◊ÿ]]‹ô\W›^
+Ÿ[ã[Y‹ò[W⁄Yà[ù^à›äHOàõ€ôNÇà]ÿZ]Ÿ[ãô^X›]JàïTUHù[ú^W›\Ÿ\ú»—U^Y\õ⁄◊ÿ]]‹ô\W›^Iã\]Yÿ]Sì’ 
+H“TëH[Y‹ò[W⁄YIHãà[Y‹ò[W⁄Yà^à
+BÇà\ﬁ[ò»YàŸ]⁄[ùYŸ\ó‹Ÿ][ô Ÿ[ã[Y‹ò[W⁄Yà[ù€€[[éà›ãò[YNà[ù
+HOàõ€ôNÇà[›ŸYH¬àò]]‹ô\Wÿ€€€›€ó€Z[ù]\»éà
+M
+Kàò]]‹ô\WŸ[^W‹ŸX€€ô»éà
+Ã
+Kàò]]‹ô\W›€‹ö◊‹›\ùéà
+å Kàò]]‹ô\W›€‹ö◊Ÿ[ôéà
+Kç
+Kàú^Y\õ⁄◊ÿ]]‹ô\Wÿ€€€›€ó€Z[ù]\»éà
+M
+Kàú^Y\õ⁄◊ÿ]]‹ô\WŸ[^W‹ŸX€€ô»éà
+Ã
+Kàú^Y\õ⁄◊ÿ]]‹ô\W›€‹ö◊‹›\ùéà
+å Kàú^Y\õ⁄◊ÿ]]‹ô\W›€‹ö◊Ÿ[ôéà
+Kç
+KàBàYà€€[[àõ›[à[›ŸY‹àõ›[›ŸYÿ€€[[óVÃHHò[YHH[›ŸYÿ€€[[óVÃWNÇàòZ\ŸHò[YQ\úõ‹ä¥'t-t-4/¥/Ù`Ù`t`¥.4/4/¥-H4-Ù/t,4aÙ-t/t.4-H4/t,4`t`¥`4/¥.t.¥.äBà]ÿZ]Ÿ[ãô^X›]JààïTUHù[ú^W›\Ÿ\ú»—Uÿ€€[[üOIã\]Yÿ]Sì’ 
+H“TëH[Y‹ò[W⁄YIHãà[Y‹ò[W⁄Yàò[YKà
+BÇà\ﬁ[ò»YàŸ]‹ô]öY]◊‹ô\JŸ[ã[Y‹ò[W⁄Yà[ù›\úŒà[ù^à›äHOàõ€ôNÇàYà›\ú»õ›[àò[ôŸJKäNÇàòZ\ŸHò[YQ\úõ‹ä¥'¥a¥-t/t.¥,4-4/¥.Ù-¥/t,4,tbÙ`¥c4/¥`àH4-4/àHäBà]ÿZ]Ÿ[ãô^X›]JààïTUHù[ú^W›\Ÿ\ú»—Uô]öY]◊‹ô\Wﬁ‹›\úﬂOIã\]Yÿ]Sì’ 
+H“TëH[Y‹ò[W⁄YIHãà[Y‹ò[W⁄Yà^à
+BÇà\ﬁ[ò»Yà€Z[Wÿ]]‹ô\JàŸ[ãà[Y‹ò[W⁄Yà[ùà⁄]⁄Yà›ãà€€€›€ó€Z[ù]\Œà[ùHÃàö\ú›€€õNàõ€€Hò[ŸKà
+HOàõ€€ÇàYàö\ú›€€õNÇàõ›»H]ÿZ]Ÿ[ãôô]⁄õ› àààÇàSî—TïSï»ù[ú^Wÿ]]‹ô\W€Ÿ»
+[Y‹ò[W⁄Y⁄]⁄Y\›‹Ÿ[ù
+BàêSQT»
+	K	ãì’ 
+JBà”à””ëìP’»ì’Së¬àëUTìíSë»[Y‹ò[W⁄Yàààãà[Y‹ò[W⁄Yà⁄]⁄Yà
+Bàô]\õàõ›»\»õ›õ€ôBàõ›»H]ÿZ]Ÿ[ãôô]⁄õ› àààÇàSî—TïSï»ù[ú^Wÿ]]‹ô\W€Ÿ»
+[Y‹ò[W⁄Y⁄]⁄Y\›‹Ÿ[ù
+BàêSQT»
+	K	ãì’ 
+JBà”à””ëìP’
+[Y‹ò[W⁄Y⁄]⁄Y
+H»TUBà—U\›‹Ÿ[ùSì’ 
+Bà“TëHù[ú^Wÿ]]‹ô\W€ŸÀõ\›‹Ÿ[ùì’ 
+HHXZŸW⁄[ù\ùò[
+Z[ú»Oà	 BàëUTìíSë»[Y‹ò[W⁄Yàààãà[Y‹ò[W⁄Yà⁄]⁄Yà€€€›€ó€Z[ù]\Àà
+Bàô]\õàõ›»\»õ›õ€ôBÇà\ﬁ[ò»Yà€Z[W‹^Y\õ⁄◊ÿ]]‹ô\JàŸ[ã[Y‹ò[W⁄Yà[ù⁄]⁄Yà›ã€€€›€ó€Z[ù]\Œà[ùHÃà
+HOàõ€€Çàõ›»H]ÿZ]Ÿ[ãôô]⁄õ› àààÇàSî—TïSï»^Y\õ⁄◊ÿ]]‹ô\W€Ÿ»
+[Y‹ò[W⁄Y⁄]⁄Y\›‹Ÿ[ù
+BàêSQT»
+	K	ãì’ 
+JBà”à””ëìP’
+[Y‹ò[W⁄Y⁄]⁄Y
+H»TUBà—U\›‹Ÿ[ùSì’ 
+Bà“TëH^Y\õ⁄◊ÿ]]‹ô\W€ŸÀõ\›‹Ÿ[ùì’ 
+HHXZŸW⁄[ù\ùò[
+Z[ú»Oà	 BàëUTìíSë»[Y‹ò[W⁄Yàààãà[Y‹ò[W⁄Yà⁄]⁄Yà€€€›€ó€Z[ù]\Àà
+Bàô]\õàõ›»\»õ›õ€ôBÇà\ﬁ[ò»Yà\›‹Y⁄[ú Ÿ[ã[Y‹ò[W⁄Yà[ù
+HOà\›ÿ\ﬁ[ò‹ÀîôX€‹ôNÇàô]\õà]ÿZ]Ÿ[ãôô]⁄
+àî—SP’
+àîì”Hù[ú^W‹Y⁄[ú»“TëH[Y‹ò[W⁄YIH‘ëTàñH\ÿYYÿ]ò[YHãà[Y‹ò[W⁄Yà
+BÇà\ﬁ[ò»YàŸ]‹Y⁄[äŸ[ã[Y‹ò[W⁄Yà[ù]ZYà›äHOà\ﬁ[ò‹ÀîôX€‹ôõ€ôNÇàô]\õà]ÿZ]Ÿ[ãôô]⁄õ› àî—SP’
+àîì”Hù[ú^W‹Y⁄[ú»“TëH[Y‹ò[W⁄YIHSë]ZYIàãà[Y‹ò[W⁄Yà]ZYà
+BÇà\ﬁ[ò»YàŸ]‹Y⁄[óÿùZ[\ó‹Ÿ][ô‹ Ÿ[ã[Y‹ò[W⁄Yà[ù
+HOà\ﬁ[ò‹ÀîôX€‹ôÇà]ÿZ]Ÿ[ãô^X›]JàààÇàSî—TïSï»ù[ú^W‹Y⁄[óÿùZ[\ó‹Ÿ][ô‹»
+[Y‹ò[W⁄Y
+BàêSQT»
+	JBà”à””ëìP’
+[Y‹ò[W⁄Y
+H»ì’Së¬àààãà[Y‹ò[W⁄Yà
+Bàõ›»H]ÿZ]Ÿ[ãôô]⁄õ› àî—SP’
+àîì”Hù[ú^W‹Y⁄[óÿùZ[\ó‹Ÿ][ô‹»“TëH[Y‹ò[W⁄YIHãà[Y‹ò[W⁄Yà
+BàYàõ›»\»õ€ôNÇàòZ\ŸHù[ù[YQ\úõ‹ä¥/t-H4`Ù-4,4.Ù/¥`tc4-Ù,4,Ù`4`Ù-Ù.4`¥c4/t,4`t`¥`4/¥.t.¥.RKt.¥/¥/t`t`¥`4`Ù.¥`¥/¥`4,äBàô]\õàõ›¬Çà\ﬁ[ò»YàŸ]‹Y⁄[óÿùZ[\ó‹Ÿ][ô àŸ[ã[Y‹ò[W⁄Yà[ùŸ^Nà›ãò[YNà›àõ€ôBà
+HOàõ€ôNÇàYàŸ^Hõ›[à»ò\Wÿò\ŸW›\õãò\W›⁄Ÿ[óŸ[ò»ãõ[Ÿ[⁄YüNÇàòZ\ŸHò[YQ\úõ‹ä¥/t-t.4-Ù,¥-t`t`¥/t,4c»4/t,4`t`¥`4/¥.t.¥,RKt.¥/¥/t`t`¥`4`Ù.¥`¥/¥`4,äBà]ÿZ]Ÿ[ãô^X›]JàààÇàSî—TïSï»ù[ú^W‹Y⁄[óÿùZ[\ó‹Ÿ][ô‹»
+[Y‹ò[W⁄Y
+BàêSQT»
+	JBà”à””ëìP’
+[Y‹ò[W⁄Y
+H»ì’Së¬àààãà[Y‹ò[W⁄Yà
+Bà]ÿZ]Ÿ[ãô^X›]JààààÇàTUHù[ú^W‹Y⁄[óÿùZ[\ó‹Ÿ][ô‹¬à—U⁄Ÿ^_OIã\]Yÿ]Sì’ 
+Bà“TëH[Y‹ò[W⁄YIBàààãà[Y‹ò[W⁄Yàò[YKà
+BÇà\ﬁ[ò»YàX\ö◊‹Y⁄[óÿZWŸŸ[ô\ò]Y
+àŸ[ãà[Y‹ò[W⁄Yà[ùà]ZYà›ãàõ€\à›ãà›[[X\ûNà›ãà
+HOàõ€ôNÇà]ÿZ]Ÿ[ãô^X›]JàààÇàTUHù[ú^W‹Y⁄[ú¬à—UZWŸŸ[ô\ò]YUïQKZW‹õ€\IÀZW‹›[[X\ûOIàZW‹ô]ö\⁄[€èXZW‹ô]ö\⁄[€äÃKZW›\]Yÿ]Sì’ 
+Bà“TëH[Y‹ò[W⁄YIHSë]ZYIÇàààãà[Y‹ò[W⁄Yà]ZYàõ€\à›[[X\ûKà
+BÇà\ﬁ[ò»YàŸYY€ŸôöX⁄X[‹Y⁄[ú Ÿ[äHOàõ€ôNÇàõ‹àY⁄[à[àëPQW‘Q“SîŒÇà€›\òŸHHôXYW‹Y⁄[ó‹€›\òŸJY⁄[äBà]ÿZ]Ÿ[ãô^X›]JàààÇàSî—TïSï»ù[ú^W‹Y⁄[óÿÿ][Ÿ¬à
+]ZY›€ô\ó›[Y‹ò[W⁄YXõ\⁄\ó€ò[YKö[[ò[YKò[YKô\ú⁄[€ãà⁄‹ùŸ\ÿ‹ö\[€ã\ÿ‹ö\[€ã‹ôY]À€›\òŸK\◊€ŸôöX⁄X[
+BàêSQT»
+	KïS	Ù&¥/¥/4,4/t-4,4/Ù`4/¥-t.¥`¥,	À	ã	À		K	ãà	—ù[î^HZ[Ÿ‹ò[Hõ›	À	ÀïQJBà”à””ëìP’
+]ZY
+H»TUBà—UXõ\⁄\ó€ò[YOQV”QQúXõ\⁄\ó€ò[YKàö[[ò[YOQV”QQôö[[ò[YKò[YOQV”QQõò[YKàô\ú⁄[€èQV”QQùô\ú⁄[€ãà⁄‹ùŸ\ÿ‹ö\[€èQV”QQú⁄‹ùŸ\ÿ‹ö\[€ãà\ÿ‹ö\[€èQV”QQô\ÿ‹ö\[€ã‹ôY]œQV”QQò‹ôY]Àà€›\òŸOQV”QQú€›\òŸK\◊€ŸôöX⁄X[UïQK\]Yÿ]Sì’ 
+Bà“TëHù[ú^W‹Y⁄[óÿÿ][ŸÀö\◊€ŸôöX⁄X[UïQBàààãàY⁄[ãù]ZYàY⁄[ãôö[[ò[YKàY⁄[ãõò[YKàY⁄[ãùô\ú⁄[€ãàY⁄[ãô\ÿ‹ö\[€ãàY⁄[ãô]Z[Àà€›\òŸKà
+Bà]ÿZ]Ÿ[ãô^X›]JàààÇàTUHù[ú^W‹Y⁄[ú¬à—Uö[[ò[YOIãò[YOIÀô\ú⁄[€èI\ÿ‹ö\[€èIKà‹ôY]œI—ù[î^HZ[Ÿ‹ò[Hõ›	ÀŸ][ô‹◊‹YŸOUïQK€›\òŸOIÇà“TëH]ZYIBàààãàY⁄[ãù]ZYàY⁄[ãôö[[ò[YKàY⁄[ãõò[YKàY⁄[ãùô\ú⁄[€ãàY⁄[ãô\ÿ‹ö\[€ãà€›\òŸKà
+BÇà\ﬁ[ò»Yà\›ÿÿ][Ÿ◊‹Y⁄[ú àŸ[ã[Z]à[ùŸôúŸ]à[ùà
+HOà\V€\›ÿ\ﬁ[ò‹ÀîôX€‹ôK[ùNÇàõ›‹»H]ÿZ]Ÿ[ãôô]⁄
+àààÇà—SP’
+àîì”Hù[ú^W‹Y⁄[óÿÿ][Ÿ¬à‘ëTàñH\◊€ŸôöX⁄X[T–À[ú›[ÿ€›[ùT–À\]Yÿ]T–Àò[YBàSRU	H—ëî—U	Çàààãà[Z]àŸôúŸ]à
+Bà€›[ù‹õ›»H]ÿZ]Ÿ[ãôô]⁄õ› î—SP’”’Sï
+
+äHT»€›[ùîì”Hù[ú^W‹Y⁄[óÿÿ][Ÿ»äBàô]\õàõ›‹À[ù
+€›[ù‹õ›÷»ò€›[ùóJHYà€›[ù‹õ›»[ŸHÇà\ﬁ[ò»YàŸ]ÿÿ][Ÿ◊‹Y⁄[äŸ[ã]ZYà›äHOà\ﬁ[ò‹ÀîôX€‹ôõ€ôNÇàô]\õà]ÿZ]Ÿ[ãôô]⁄õ› àî—SP’
+àîì”Hù[ú^W‹Y⁄[óÿÿ][Ÿ»“TëH]ZYIHãà]ZYà
+BÇà\ﬁ[ò»YàXõ\⁄ÿÿ][Ÿ◊‹Y⁄[äàŸ[ãà[Y‹ò[W⁄Yà[ùà]ZYà›ãàXõ\⁄\ó€ò[YNà›ãà\ÿ‹ö\[€éà›ãà
+HOàõ€€Çàõ›»H]ÿZ]Ÿ[ãôô]⁄õ› àààÇàSî—TïSï»ù[ú^W‹Y⁄[óÿÿ][Ÿ¬à
+]ZY›€ô\ó›[Y‹ò[W⁄YXõ\⁄\ó€ò[YKö[[ò[YKò[YKô\ú⁄[€ãà⁄‹ùŸ\ÿ‹ö\[€ã\ÿ‹ö\[€ã‹ôY]À€›\òŸK\◊€ŸôöX⁄X[àZWŸŸ[ô\ò]YXõ\⁄Yÿ]\]Yÿ]
+Bà—SP’]ZY[Y‹ò[W⁄Y	Àö[[ò[YKò[YKô\ú⁄[€ã\ÿ‹ö\[€ã	à‹ôY]À€›\òŸKêS—KZWŸŸ[ô\ò]Yì’ 
+Kì’ 
+Bàîì”Hù[ú^W‹Y⁄[ú¬à“TëH[Y‹ò[W⁄YIHSë]ZYIÇà”à””ëìP’
+]ZY
+H»TUBà—UXõ\⁄\ó€ò[YOQV”QQúXõ\⁄\ó€ò[YKàö[[ò[YOQV”QQôö[[ò[YKò[YOQV”QQõò[YKàô\ú⁄[€èQV”QQùô\ú⁄[€ãà⁄‹ùŸ\ÿ‹ö\[€èQV”QQú⁄‹ùŸ\ÿ‹ö\[€ãà\ÿ‹ö\[€èQV”QQô\ÿ‹ö\[€ã‹ôY]œQV”QQò‹ôY]Àà€›\òŸOQV”QQú€›\òŸKZWŸŸ[ô\ò]YQV”QQòZWŸŸ[ô\ò]Yà\]Yÿ]Sì’ 
+Bà“TëHù[ú^W‹Y⁄[óÿÿ][ŸÀõ›€ô\ó›[Y‹ò[W⁄YIBàSëù[ú^W‹Y⁄[óÿÿ][ŸÀö\◊€ŸôöX⁄X[QêS—BàëUTìíSë»]ZYàààãà[Y‹ò[W⁄Yà]ZYàXõ\⁄\ó€ò[YKà\ÿ‹ö\[€ãà
+Bàô]\õàõ›»\»õ›õ€ôBÇà\ﬁ[ò»Yà[úXõ\⁄ÿÿ][Ÿ◊‹Y⁄[äŸ[ã[Y‹ò[W⁄Yà[ù]ZYà›äHOàõ€€Çàô\›[H]ÿZ]Ÿ[ãô^X›]JàààÇàSUHîì”Hù[ú^W‹Y⁄[óÿÿ][Ÿ¬à“TëH]ZYIHSë›€ô\ó›[Y‹ò[W⁄YIàSë\◊€ŸôöX⁄X[QêS—Bàààãà]ZYà[Y‹ò[W⁄Yà
+Bàô]\õàô\›[ô[ô›⁄]
+àHäBÇà\ﬁ[ò»Yà[ò‹ô[Y[ùÿÿ][Ÿ◊⁄[ú›[
+Ÿ[ã]ZYà›äHOàõ€ôNÇà]ÿZ]Ÿ[ãô^X›]JàïTUHù[ú^W‹Y⁄[óÿÿ][Ÿ»—U[ú›[ÿ€›[ùZ[ú›[ÿ€›[ù
+ÃH“TëH]ZYIHãà]ZYà
+BÇà\ﬁ[ò»Yà\Ÿ\ù‹Y⁄[äŸ[ã[Y‹ò[W⁄Yà[ùY⁄[éàY⁄[ë]K€›\òŸNà›äHOàõ€ôNÇà]ÿZ]Ÿ[ãô^X›]JàààÇàSî—TïSï»ù[ú^W‹Y⁄[ú¬à
+[Y‹ò[W⁄Y]ZYö[[ò[YKò[YKô\ú⁄[€ã\ÿ‹ö\[€ã‹ôY]ÀàŸ][ô‹◊‹YŸK€›\òŸK[òXõY\ÿYYÿ]
+BàêSQT»
+	K	ã	À		K	ã	À		KïQKì’ 
+JBà”à””ëìP’
+[Y‹ò[W⁄Y]ZY
+H»TUBà—Uö[[ò[YOQV”QQôö[[ò[YKò[YOQV”QQõò[YKô\ú⁄[€èQV”QQùô\ú⁄[€ãà\ÿ‹ö\[€èQV”QQô\ÿ‹ö\[€ã‹ôY]œQV”QQò‹ôY]ÀàŸ][ô‹◊‹YŸOQV”QQúŸ][ô‹◊‹YŸK€›\òŸOQV”QQú€›\òŸKà[òXõYUïQK\ÿYYÿ]Sì’ 
+Bàààãà[Y‹ò[W⁄YàY⁄[ãù]ZYàY⁄[ãôö[[ò[YKàY⁄[ãõò[YKàY⁄[ãùô\ú⁄[€ãàY⁄[ãô\ÿ‹ö\[€ãàY⁄[ãò‹ôY]ÀàY⁄[ãúŸ][ô‹◊‹YŸKà€›\òŸKà
+BÇà\ﬁ[ò»YàŸ]‹Y⁄[óŸ[òXõY
+Ÿ[ã[Y‹ò[W⁄Yà[ù]ZYà›ã[òXõYàõ€€
+HOàõ€ôNÇà]ÿZ]Ÿ[ãô^X›]JàïTUHù[ú^W‹Y⁄[ú»—U[òXõYI»“TëH[Y‹ò[W⁄YIHSë]ZYIàãà[Y‹ò[W⁄Yà]ZYà[òXõYà
+BÇà\ﬁ[ò»Yà[]W‹Y⁄[äŸ[ã[Y‹ò[W⁄Yà[ù]ZYà›äHOàõ€ôNÇà]ÿZ]Ÿ[ãô^X›]JàëSUHîì”Hù[ú^W‹Y⁄[ú»“TëH[Y‹ò[W⁄YIHSë]ZYIàãà[Y‹ò[W⁄Yà]ZYà
+BÇà\ﬁ[ò»YàŸ]‹Y⁄[ó‹Ÿ][ô àŸ[ã[Y‹ò[W⁄Yà[ù]ZYà›ãŸ^Nà›ãYò][à›àHàÇà
+HOà›éÇàõ›»H]ÿZ]Ÿ[ãôô]⁄õ› àààÇà—SP’Ÿ][ô◊›ò[YHîì”Hù[ú^W‹Y⁄[ó‹Ÿ][ô‹¬à“TëH[Y‹ò[W⁄YIHSëY⁄[ó›]ZYIàSëŸ][ô◊⁄Ÿ^OI¬àààãà[Y‹ò[W⁄Yà]ZYàŸ^Kà
+Bàô]\õà›äõ›÷»úŸ][ô◊›ò[YHóJHYàõ›»[ŸHYò][Çà\ﬁ[ò»YàŸ]‹Y⁄[ó‹Ÿ][ô àŸ[ã[Y‹ò[W⁄Yà[ù]ZYà›ãŸ^Nà›ãò[YNà›Çà
+HOàõ€ôNÇà]ÿZ]Ÿ[ãô^X›]JàààÇàSî—TïSï»ù[ú^W‹Y⁄[ó‹Ÿ][ô‹¬à
+[Y‹ò[W⁄YY⁄[ó›]ZYŸ][ô◊⁄Ÿ^KŸ][ô◊›ò[YK\]Yÿ]
+BàêSQT»
+	K	ã	À	ì’ 
+JBà”à””ëìP’
+[Y‹ò[W⁄YY⁄[ó›]ZYŸ][ô◊⁄Ÿ^JH»TUBà—UŸ][ô◊›ò[YOQV”QQúŸ][ô◊›ò[YK\]Yÿ]Sì’ 
+Bàààãà[Y‹ò[W⁄Yà]ZYàŸ^Kàò[YKà
+BÇà\ﬁ[ò»YàŸ]‹Y⁄[ó›[]€ó‹Ÿ\‹⁄[€äàŸ[ã[Y‹ò[W⁄Yà[ù]ZYà›ãŸ\‹⁄[€ó⁄Yà[ùõ€ôHHõ€ôBà
+HOà\ﬁ[ò‹ÀîôX€‹ôõ€ôNÇàô]\õà]ÿZ]Ÿ[ãôô]⁄õ› àààÇà—SP’
+àîì”Hù[ú^W‹Y⁄[ó›[]€ó‹Ÿ\‹⁄[€ú¬à“TëH[Y‹ò[W⁄YIHSëY⁄[ó›]ZYIÇàSë
+	ŒéêíQ“SïT»ïS‘àYI Bà‘ëTàñH\]Yÿ]YàSRUBàààãà[Y‹ò[W⁄Yà]ZYàŸ\‹⁄[€ó⁄Yà
+BÇà\ﬁ[ò»YàŸ]‹Y⁄[ó›[]€ó‹Ÿ\‹⁄[€ú àŸ[ã[Y‹ò[W⁄Yà[ù]ZYà›Çà
+HOà\›ÿ\ﬁ[ò‹ÀîôX€‹ôNÇàô]\õà\›
+]ÿZ]Ÿ[ãôô]⁄
+àààÇà—SP’
+àîì”Hù[ú^W‹Y⁄[ó›[]€ó‹Ÿ\‹⁄[€ú¬à“TëH[Y‹ò[W⁄YIHSëY⁄[ó›]ZYIÇà‘ëTàñH\]Yÿ]Yàààãà[Y‹ò[W⁄Yà]ZYà
+JBÇà\ﬁ[ò»YàŸ]‹Y⁄[ó›[]€ó‹Ÿ\‹⁄[€óÿûW⁄Y
+àŸ[ã[Y‹ò[W⁄Yà[ùŸ\‹⁄[€ó⁄Yà[ùà
+HOà\ﬁ[ò‹ÀîôX€‹ôõ€ôNÇàô]\õà]ÿZ]Ÿ[ãôô]⁄õ› àààî—SP’
+àîì”Hù[ú^W‹Y⁄[ó›[]€ó‹Ÿ\‹⁄[€ú¬à“TëH[Y‹ò[W⁄YIHSëYIàààãà[Y‹ò[W⁄YàŸ\‹⁄[€ó⁄Yà
+BÇà\ﬁ[ò»Yàÿ]ôW‹Y⁄[ó›[]€ó‹Ÿ\‹⁄[€äàŸ[ãà[Y‹ò[W⁄Yà[ùà]ZYà›ãà€ôWŸ[òŒà›ãàŸ\‹⁄[€óŸ[òŒà›ãà\‹›€‹ôŸ[òŒà›àõ€ôKà[Y‹ò[W›\Ÿ\ó⁄Yà[ùà[Y‹ò[W›\Ÿ\õò[YNà›àõ€ôKà
+HOà\ﬁ[ò‹ÀîôX€‹ôÇàô]\õà]ÿZ]Ÿ[ãôô]⁄õ› àààÇàSî—TïSï»ù[ú^W‹Y⁄[ó›[]€ó‹Ÿ\‹⁄[€ú¬à
+[Y‹ò[W⁄YY⁄[ó›]ZY€ôWŸ[òÀŸ\‹⁄[€óŸ[òÀ\‹›€‹ôŸ[òÀà[Y‹ò[W›\Ÿ\ó⁄Y[Y‹ò[W›\Ÿ\õò[YK\]Yÿ]
+BàêSQT»
+	K	ã	À		K	ã	Àì’ 
+JBà”à””ëìP’
+[Y‹ò[W⁄YY⁄[ó›]ZY[Y‹ò[W›\Ÿ\ó⁄Y
+H»TUBà—U€ôWŸ[òœQV”QQú€ôWŸ[òÀàŸ\‹⁄[€óŸ[òœQV”QQúŸ\‹⁄[€óŸ[òÀà\‹›€‹ôŸ[òœQV”QQú\‹›€‹ôŸ[òÀà[Y‹ò[W›\Ÿ\ó⁄YQV”QQù[Y‹ò[W›\Ÿ\ó⁄Yà[Y‹ò[W›\Ÿ\õò[YOQV”QQù[Y‹ò[W›\Ÿ\õò[YKà\]Yÿ]Sì’ 
+BàëUTìíSë»
+Çàààãà[Y‹ò[W⁄Yà]ZYà€ôWŸ[òÀàŸ\‹⁄[€óŸ[òÀà\‹›€‹ôŸ[òÀà[Y‹ò[W›\Ÿ\ó⁄Yà[Y‹ò[W›\Ÿ\õò[YKà
+BÇà\ﬁ[ò»Yà[]W‹Y⁄[ó›[]€ó‹Ÿ\‹⁄[€äàŸ[ã[Y‹ò[W⁄Yà[ù]ZYà›ãŸ\‹⁄[€ó⁄Yà[ùõ€ôHHõ€ôBà
+HOàõ€ôNÇà]ÿZ]Ÿ[ãô^X›]JàààÇàSUHîì”Hù[ú^W‹Y⁄[ó›[]€ó‹Ÿ\‹⁄[€ú¬à“TëH[Y‹ò[W⁄YIHSëY⁄[ó›]ZYIÇàSë
+	ŒéêíQ“SïT»ïS‘àYI Bàààãà[Y‹ò[W⁄Yà]ZYàŸ\‹⁄[€ó⁄Yà
+BÇà\ﬁ[ò»YàŸYY€ŸôöX⁄X[‹^Y\õ⁄◊‹Y⁄[ú Ÿ[äHOàõ€ôNÇàõ‹àY⁄[à[àVQTì“◊‘ëPQW‘Q“SîŒÇà]ÿZ]Ÿ[ãô^X›]JàààÇàSî—TïSï»^Y\õ⁄◊‹Y⁄[óÿÿ][Ÿ¬à
+]ZY›€ô\ó›[Y‹ò[W⁄YXõ\⁄\ó€ò[YKö[[ò[YKò[YKô\ú⁄[€ãà⁄‹ùŸ\ÿ‹ö\[€ã\ÿ‹ö\[€ã‹ôY]À€›\òŸK\◊€ŸôöX⁄X[
+BàêSQT»
+	KïS	Ù&¥/¥/4,4/t-4,4/Ù`4/¥-t.¥`¥,	À	ã	À		K	ãà	—ù[î^HZ[Ÿ‹ò[Hõ›	À	ÀïQJBà”à””ëìP’
+]ZY
+H»TUBà—UXõ\⁄\ó€ò[YOQV”QQúXõ\⁄\ó€ò[YKàö[[ò[YOQV”QQôö[[ò[YKò[YOQV”QQõò[YKàô\ú⁄[€èQV”QQùô\ú⁄[€ãà⁄‹ùŸ\ÿ‹ö\[€èQV”QQú⁄‹ùŸ\ÿ‹ö\[€ãà\ÿ‹ö\[€èQV”QQô\ÿ‹ö\[€ã‹ôY]œQV”QQò‹ôY]Àà€›\òŸOQV”QQú€›\òŸK\◊€ŸôöX⁄X[UïQK\]Yÿ]Sì’ 
+Bà“TëH^Y\õ⁄◊‹Y⁄[óÿÿ][ŸÀö\◊€ŸôöX⁄X[UïQBàààãàY⁄[ãù]ZYàY⁄[ãôö[[ò[YKàY⁄[ãõò[YKàY⁄[ãùô\ú⁄[€ãàY⁄[ãô\ÿ‹ö\[€ãàY⁄[ãô]Z[Àà^Y\õ⁄◊‹ôXYW‹Y⁄[ó‹€›\òŸJY⁄[äKà
+BÇà\ﬁ[ò»Yà\›‹^Y\õ⁄◊‹Y⁄[ú Ÿ[ã[Y‹ò[W⁄Yà[ù
+HOà\›ÿ\ﬁ[ò‹ÀîôX€‹ôNÇàô]\õà]ÿZ]Ÿ[ãôô]⁄
+àî—SP’
+àîì”H^Y\õ⁄◊‹Y⁄[ú»“TëH[Y‹ò[W⁄YIH‘ëTàñH\ÿYYÿ]ò[YHãà[Y‹ò[W⁄Yà
+BÇà\ﬁ[ò»YàŸ]‹^Y\õ⁄◊‹Y⁄[äàŸ[ã[Y‹ò[W⁄Yà[ù]ZYà›Çà
+HOà\ﬁ[ò‹ÀîôX€‹ôõ€ôNÇàô]\õà]ÿZ]Ÿ[ãôô]⁄õ› àî—SP’
+àîì”H^Y\õ⁄◊‹Y⁄[ú»“TëH[Y‹ò[W⁄YIHSë]ZYIàãà[Y‹ò[W⁄Yà]ZYà
+BÇà\ﬁ[ò»Yà\›‹^Y\õ⁄◊ÿÿ][Ÿ◊‹Y⁄[ú àŸ[ã[Z]à[ùŸôúŸ]à[ùà
+HOà\V€\›ÿ\ﬁ[ò‹ÀîôX€‹ôK[ùNÇàõ›‹»H]ÿZ]Ÿ[ãôô]⁄
+àààÇà—SP’
+àîì”H^Y\õ⁄◊‹Y⁄[óÿÿ][Ÿ¬à‘ëTàñH\◊€ŸôöX⁄X[T–À[ú›[ÿ€›[ùT–À\]Yÿ]T–Àò[YBàSRU	H—ëî—U	Çàààãà[Z]àŸôúŸ]à
+Bà€›[ù‹õ›»H]ÿZ]Ÿ[ãôô]⁄õ› àî—SP’”’Sï
+
+äHT»€›[ùîì”H^Y\õ⁄◊‹Y⁄[óÿÿ][Ÿ»Çà
+Bàô]\õàõ›‹À[ù
+€›[ù‹õ›÷»ò€›[ùóJHYà€›[ù‹õ›»[ŸHÇà\ﬁ[ò»YàŸ]‹^Y\õ⁄◊ÿÿ][Ÿ◊‹Y⁄[äŸ[ã]ZYà›äHOà\ﬁ[ò‹ÀîôX€‹ôõ€ôNÇàô]\õà]ÿZ]Ÿ[ãôô]⁄õ› àî—SP’
+àîì”H^Y\õ⁄◊‹Y⁄[óÿÿ][Ÿ»“TëH]ZYIHã]ZYà
+BÇà\ﬁ[ò»YàXõ\⁄‹^Y\õ⁄◊ÿÿ][Ÿ◊‹Y⁄[äàŸ[ãà[Y‹ò[W⁄Yà[ùà]ZYà›ãàXõ\⁄\ó€ò[YNà›ãà\ÿ‹ö\[€éà›ãà
+HOàõ€€Çàõ›»H]ÿZ]Ÿ[ãôô]⁄õ› àààÇàSî—TïSï»^Y\õ⁄◊‹Y⁄[óÿÿ][Ÿ¬à
+]ZY›€ô\ó›[Y‹ò[W⁄YXõ\⁄\ó€ò[YKö[[ò[YKò[YKô\ú⁄[€ãà⁄‹ùŸ\ÿ‹ö\[€ã\ÿ‹ö\[€ã‹ôY]À€›\òŸK\◊€ŸôöX⁄X[àXõ\⁄Yÿ]\]Yÿ]
+Bà—SP’]ZY[Y‹ò[W⁄Y	Àö[[ò[YKò[YKô\ú⁄[€ã\ÿ‹ö\[€ã	à‹ôY]À€›\òŸKêS—Kì’ 
+Kì’ 
+Bàîì”H^Y\õ⁄◊‹Y⁄[ú¬à“TëH[Y‹ò[W⁄YIHSë]ZYIÇà”à””ëìP’
+]ZY
+H»TUBà—UXõ\⁄\ó€ò[YOQV”QQúXõ\⁄\ó€ò[YKàö[[ò[YOQV”QQôö[[ò[YKò[YOQV”QQõò[YKàô\ú⁄[€èQV”QQùô\ú⁄[€ãà⁄‹ùŸ\ÿ‹ö\[€èQV”QQú⁄‹ùŸ\ÿ‹ö\[€ãà\ÿ‹ö\[€èQV”QQô\ÿ‹ö\[€ã‹ôY]œQV”QQò‹ôY]Àà€›\òŸOQV”QQú€›\òŸK\]Yÿ]Sì’ 
+Bà“TëH^Y\õ⁄◊‹Y⁄[óÿÿ][ŸÀõ›€ô\ó›[Y‹ò[W⁄YIBàSë^Y\õ⁄◊‹Y⁄[óÿÿ][ŸÀö\◊€ŸôöX⁄X[QêS—BàëUTìíSë»]ZYàààãà[Y‹ò[W⁄Yà]ZYàXõ\⁄\ó€ò[YKà\ÿ‹ö\[€ãà
+Bàô]\õàõ›»\»õ›õ€ôBÇà\ﬁ[ò»Yà[úXõ\⁄‹^Y\õ⁄◊ÿÿ][Ÿ◊‹Y⁄[äàŸ[ã[Y‹ò[W⁄Yà[ù]ZYà›Çà
+HOàõ€€Çàô\›[H]ÿZ]Ÿ[ãô^X›]JàààÇàSUHîì”H^Y\õ⁄◊‹Y⁄[óÿÿ][Ÿ¬à“TëH]ZYIHSë›€ô\ó›[Y‹ò[W⁄YIàSë\◊€ŸôöX⁄X[QêS—Bàààãà]ZYà[Y‹ò[W⁄Yà
+Bàô]\õàô\›[ô[ô›⁄]
+àHäBÇà\ﬁ[ò»Yà[ò‹ô[Y[ù‹^Y\õ⁄◊ÿÿ][Ÿ◊⁄[ú›[
+Ÿ[ã]ZYà›äHOàõ€ôNÇà]ÿZ]Ÿ[ãô^X›]JàààÇàTUH^Y\õ⁄◊‹Y⁄[óÿÿ][Ÿ¬à—U[ú›[ÿ€›[ùZ[ú›[ÿ€›[ù
+ÃBà“TëH]ZYIBàààãà]ZYà
+BÇà\ﬁ[ò»Yà\Ÿ\ù‹^Y\õ⁄◊‹Y⁄[äàŸ[ã[Y‹ò[W⁄Yà[ùY⁄[éà^Y\õ⁄‘Y⁄[ë]K€›\òŸNà›Çà
+HOàõ€ôNÇà]ÿZ]Ÿ[ãô^X›]JàààÇàSî—TïSï»^Y\õ⁄◊‹Y⁄[ú¬à
+[Y‹ò[W⁄Y]ZYö[[ò[YKò[YKô\ú⁄[€ã\ÿ‹ö\[€ã‹ôY]ÀàŸ][ô‹◊‹YŸK€›\òŸK[òXõY\ÿYYÿ]
+BàêSQT»
+	K	ã	À		K	ã	À		KïQKì’ 
+JBà”à””ëìP’
+[Y‹ò[W⁄Y]ZY
+H»TUBà—Uö[[ò[YOQV”QQôö[[ò[YKò[YOQV”QQõò[YKàô\ú⁄[€èQV”QQùô\ú⁄[€ã\ÿ‹ö\[€èQV”QQô\ÿ‹ö\[€ãà‹ôY]œQV”QQò‹ôY]ÀŸ][ô‹◊‹YŸOQV”QQúŸ][ô‹◊‹YŸKà€›\òŸOQV”QQú€›\òŸK[òXõYUïQK\ÿYYÿ]Sì’ 
+Bàààãà[Y‹ò[W⁄YàY⁄[ãù]ZYàY⁄[ãôö[[ò[YKàY⁄[ãõò[YKàY⁄[ãùô\ú⁄[€ãàY⁄[ãô\ÿ‹ö\[€ãàY⁄[ãò‹ôY]ÀàY⁄[ãúŸ][ô‹◊‹YŸKà€›\òŸKà
+BÇà\ﬁ[ò»YàŸ]‹^Y\õ⁄◊‹Y⁄[óŸ[òXõY
+àŸ[ã[Y‹ò[W⁄Yà[ù]ZYà›ã[òXõYàõ€€à
+HOàõ€ôNÇà]ÿZ]Ÿ[ãô^X›]JàïTUH^Y\õ⁄◊‹Y⁄[ú»—U[òXõYI»“TëH[Y‹ò[W⁄YIHSë]ZYIàãà[Y‹ò[W⁄Yà]ZYà[òXõYà
+BÇà\ﬁ[ò»Yà[]W‹^Y\õ⁄◊‹Y⁄[äŸ[ã[Y‹ò[W⁄Yà[ù]ZYà›äHOàõ€ôNÇà]ÿZ]Ÿ[ãô^X›]JàëSUHîì”H^Y\õ⁄◊‹Y⁄[ú»“TëH[Y‹ò[W⁄YIHSë]ZYIàãà[Y‹ò[W⁄Yà]ZYà
+BÇà\ﬁ[ò»Yà\›‹^Y\õ⁄◊‹Y⁄[ó‹Ÿ][ô‹ àŸ[ã[Y‹ò[W⁄Yà[ù]ZYà›Çà
+HOàX›‹›ã›óNÇàõ›‹»H]ÿZ]Ÿ[ãôô]⁄
+àààÇà—SP’Ÿ][ô◊⁄Ÿ^KŸ][ô◊›ò[YHîì”H^Y\õ⁄◊‹Y⁄[ó‹Ÿ][ô‹¬à“TëH[Y‹ò[W⁄YIHSëY⁄[ó›]ZYIÇàààãà[Y‹ò[W⁄Yà]ZYà
+Bàô]\õà‹›äõ›÷»úŸ][ô◊⁄Ÿ^HóJNà›äõ›÷»úŸ][ô◊›ò[YHóJHõ‹àõ›»[àõ›‹ﬂBÇà\ﬁ[ò»YàŸ]‹^Y\õ⁄◊‹Y⁄[ó‹Ÿ][ô àŸ[ã[Y‹ò[W⁄Yà[ù]ZYà›ãŸ^Nà›ãò[YNà›Çà
+HOàõ€ôNÇà]ÿZ]Ÿ[ãô^X›]JàààÇàSî—TïSï»^Y\õ⁄◊‹Y⁄[ó‹Ÿ][ô‹¬à
+[Y‹ò[W⁄YY⁄[ó›]ZYŸ][ô◊⁄Ÿ^KŸ][ô◊›ò[YK\]Yÿ]
+BàêSQT»
+	K	ã	À	ì’ 
+JBà”à””ëìP’
+[Y‹ò[W⁄YY⁄[ó›]ZYŸ][ô◊⁄Ÿ^JH»TUBà—UŸ][ô◊›ò[YOQV”QQúŸ][ô◊›ò[YK\]Yÿ]Sì’ 
+Bàààãà[Y‹ò[W⁄Yà]ZYàŸ^Kàò[YKà
+BÇà\ﬁ[ò»YàX›]ôW›\Ÿ\ú Ÿ[äHOà\›ÿ\ﬁ[ò‹ÀîôX€‹ôNÇàô]\õà]ÿZ]Ÿ[ãôô]⁄
+àààÇà—SP’
+àîì”HX\öŸ]XŸWÿXÿ€›[ù¬à“TëHX\öŸ]XŸOIŸù[ú^I»Së[òXõYUïQBàSëõﬁWŸ[ò»T»ì’ïSSë‹ôY[ùX[Ÿ[ò»T»ì’ïSàààÇà
+BÇà\ﬁ[ò»YàX›]ôW‹^Y\õ⁄◊›\Ÿ\ú Ÿ[äHOà\›ÿ\ﬁ[ò‹ÀîôX€‹ôNÇàô]\õà]ÿZ]Ÿ[ãôô]⁄
+àààÇà—SP’
+àîì”HX\öŸ]XŸWÿXÿ€›[ù¬à“TëHX\öŸ]XŸOI‹^Y\õ⁄…»Së[òXõYUïQBàSëõﬁWŸ[ò»T»ì’ïSSë‹ôY[ùX[Ÿ[ò»T»ì’ïSàààÇà
+BÇà\ﬁ[ò»Yà\›Ÿ[]ô\ûW‹ù[\ Ÿ[ã[Y‹ò[W⁄Yà[ù
+HOà\›ÿ\ﬁ[ò‹ÀîôX€‹ôNÇàô]\õà]ÿZ]Ÿ[ãôô]⁄
+àî—SP’
+àîì”Hù[ú^WŸ[]ô\ûW‹ù[\»“TëH[Y‹ò[W⁄YIH‘ëTàñH››]Hãà[Y‹ò[W⁄Yà
+BÇà\ﬁ[ò»YàŸ]Ÿ[]ô\ûW‹ù[JŸ[ã[Y‹ò[W⁄Yà[ùù[W⁄Yà[ù
+HOà\ﬁ[ò‹ÀîôX€‹ôõ€ôNÇàô]\õà]ÿZ]Ÿ[ãôô]⁄õ› àî—SP’
+àîì”Hù[ú^WŸ[]ô\ûW‹ù[\»“TëH[Y‹ò[W⁄YIHSëYIàãà[Y‹ò[W⁄Yàù[W⁄Yà
+BÇà\ﬁ[ò»Yàö[ôŸ[]ô\ûW‹ù[JàŸ[ã[Y‹ò[W⁄Yà[ù››]Nà›Çà
+HOà\ﬁ[ò‹ÀîôX€‹ôõ€ôNÇàô]\õà]ÿZ]Ÿ[ãôô]⁄õ› àààÇà—SP’
+àîì”Hù[ú^WŸ[]ô\ûW‹ù[\¬à“TëH[Y‹ò[W⁄YIHSë‹⁄][€ä››]H[à	äOåà‘ëTàñH[ô›
+››]JHT–»SRUBàààãà[Y‹ò[W⁄Yà››]Kà
+BÇà\ﬁ[ò»Yàÿ]ôWŸ[]ô\ûW‹ù[JàŸ[ã[Y‹ò[W⁄Yà[ù›⁄Yà[ù››]Nà›ãô\‹€úŸNà›Çà
+HOà\ﬁ[ò‹ÀîôX€‹ôÇàô]\õà]ÿZ]Ÿ[ãôô]⁄õ› àààÇàSî—TïSï»ù[ú^WŸ[]ô\ûW‹ù[\»
+[Y‹ò[W⁄Y›⁄Y››]Kô\‹€úŸJBàêSQT»
+	K	ã	À	
+Bà”à””ëìP’
+[Y‹ò[W⁄Y›⁄Y
+H»TUBà—U››]OQV”QQõ››]Kô\‹€úŸOQV”QQúô\‹€úŸKà[òXõYUïQK\]Yÿ]Sì’ 
+BàëUTìíSë»
+Çàààãà[Y‹ò[W⁄Yà›⁄Yà››]Kàô\‹€úŸKà
+BÇà\ﬁ[ò»YàYŸ[]ô\ûW‹õŸX› àŸ[ã[Y‹ò[W⁄Yà[ùù[W⁄Yà[ùõŸX›Œà\›‹›óBà
+HOàõ€ôNÇà]ÿZ]Ÿ[ãô^X›]JàààÇàTUHù[ú^WŸ[]ô\ûW‹ù[\¬à—UõŸX›œ\õŸX›»	ŒéïV◊K\]Yÿ]Sì’ 
+Bà“TëH[Y‹ò[W⁄YIHSëYIÇàààãà[Y‹ò[W⁄Yàù[W⁄YàõŸX›Àà
+BÇà\ﬁ[ò»Yà€X\óŸ[]ô\ûW‹õŸX› Ÿ[ã[Y‹ò[W⁄Yà[ùù[W⁄Yà[ù
+HOàõ€ôNÇà]ÿZ]Ÿ[ãô^X›]JàààÇàTUHù[ú^WŸ[]ô\ûW‹ù[\¬à—UõŸX›œPTîêVV◊NéïV◊K\]Yÿ]Sì’ 
+Bà“TëH[Y‹ò[W⁄YIHSëYIÇàààãà[Y‹ò[W⁄Yàù[W⁄Yà
+BÇà\ﬁ[ò»YàŸŸ€WŸ[]ô\ûW‹ù[JŸ[ã[Y‹ò[W⁄Yà[ùù[W⁄Yà[ù
+HOàõ€ôNÇà]ÿZ]Ÿ[ãô^X›]JàààÇàTUHù[ú^WŸ[]ô\ûW‹ù[\»—U[òXõYSì’[òXõY\]Yÿ]Sì’ 
+Bà“TëH[Y‹ò[W⁄YIHSëYIÇàààãà[Y‹ò[W⁄Yàù[W⁄Yà
+BÇà\ﬁ[ò»YàŸŸ€WŸ[]ô\ûW‹ù[W€‹[€äàŸ[ã[Y‹ò[W⁄Yà[ùù[W⁄Yà[ù€€[[éà›Çà
+HOàõ€ôNÇàYà€€[[àõ›[à»ô\ÿXõWÿ]]◊‹ô\›‹ôHãô\ÿXõWÿ]]◊Ÿ\ÿXõHüNÇàòZ\ŸHò[YQ\úõ‹ä¥'t-t.4-Ù,¥-t`t`¥/t,4c»4/t,4`t`¥`4/¥.t.¥,4/Ù`4,4,¥.4.Ù,4,4,¥`¥/¥,¥bÙ-4,4aÙ.äBà]ÿZ]Ÿ[ãô^X›]JààààÇàTUHù[ú^WŸ[]ô\ûW‹ù[\¬à—Uÿ€€[[üOSì’ÿ€€[[üK\]Yÿ]Sì’ 
+Bà“TëH[Y‹ò[W⁄YIHSëYIÇàààãà[Y‹ò[W⁄Yàù[W⁄Yà
+BÇà\ﬁ[ò»Yà[]WŸ[]ô\ûW‹ù[JŸ[ã[Y‹ò[W⁄Yà[ùù[W⁄Yà[ù
+HOàõ€ôNÇà]ÿZ]Ÿ[ãô^X›]JàëSUHîì”Hù[ú^WŸ[]ô\ûW‹ù[\»“TëH[Y‹ò[W⁄YIHSëYIàãà[Y‹ò[W⁄Yàù[W⁄Yà
+BÇà\ﬁ[ò»Yà€Z[WŸ[]ô\ûJàŸ[ã[Y‹ò[W⁄Yà[ù‹ô\ó⁄Yà›ã››]Nà›ã[[›[ùà[ùà
+HOà\Vÿ\ﬁ[ò‹ÀîôX€‹ô\›‹›óK[ù›àõ€ôWHõ€ôNÇàYàõ›Ÿ[ãú€€ÇàòZ\ŸHù[ù[YQ\úõ‹ä¥$t,4-Ù,4-4,4/t/tbÙaH4/t-H4/Ù/¥-4.¥.Ùc¥aÙ-t/t,äBà\ﬁ[ò»⁄]Ÿ[ãú€€òX‹]Z\ôJ
+H\»€€õôX›[€éà»õ‹XNà“SLLM»Hò[úÿX›[€àôYY»€€õôX›[€ãÇà\ﬁ[ò»⁄]€€õôX›[€ãùò[úÿX›[€ä
+NÇà\Xÿ]HH]ÿZ]€€õôX›[€ãôô]⁄ò[
+àî—SP’Hîì”Hù[ú^WŸ[]ô\ûW€Ÿ»“TëH[Y‹ò[W⁄YIHSë‹ô\ó⁄YIàãà[Y‹ò[W⁄Yà‹ô\ó⁄Yà
+BàYà\Xÿ]NÇàô]\õàõ€ôBàù[HH]ÿZ]€€õôX›[€ãôô]⁄õ› àààÇà—SP’
+àîì”Hù[ú^WŸ[]ô\ûW‹ù[\¬à“TëH[Y‹ò[W⁄YIHSë[òXõYUïQBàSë‹⁄][€ä››]H[à	äOåà‘ëTàñH[ô›
+››]JHT–¬àSRUHì‘àTUBàààãà[Y‹ò[W⁄Yà››]Kà
+BàYàõ›ù[NÇàô]\õàõ€ôBà›ÿ⁄»H\›
+ù[V»úõŸX›»óH‹à◊JBàôYY◊‹õŸX›HâõŸX›à[àù[V»úô\‹€úŸHóBàYàôYY◊‹õŸX›[ô[ä›ÿ⁄ H[[›[ùÇà\úõ‹àHà¥'t-t-4/¥`t`¥,4`¥/¥aÙ/t/à4`¥/¥,¥,4`4/¥,éà4/t`Ù-¥/t/àÿ[[›[ùK4-4/¥`t`¥`Ù/Ù/t/à€[ä›ÿ⁄ _HÇà]ÿZ]€€õôX›[€ãô^X›]JàààÇàSî—TïSï»ù[ú^WŸ[]ô\ûW€Ÿ¬à
+[Y‹ò[W⁄Y‹ô\ó⁄Yù[W⁄Y›]\À]Z[ BàêSQT»
+	K	ã	À	ŸòZ[Y	À	
+Bàààãà[Y‹ò[W⁄Yà‹ô\ó⁄Yàù[V»öYóKà\úõ‹ãà
+Bàô]\õàù[K◊K[ä›ÿ⁄ K\úõ‹ÇàõŸX›»H›ÿ⁄÷Œò[[›[ùHYàôYY◊‹õŸX›[ŸH◊Bàô[XZ[ö[ô»H›ÿ⁄÷ÿ[[›[ùóHYàôYY◊‹õŸX›[ŸH›ÿ⁄¬à]ÿZ]€€õôX›[€ãô^X›]JàïTUHù[ú^WŸ[]ô\ûW‹ù[\»—UõŸX›œIÀ\]Yÿ]Sì’ 
+H“TëH[Y‹ò[W⁄YIHSëYIàãà[Y‹ò[W⁄Yàù[V»öYóKàô[XZ[ö[ôÀà
+Bà]ÿZ]€€õôX›[€ãô^X›]JàààÇàSî—TïSï»ù[ú^WŸ[]ô\ûW€Ÿ¬à
+[Y‹ò[W⁄Y‹ô\ó⁄Yù[W⁄Y›]\ BàêSQT»
+	K	ã	À	‹õÿŸ\‹⁄[ô… Bàààãà[Y‹ò[W⁄Yà‹ô\ó⁄Yàù[V»öYóKà
+Bàô]\õàù[KõŸX›À[äô[XZ[ö[ô Kõ€ôBÇà\ﬁ[ò»Yàö[ö\⁄Ÿ[]ô\ûJàŸ[ã[Y‹ò[W⁄Yà[ù‹ô\ó⁄Yà›ã›]\Œà›ã]Z[Œà›àHàÇà
+HOàõ€ôNÇà]ÿZ]Ÿ[ãô^X›]JàààÇàTUHù[ú^WŸ[]ô\ûW€Ÿ»—U›]\œIÀ]Z[œIà“TëH[Y‹ò[W⁄YIHSë‹ô\ó⁄YIÇàààãà[Y‹ò[W⁄Yà‹ô\ó⁄Yà›]\Àà]Z[Àà
+BÇà\ﬁ[ò»Yàô\›‹ôWŸ[]ô\ûW‹õŸX› àŸ[ã[Y‹ò[W⁄Yà[ùù[W⁄Yà[ùõŸX›Œà\›‹›óBà
+HOàõ€ôNÇàYàõŸX›ŒÇà]ÿZ]Ÿ[ãô^X›]JàààÇàTUHù[ú^WŸ[]ô\ûW‹ù[\¬à—UõŸX›œIŒéïV◊HõŸX›À\]Yÿ]Sì’ 
+Bà“TëH[Y‹ò[W⁄YIHSëYIÇàààãà[Y‹ò[W⁄Yàù[W⁄YàõŸX›Àà
+BÇà\ﬁ[ò»Yà\›ÿ€€[X[ô‹ô\Y\ Ÿ[ã[Y‹ò[W⁄Yà[ù
+HOà\›ÿ\ﬁ[ò‹ÀîôX€‹ôNÇàô]\õà]ÿZ]Ÿ[ãôô]⁄
+àî—SP’
+àîì”Hù[ú^Wÿ€€[X[ô‹ô\Y\»“TëH[Y‹ò[W⁄YIH‘ëTàñHöYŸŸ\àãà[Y‹ò[W⁄Yà
+BÇà\ﬁ[ò»YàŸ]ÿ€€[X[ô‹ô\JŸ[ã[Y‹ò[W⁄Yà[ùô\W⁄Yà[ù
+HOà\ﬁ[ò‹ÀîôX€‹ôõ€ôNÇàô]\õà]ÿZ]Ÿ[ãôô]⁄õ› àî—SP’
+àîì”Hù[ú^Wÿ€€[X[ô‹ô\Y\»“TëH[Y‹ò[W⁄YIHSëYIàãà[Y‹ò[W⁄Yàô\W⁄Yà
+BÇà\ﬁ[ò»Yàö[ôÿ€€[X[ô‹ô\JŸ[ã[Y‹ò[W⁄Yà[ùöYŸŸ\éà›äHOà\ﬁ[ò‹ÀîôX€‹ôõ€ôNÇàô]\õà]ÿZ]Ÿ[ãôô]⁄õ› àààÇà—SP’
+àîì”Hù[ú^Wÿ€€[X[ô‹ô\Y\¬à“TëH[Y‹ò[W⁄YIHSëöYŸŸ\èIàSë[òXõYUïQBàààãà[Y‹ò[W⁄YàöYŸŸ\ãòÿ\ŸYõ€
+
+Kú›ö\
+
+Kà
+BÇà\ﬁ[ò»Yàÿ]ôWÿ€€[X[ô‹ô\JàŸ[ã[Y‹ò[W⁄Yà[ùöYŸŸ\éà›ãô\‹€úŸNà›Çà
+HOà\ﬁ[ò‹ÀîôX€‹ôÇàô]\õà]ÿZ]Ÿ[ãôô]⁄õ› àààÇàSî—TïSï»ù[ú^Wÿ€€[X[ô‹ô\Y\»
+[Y‹ò[W⁄YöYŸŸ\ãô\‹€úŸJBàêSQT»
+	K	ã	 Bà”à””ëìP’
+[Y‹ò[W⁄YöYŸŸ\äH»TUBà—Uô\‹€úŸOQV”QQúô\‹€úŸK[òXõYUïQK\]Yÿ]Sì’ 
+BàëUTìíSë»
+Çàààãà[Y‹ò[W⁄YàöYŸŸ\ãòÿ\ŸYõ€
+
+Kú›ö\
+
+Kàô\‹€úŸKà
+BÇà\ﬁ[ò»YàŸŸ€Wÿ€€[X[ô‹ô\JŸ[ã[Y‹ò[W⁄Yà[ùô\W⁄Yà[ù
+HOàõ€ôNÇà]ÿZ]Ÿ[ãô^X›]JàààÇàTUHù[ú^Wÿ€€[X[ô‹ô\Y\»—U[òXõYSì’[òXõY\]Yÿ]Sì’ 
+Bà“TëH[Y‹ò[W⁄YIHSëYIÇàààãà[Y‹ò[W⁄Yàô\W⁄Yà
+BÇà\ﬁ[ò»YàŸŸ€Wÿ€€[X[ô€õ›YöXÿ][€äŸ[ã[Y‹ò[W⁄Yà[ùô\W⁄Yà[ù
+HOàõ€ôNÇà]ÿZ]Ÿ[ãô^X›]JàààÇàTUHù[ú^Wÿ€€[X[ô‹ô\Y\»—Uõ›YûOSì’õ›YûK\]Yÿ]Sì’ 
+Bà“TëH[Y‹ò[W⁄YIHSëYIÇàààãà[Y‹ò[W⁄Yàô\W⁄Yà
+BÇà\ﬁ[ò»Yà[]Wÿ€€[X[ô‹ô\JŸ[ã[Y‹ò[W⁄Yà[ùô\W⁄Yà[ù
+HOàõ€ôNÇà]ÿZ]Ÿ[ãô^X›]JàëSUHîì”Hù[ú^Wÿ€€[X[ô‹ô\Y\»“TëH[Y‹ò[W⁄YIHSëYIàãà[Y‹ò[W⁄Yàô\W⁄Yà
+BÇà\ﬁ[ò»Yà\›€õ›YöXÿ][€ó›\ôŸ] Ÿ[ã[Y‹ò[W⁄Yà[ù
+HOà\›ÿ\ﬁ[ò‹ÀîôX€‹ôNÇàô]\õà]ÿZ]Ÿ[ãôô]⁄
+àî—SP’
+àîì”Hù[ú^W€õ›YöXÿ][€ó›\ôŸ]»“TëH[Y‹ò[W⁄YIH‘ëTàñH‹ôX]Yÿ]ãà[Y‹ò[W⁄Yà
+BÇà\ﬁ[ò»Yàÿ]ôW€õ›YöXÿ][€ó›\ôŸ]
+àŸ[ã[Y‹ò[W⁄Yà[ù⁄]⁄Yà[ù]Nà›Çà
+HOàõ€ôNÇà]ÿZ]Ÿ[ãô^X›]JàààÇàSî—TïSï»ù[ú^W€õ›YöXÿ][€ó›\ôŸ]»
+[Y‹ò[W⁄Y⁄]⁄Y]JBàêSQT»
+	K	ã	 Bà”à””ëìP’
+[Y‹ò[W⁄Y⁄]⁄Y
+H»TUBà—U]OQV”QQù]K[òXõYUïQBàààãà[Y‹ò[W⁄Yà⁄]⁄Yà]Kà
+BÇà\ﬁ[ò»Yà[]W€õ›YöXÿ][€ó›\ôŸ]
+Ÿ[ã[Y‹ò[W⁄Yà[ù⁄]⁄Yà[ù
+HOàõ€ôNÇà]ÿZ]Ÿ[ãô^X›]JàëSUHîì”Hù[ú^W€õ›YöXÿ][€ó›\ôŸ]»“TëH[Y‹ò[W⁄YIHSë⁄]⁄YIàãà[Y‹ò[W⁄Yà⁄]⁄Yà
+BÇà\ﬁ[ò»Yà\›‹^Y\õ⁄◊ÿ€€[X[ô‹ô\Y\ Ÿ[ã[Y‹ò[W⁄Yà[ù
+HOà\›ÿ\ﬁ[ò‹ÀîôX€‹ôNÇàô]\õà]ÿZ]Ÿ[ãôô]⁄
+àî—SP’
+àîì”H^Y\õ⁄◊ÿ€€[X[ô‹ô\Y\»“TëH[Y‹ò[W⁄YIH‘ëTàñHöYŸŸ\àãà[Y‹ò[W⁄Yà
+BÇà\ﬁ[ò»YàŸ]‹^Y\õ⁄◊ÿ€€[X[ô‹ô\JàŸ[ã[Y‹ò[W⁄Yà[ùô\W⁄Yà[ùà
+HOà\ﬁ[ò‹ÀîôX€‹ôõ€ôNÇàô]\õà]ÿZ]Ÿ[ãôô]⁄õ› àî—SP’
+àîì”H^Y\õ⁄◊ÿ€€[X[ô‹ô\Y\»“TëH[Y‹ò[W⁄YIHSëYIàãà[Y‹ò[W⁄Yàô\W⁄Yà
+BÇà\ﬁ[ò»Yàö[ô‹^Y\õ⁄◊ÿ€€[X[ô‹ô\JàŸ[ã[Y‹ò[W⁄Yà[ùöYŸŸ\éà›Çà
+HOà\ﬁ[ò‹ÀîôX€‹ôõ€ôNÇàô]\õà]ÿZ]Ÿ[ãôô]⁄õ› àààÇà—SP’
+àîì”H^Y\õ⁄◊ÿ€€[X[ô‹ô\Y\¬à“TëH[Y‹ò[W⁄YIHSëöYŸŸ\èIàSë[òXõYUïQBàààãà[Y‹ò[W⁄YàöYŸŸ\ãòÿ\ŸYõ€
+
+Kú›ö\
+
+Kà
+BÇà\ﬁ[ò»Yàÿ]ôW‹^Y\õ⁄◊ÿ€€[X[ô‹ô\JàŸ[ã[Y‹ò[W⁄Yà[ùöYŸŸ\éà›ãô\‹€úŸNà›Çà
+HOà\ﬁ[ò‹ÀîôX€‹ôÇàô]\õà]ÿZ]Ÿ[ãôô]⁄õ› àààÇàSî—TïSï»^Y\õ⁄◊ÿ€€[X[ô‹ô\Y\»
+[Y‹ò[W⁄YöYŸŸ\ãô\‹€úŸJBàêSQT»
+	K	ã	 Bà”à””ëìP’
+[Y‹ò[W⁄YöYŸŸ\äH»TUBà—Uô\‹€úŸOQV”QQúô\‹€úŸK[òXõYUïQK\]Yÿ]Sì’ 
+BàëUTìíSë»
+Çàààãà[Y‹ò[W⁄YàöYŸŸ\ãòÿ\ŸYõ€
+
+Kú›ö\
+
+Kàô\‹€úŸKà
+BÇà\ﬁ[ò»YàŸŸ€W‹^Y\õ⁄◊ÿ€€[X[ô‹ô\JŸ[ã[Y‹ò[W⁄Yà[ùô\W⁄Yà[ù
+HOàõ€ôNÇà]ÿZ]Ÿ[ãô^X›]JàààÇàTUH^Y\õ⁄◊ÿ€€[X[ô‹ô\Y\»—U[òXõYSì’[òXõY\]Yÿ]Sì’ 
+Bà“TëH[Y‹ò[W⁄YIHSëYIÇàààãà[Y‹ò[W⁄Yàô\W⁄Yà
+BÇà\ﬁ[ò»Yà[]W‹^Y\õ⁄◊ÿ€€[X[ô‹ô\JŸ[ã[Y‹ò[W⁄Yà[ùô\W⁄Yà[ù
+HOàõ€ôNÇà]ÿZ]Ÿ[ãô^X›]JàëSUHîì”H^Y\õ⁄◊ÿ€€[X[ô‹ô\Y\»“TëH[Y‹ò[W⁄YIHSëYIàãà[Y‹ò[W⁄Yàô\W⁄Yà
+BÇà\ﬁ[ò»Yà\›‹^Y\õ⁄◊Ÿ[]ô\ûW‹ù[\ Ÿ[ã[Y‹ò[W⁄Yà[ù
+HOà\›ÿ\ﬁ[ò‹ÀîôX€‹ôNÇàô]\õà]ÿZ]Ÿ[ãôô]⁄
+àî—SP’
+àîì”H^Y\õ⁄◊Ÿ[]ô\ûW‹ù[\»“TëH[Y‹ò[W⁄YIH‘ëTàñH][W›]Hãà[Y‹ò[W⁄Yà
+BÇà\ﬁ[ò»YàŸ]‹^Y\õ⁄◊Ÿ[]ô\ûW‹ù[JàŸ[ã[Y‹ò[W⁄Yà[ùù[W⁄Yà[ùà
+HOà\ﬁ[ò‹ÀîôX€‹ôõ€ôNÇàô]\õà]ÿZ]Ÿ[ãôô]⁄õ› àî—SP’
+àîì”H^Y\õ⁄◊Ÿ[]ô\ûW‹ù[\»“TëH[Y‹ò[W⁄YIHSëYIàãà[Y‹ò[W⁄Yàù[W⁄Yà
+BÇà\ﬁ[ò»Yàÿ]ôW‹^Y\õ⁄◊Ÿ[]ô\ûW‹ù[JàŸ[ã[Y‹ò[W⁄Yà[ù][W⁄Yà›ã][W›]Nà›ãô\‹€úŸNà›Çà
+HOà\ﬁ[ò‹ÀîôX€‹ôÇàô]\õà]ÿZ]Ÿ[ãôô]⁄õ› àààÇàSî—TïSï»^Y\õ⁄◊Ÿ[]ô\ûW‹ù[\»
+[Y‹ò[W⁄Y][W⁄Y][W›]Kô\‹€úŸJBàêSQT»
+	K	ã	À	
+Bà”à””ëìP’
+[Y‹ò[W⁄Y][W⁄Y
+H»TUBà—U][W›]OQV”QQö][W›]Kô\‹€úŸOQV”QQúô\‹€úŸKà[òXõYUïQK\]Yÿ]Sì’ 
+BàëUTìíSë»
+Çàààãà[Y‹ò[W⁄Yà][W⁄Yà][W›]Kàô\‹€úŸKà
+BÇà\ﬁ[ò»YàY‹^Y\õ⁄◊Ÿ[]ô\ûW‹õŸX› àŸ[ã[Y‹ò[W⁄Yà[ùù[W⁄Yà[ùõŸX›Œà\›‹›óBà
+HOàõ€ôNÇà]ÿZ]Ÿ[ãô^X›]JàààÇàTUH^Y\õ⁄◊Ÿ[]ô\ûW‹ù[\¬à—UõŸX›œ\õŸX›»	ŒéïV◊K\]Yÿ]Sì’ 
+Bà“TëH[Y‹ò[W⁄YIHSëYIÇàààãà[Y‹ò[W⁄Yàù[W⁄YàõŸX›Àà
+BÇà\ﬁ[ò»Yà€X\ó‹^Y\õ⁄◊Ÿ[]ô\ûW‹õŸX› Ÿ[ã[Y‹ò[W⁄Yà[ùù[W⁄Yà[ù
+HOàõ€ôNÇà]ÿZ]Ÿ[ãô^X›]JàààÇàTUH^Y\õ⁄◊Ÿ[]ô\ûW‹ù[\¬à—UõŸX›œPTîêVV◊NéïV◊K\]Yÿ]Sì’ 
+Bà“TëH[Y‹ò[W⁄YIHSëYIÇàààãà[Y‹ò[W⁄Yàù[W⁄Yà
+BÇà\ﬁ[ò»YàŸŸ€W‹^Y\õ⁄◊Ÿ[]ô\ûW‹ù[JŸ[ã[Y‹ò[W⁄Yà[ùù[W⁄Yà[ù
+HOàõ€ôNÇà]ÿZ]Ÿ[ãô^X›]JàààÇàTUH^Y\õ⁄◊Ÿ[]ô\ûW‹ù[\»—U[òXõYSì’[òXõY\]Yÿ]Sì’ 
+Bà“TëH[Y‹ò[W⁄YIHSëYIÇàààãà[Y‹ò[W⁄Yàù[W⁄Yà
+BÇà\ﬁ[ò»Yà[]W‹^Y\õ⁄◊Ÿ[]ô\ûW‹ù[JŸ[ã[Y‹ò[W⁄Yà[ùù[W⁄Yà[ù
+HOàõ€ôNÇà]ÿZ]Ÿ[ãô^X›]JàëSUHîì”H^Y\õ⁄◊Ÿ[]ô\ûW‹ù[\»“TëH[Y‹ò[W⁄YIHSëYIàãà[Y‹ò[W⁄Yàù[W⁄Yà
+BÇà\ﬁ[ò»Yà€Z[W‹^Y\õ⁄◊Ÿ[]ô\ûJàŸ[ã[Y‹ò[W⁄Yà[ùX[⁄Yà›ã][W⁄Yà›Çà
+HOà\Vÿ\ﬁ[ò‹ÀîôX€‹ô\›‹›óK[ù›àõ€ôWHõ€ôNÇàYàõ›Ÿ[ãú€€ÇàòZ\ŸHù[ù[YQ\úõ‹ä¥$t,4-Ù,4-4,4/t/tbÙaH4/t-H4/Ù/¥-4.¥.Ùc¥aÙ-t/t,äBà\ﬁ[ò»⁄]Ÿ[ãú€€òX‹]Z\ôJ
+H\»€€õôX›[€éà»õ‹XNà“SLLM»Hò[úÿX›[€àôYY»€€õôX›[€ãÇà\ﬁ[ò»⁄]€€õôX›[€ãùò[úÿX›[€ä
+NÇàYà]ÿZ]€€õôX›[€ãôô]⁄ò[
+àî—SP’Hîì”H^Y\õ⁄◊Ÿ[]ô\ûW€Ÿ»“TëH[Y‹ò[W⁄YIHSëX[⁄YIàãà[Y‹ò[W⁄YàX[⁄Yà
+NÇàô]\õàõ€ôBàù[HH]ÿZ]€€õôX›[€ãôô]⁄õ› àààÇà—SP’
+àîì”H^Y\õ⁄◊Ÿ[]ô\ûW‹ù[\¬à“TëH[Y‹ò[W⁄YIHSë][W⁄YIàSë[òXõYUïQBàSRUHì‘àTUBàààãà[Y‹ò[W⁄Yà][W⁄Yà
+BàYàõ›ù[NÇàô]\õàõ€ôBà›ÿ⁄»H\›
+ù[V»úõŸX›»óH‹à◊JBàôYY◊‹õŸX›HâõŸX›à[àù[V»úô\‹€úŸHóBàYàôYY◊‹õŸX›[ôõ››ÿ⁄ŒÇà\úõ‹àH¥%Ù,4.¥/¥/taÙ.4.Ù.4`tc4`¥/¥,¥,4`4b»4-4.Ùc»4,4,¥`¥/¥,¥bÙ-4,4aÙ.Çà]ÿZ]€€õôX›[€ãô^X›]JàààÇàSî—TïSï»^Y\õ⁄◊Ÿ[]ô\ûW€Ÿ¬à
+[Y‹ò[W⁄YX[⁄Yù[W⁄Y›]\À]Z[ BàêSQT»
+	K	ã	À	ŸòZ[Y	À	
+Bàààãà[Y‹ò[W⁄YàX[⁄Yàù[V»öYóKà\úõ‹ãà
+Bàô]\õàù[K◊K\úõ‹ÇàõŸX›»H›ÿ⁄÷ŒåWHYàôYY◊‹õŸX›[ŸH◊Bàô[XZ[ö[ô»H›ÿ⁄÷ÃNóHYàôYY◊‹õŸX›[ŸH›ÿ⁄¬à]ÿZ]€€õôX›[€ãô^X›]JàïTUH^Y\õ⁄◊Ÿ[]ô\ûW‹ù[\»—UõŸX›œIÀ\]Yÿ]Sì’ 
+H“TëH[Y‹ò[W⁄YIHSëYIàãà[Y‹ò[W⁄Yàù[V»öYóKàô[XZ[ö[ôÀà
+Bà]ÿZ]€€õôX›[€ãô^X›]JàààÇàSî—TïSï»^Y\õ⁄◊Ÿ[]ô\ûW€Ÿ»
+[Y‹ò[W⁄YX[⁄Yù[W⁄Y›]\ BàêSQT»
+	K	ã	À	‹õÿŸ\‹⁄[ô… Bàààãà[Y‹ò[W⁄YàX[⁄Yàù[V»öYóKà
+Bàô]\õàù[KõŸX›À[äô[XZ[ö[ô Kõ€ôBÇà\ﬁ[ò»Yàö[ö\⁄‹^Y\õ⁄◊Ÿ[]ô\ûJàŸ[ã[Y‹ò[W⁄Yà[ùX[⁄Yà›ã›]\Œà›ã]Z[Œà›àHàÇà
+HOàõ€ôNÇà]ÿZ]Ÿ[ãô^X›]JàààÇàTUH^Y\õ⁄◊Ÿ[]ô\ûW€Ÿ»—U›]\œIÀ]Z[œIà“TëH[Y‹ò[W⁄YIHSëX[⁄YIÇàààãà[Y‹ò[W⁄YàX[⁄Yà›]\Àà]Z[Àà
+BÇà\ﬁ[ò»Yà‹ôX]W‹^Y\õ⁄◊‹õ€[›[€ó‹ô\]Y\›
+àŸ[ãà[Y‹ò[W⁄Yà[ùàXÿ€›[ù⁄Yà[ùà][W⁄Yà›ãà][W›]Nà›ãàö[‹ö]W‹›]\◊⁄Yà›ãàö[‹ö]W€ò[YNà›ãà^X›Y‹öXŸNà[ùà\ö[ŸŸ^\Œà[ùà
+HOà\ﬁ[ò‹ÀîôX€‹ôÇà⁄Ÿ[àH‹Àù\ò[ô€J
+Kö^
+
+Bàõ›»H]ÿZ]Ÿ[ãôô]⁄õ› àààÇàSî—TïSï»^Y\õ⁄◊‹õ€[›[€ó‹ô\]Y\›¬à
+⁄Ÿ[ã[Y‹ò[W⁄YXÿ€›[ù⁄Y][W⁄Y][W›]Kàö[‹ö]W‹›]\◊⁄Yö[‹ö]W€ò[YK^X›Y‹öXŸK\ö[ŸŸ^\ BàêSQT»
+	K	ã	À		K	ã	À		JBàëUTìíSë»
+Çàààãà⁄Ÿ[ãà[Y‹ò[W⁄YàXÿ€›[ù⁄Yà][W⁄Yà€\Y
+][W›]KL
+Kàö[‹ö]W‹›]\◊⁄Yà€\Y
+ö[‹ö]W€ò[YKå
+Kà^X›Y‹öXŸKà\ö[ŸŸ^\Àà
+BàYàõ›õ›ŒÇàòZ\ŸHù[ù[YQ\úõ‹ä¥'t-H4`Ù-4,4.Ù/¥`tc4`t/¥-Ù-4,4`¥c4-Ù,4/Ù`4/¥`H4/Ù`4/¥-4,¥.4-¥-t/t.4c»äBàô]\õàõ›¬Çà\ﬁ[ò»YàŸ]‹^Y\õ⁄◊‹õ€[›[€ó‹ô\]Y\›
+àŸ[ã[Y‹ò[W⁄Yà[ù⁄Ÿ[éà›Çà
+HOà\ﬁ[ò‹ÀîôX€‹ôõ€ôNÇàô]\õà]ÿZ]Ÿ[ãôô]⁄õ› àààÇà—SP’
+àîì”H^Y\õ⁄◊‹õ€[›[€ó‹ô\]Y\›¬à“TëH[Y‹ò[W⁄YIHSë⁄Ÿ[èIÇàààãà[Y‹ò[W⁄Yà⁄Ÿ[ãà
+BÇà\ﬁ[ò»Yà€Z[W‹^Y\õ⁄◊‹õ€[›[€ó‹ô\]Y\›
+àŸ[ã[Y‹ò[W⁄Yà[ù⁄Ÿ[éà›Çà
+HOà\ﬁ[ò‹ÀîôX€‹ôõ€ôNÇàô]\õà]ÿZ]Ÿ[ãôô]⁄õ› àààÇàTUH^Y\õ⁄◊‹õ€[›[€ó‹ô\]Y\›¬à—U›]\œI‹õÿŸ\‹⁄[ô…À\]Yÿ]Sì’ 
+Bà“TëH[Y‹ò[W⁄YIHSë⁄Ÿ[èIàSë›]\œI‹[ô[ô…¬àSë‹ôX]Yÿ]àì’ 
+HHSïTïêS	ÃMHZ[ù]\…¬àëUTìíSë»
+Çàààãà[Y‹ò[W⁄Yà⁄Ÿ[ãà
+BÇà\ﬁ[ò»Yàö[ö\⁄‹^Y\õ⁄◊‹õ€[›[€ó‹ô\]Y\›
+àŸ[ã[Y‹ò[W⁄Yà[ù⁄Ÿ[éà›ã›]\Œà›ã\úõ‹ó›^à›àHàÇà
+HOàõ€ôNÇàYà›]\»õ›[à»ú›XÿŸYYYãôòZ[YüNÇàòZ\ŸHò[YQ\úõ‹ä¥'t-t.4-Ù,¥-t`t`¥/tbÙ.H4`t`¥,4`¥`Ù`H4/Ù`4/¥-4,¥.4-¥-t/t.4c»äBà]ÿZ]Ÿ[ãô^X›]JàààÇàTUH^Y\õ⁄◊‹õ€[›[€ó‹ô\]Y\›¬à—U›]\œIÀ\úõ‹ó›^I\]Yÿ]Sì’ 
+Bà“TëH[Y‹ò[W⁄YIHSë⁄Ÿ[èIàSë›]\œI‹õÿŸ\‹⁄[ô…¬àààãà[Y‹ò[W⁄Yà⁄Ÿ[ãà›]\Àà€\Y
+\úõ‹ó›^L
+Kà
+BÇà\ﬁ[ò»Yàô\›‹ôW‹^Y\õ⁄◊Ÿ[]ô\ûW‹õŸX› àŸ[ã[Y‹ò[W⁄Yà[ùù[W⁄Yà[ùõŸX›Œà\›‹›óBà
+HOàõ€ôNÇàYàõŸX›ŒÇà]ÿZ]Ÿ[ãô^X›]JàààÇàTUH^Y\õ⁄◊Ÿ[]ô\ûW‹ù[\¬à—UõŸX›œIŒéïV◊HõŸX›À\]Yÿ]Sì’ 
+Bà“TëH[Y‹ò[W⁄YIHSëYIÇàààãà[Y‹ò[W⁄Yàù[W⁄YàõŸX›Àà
+BÇÇôYàõ‹õX[^ôW‹õﬁJò]Œà›äHOà›éÇàò[YHHò]Àú›ö\
+
+BàYàéãÀ»àõ›[àò[YNÇàò[YHHöãÀ»à
+»ò[YBà\úŸYH\õ‹]
+ò[YJBàYà\úŸYúÿ⁄[YKõ›Ÿ\ä
+Hõ›[à»öãö»ãú€ÿ⁄‹Õãú€ÿ⁄‹ÕHãú€ÿ⁄‹ÕZüNÇàòZ\ŸHò[YQ\úõ‹ä¥'Ù/¥-4-4-t`4-¥.4,¥,4c¥`¥`tc»À€ÿ⁄‹Õ€ÿ⁄‹ÕH4.€ÿ⁄‹ÕZäBàûNÇà‹ùH\úŸYú‹ùà^Ÿ\ò[YQ\úõ‹à\»^ŒÇàòZ\ŸHò[YQ\úõ‹ä¥'t-t.¥/¥`4`4-t.¥`¥/tbÙ.H4/Ù/¥`4`à4/Ù`4/¥.¥`t.äHúõ€H^¬àYàõ›\úŸYö‹›ò[YH‹àõ›‹ùÇàòZ\ŸHò[YQ\úõ‹ä¥'t`Ù-¥-t/H4,4-4`4-t`H4,¥.4-4,\Ÿ\éú\‹›€‹ô‹›ú‹ùäBàô]\õàò[YBÇÇôYàõﬁWŸX›
+õﬁNà›äHOàX›‹›ã›óNÇàô]\õà»öéàõﬁKö»éàõﬁ_BÇÇôYàõﬁW€Xô[
+õﬁNà›äHOà›éÇà\úŸYH\õ‹]
+õﬁJBàô]\õààû‹\úŸYúÿ⁄[Y_NãÀﬁ‹\úŸYö‹›ò[Y_Nû‹\úŸYú‹ùHÇÇÇôYàX\⁄ŸY‹€ôJ€ôNà›äHOà›éÇàY⁄]»HôKú›Xäàóãàã€ôJBàYà[äY⁄] HNÇàô]\õà¥`t.¥`4bÙ`àÇàô]\õààäﬁŸY⁄]÷Œåó_^…¯†(â»
+àX^
+À[äY⁄] HH
+_^ŸY⁄]÷ÀLéó_HÇÇÇôYàù[ú^Wÿ€€õôX›[€óŸ\úõ‹ó€Y\‹ÿYŸJ^Œàò\ŸQ^Ÿ\[€äHOà›éÇààà¥$¥/¥-Ù,¥`4,4bt,4-t`à4,t-t-Ù/¥/Ù,4`t/t`Ùcà4/Ù/¥-4`t.¥,4-Ù.¥`»4,t-t-»4,¥bÙ,¥/¥-4,4/Ù`4/¥.¥`t.t.Ù/¥,Ù.4/t,4.4/Ù,4`4/¥.ÙcÀàààÇàYàŸ]]ä^Àú›]\◊ÿ€ŸHãõ€ôJHOH»‹àç»à[à›ä^ NÇàô]\õà
+à¥'Ù`4/¥.¥`t.4/¥`¥.¥.Ù/¥/t.4.»4,4,¥`¥/¥`4.4-Ù,4a¥.4cà
+4/¥b4.4,t.¥, Kà4'Ù`4/¥,¥-t`4c4`¥-H4.Ù/¥,Ù.4/K4/Ù,4`4/¥.ÙcÇà¥`¥.4/»4/Ù`4/¥.¥`t.4.4`4,4-Ù`4-tb4dt/t/tbÙ.HT4`»4/Ù`4/¥,¥,4.t-4-t`4,àÇà
+Bàô]\õàëù[î^H4/t-H4/Ù`4.4/tcÙ.»4-4,4/t/tbÙ-Kà4'Ù`4/¥,¥-t`4c4`¥-H4-4/¥`t`¥`Ù/Ù/t/¥`t`¥c4/Ù`4/¥.¥`t.4.4,4.¥`¥`Ù,4.Ùc4/t/¥`t`¥c€€[ó⁄Ÿ^KàÇÇÇôYà^Y\õ⁄◊‹õﬁW›ò[YJõﬁNà›äHOà›éÇà\úŸYH\õ‹]
+õﬁJBàYà\úŸYúÿ⁄[YKõ›Ÿ\ä
+Hõ›[à»öãö»üNÇàòZ\ŸHò[YQ\úõ‹äî^Y\õ⁄–TH4/Ù/¥-4-4-t`4-¥.4,¥,4-t`àTç“Àt/Ù`4/¥.¥`t.äBà‹ôY[ùX[»HàÇàYà\úŸYù\Ÿ\õò[YNÇà‹ôY[ùX[»H\úŸYù\Ÿ\õò[YBàYà\úŸYú\‹›€‹ôÇà‹ôY[ùX[»
+œHàéû‹\úŸYú\‹›€‹ôHÇà‹ôY[ùX[»
+œHêÇàô]\õààûÿ‹ôY[ùX[ﬂ^‹\úŸYö‹›ò[Y_Nû‹\úŸYú‹ùHÇÇÇôYà‹ôX]W‹^Y\õ⁄◊ÿXÿ€›[ù
+€€⁄⁄YNà›ãõﬁNà›äHOà[ûNÇààà¥(t/¥-Ù-4,4dt`à4/t-t-Ù,4,¥.4`t.4/4bÙ.H4,4.¥.¥,4`Ù/t`ã4/¥,tat/¥-4c»⁄[ô€]€à4,à^Y\õ⁄–TKàààÇàYà^Y\õ⁄–Xÿ€›[ù\»õ€ôNÇà]Z[»Hàéà‘VQTì“◊“ST‘ï—Tîì‘üHàYàVQTì“◊“ST‘ï—Tîì‘à[ŸHàÇàòZ\ŸHù[ù[YQ\úõ‹äàî^Y\õ⁄–TH4/t-H4-Ù,4,Ù`4`Ù-Ù.4.Ù`tc»4,à4`¥-t.¥`Ùbt-t.H4`t,t/¥`4.¥-^Ÿ]Z[ﬂHäBàXÿ€›[ùHÿöôX›ó◊€ô]◊◊ ^Y\õ⁄–Xÿ€›[ù
+Bà›ÿ\ô‹ŒàX›‹›ã[ûWHH¬àù\Ÿ\óÿYŸ[ùéàT—Tó–Q—SïàúõﬁHéà^Y\õ⁄◊‹õﬁW›ò[YJõﬁJKàúô\]Y\›◊›[Y[›]éàåàBàYàèHà[à€€⁄⁄YNÇà›ÿ\ô‹÷»ò€€⁄⁄Y\»óHH€€⁄⁄YBà[ŸNÇà›ÿ\ô‹÷»ù⁄Ÿ[àóHH€€⁄⁄YBàûNÇà^Y\õ⁄–Xÿ€›[ùó◊⁄[ö]◊ Xÿ€›[ù
+äö›ÿ\ô‹ Bà^Ÿ\ö[Sõ›õ›[ô\úõ‹éÇà»^Y\õ⁄–THKåH4/t-H4/¥,tb¥cÙ,¥.ÙcÙ-t`àÿXŸ\ùú[H4,àX⁄ÿYŸWŸ]Kà4&à4ct`¥/¥/4`»4/4/¥/4-t/t`¥`¬à»◊⁄[ö]◊»4`Ù-¥-H4-Ù,4/Ù/¥.Ù/t.4.»4-4,4/t/tbÙ-H4,4.¥.¥,4`Ù/t`¥,4/Ù/¥ct`¥/¥/4`»4,t-t-Ù/¥/Ù,4`t/t/à4-Ù,4,¥-t`4b4,4-t/4/t,4`t`¥`4/¥.t.¥`»4.¥.Ù.4-t/t`¥/¥,ãÇàXÿ€›[ùóÿŸ\ù‹]HŸ\ùYöKù⁄\ôJ
+BàXÿ€›[ùó›\ÿŸ\ù‹]HŸ\ùYöKù⁄\ôJ
+BàXÿ€›[ùó–Xÿ€›[ù◊›◊‹ô\]Y\›»Hõ€ôBàXÿ€›[ùó–Xÿ€›[ù◊ÿ›\õ‹Ÿ\‹⁄[€àHõ€ôBàXÿ€›[ùó–Xÿ€›[ù◊‹ô\]Y\›€ÿ⁄»HôXY[ôÀîìÿ⁄ 
+BàXÿ€›[ùó‹ôYúô\⁄ÿ€Y[ù 
+Bàô]\õàXÿ€›[ùÇÇîVQTì“◊–“P“◊—SPRS‘UQTñHHààõ]]][€à⁄X⁄—[XZ[]]€ŸJ	[ú]à⁄X⁄—[XZ[]]€ŸR[ú]JH¬à⁄X⁄—[XZ[]]€ŸJ[ú]à	[ú]
+H¬àYà\Ÿ\õò[YBà[XZ[àõ€Bà◊›\[ò[YBàBüHààÇÇÇôYà‹^Y\õ⁄◊ÿ]]⁄XY\ú ‹\ò][€éà›ã€€⁄⁄YNà›àHàäHOàX›‹›ã›óNÇàXY\ú»H¬àòXÿŸ\éàäã àãàò€€ù[ù]\Héàò\Xÿ][€ã⁄ú€€àãàõ‹öY⁄[àéàöŒãÀ‹^Y\õ⁄Àò€€HãàúôYô\ô\àéàöŒãÀ‹^Y\õ⁄Àò€€K»ãàù\Ÿ\ãXYŸ[ùéàT—Tó–Q—SïàûX\€À[‹\ò][€ã[ò[YHéà‹\ò][€ãàûY‹[[‹éà‹\ò][€ãàûY‹[\]éàã»ãàBàYà€€⁄⁄YNÇàXY\ú÷»ò€€⁄⁄YHóHH€€⁄⁄YBàô]\õàXY\ú¬ÇÇôYà‹^Y\õ⁄◊‹ô\‹€úŸW⁄ú€€äô\‹€úŸNà[ûJHOàX›‹›ã[ûWNÇàûNÇà^[ÿYHô\‹€úŸKöú€€ä
+Bà^Ÿ\^Ÿ\[€à\»^ŒÇàòZ\ŸHù[ù[YQ\úõ‹äààî^Y\õ⁄»4,¥-t`4/t`Ù.»4/t-Hî””à
+ŸŸ]]äô\‹€úŸK	‹›]\◊ÿ€ŸIÀ	¯†%	 _JHÇà
+Húõ€H^¬àYàŸ]]äô\‹€úŸKú›]\◊ÿ€ŸHã
+HOHåÇàòZ\ŸHù[ù[YQ\úõ‹äàî^Y\õ⁄»4,¥-t`4/t`Ù.»‹ô\‹€úŸKú›]\◊ÿ€Ÿ_HäBà\úõ‹ú»H^[ÿYôŸ]
+ô\úõ‹ú»äH‹à◊BàYà\úõ‹úŒÇàY\‹ÿYŸHH\úõ‹ú÷ÃKôŸ]
+õY\‹ÿYŸHã¥'t-t.4-Ù,¥-t`t`¥/t,4c»4/¥b4.4,t.¥,^Y\õ⁄»äBàòZ\ŸHù[ù[YQ\úõ‹ä›äY\‹ÿYŸJJBàô]\õà^[ÿYÇÇôYà‹^Y\õ⁄◊‹Ÿ\‹⁄[€óÿ€€⁄⁄Y\ Ÿ\‹⁄[€éà[ûKô\‹€úŸNà[ûHõ€ôHHõ€ôJHOà›éÇà€€⁄⁄Y\ŒàX›‹›ã›óHHﬂBàô\‹€úŸ\»H‹ô\‹€úŸK
+õ\›
+Ÿ]]äô\‹€úŸKö\›‹ûHãõ€ôJH‹à◊JWBà€›\òŸ\»HŸŸ]]äŸ\‹⁄[€ãò€€⁄⁄Y\»ãõ€ôJWBà€›\òŸ\Àô^[ô
+Ÿ]]ä][Kò€€⁄⁄Y\»ãõ€ôJHõ‹à][H[àô\‹€úŸ\»Yà][JBàõ‹à€›\òŸH[à€›\òŸ\ŒÇàYà€›\òŸH\»õ€ôNÇà€€ù[ùYBàûNÇà€€⁄⁄Y\Àù\]J‹›äŸ^JNà›äò[YJHõ‹àŸ^Kò[YH[à€›\òŸKôŸ]ŸX›
+
+Kö][\ 
+_JBà^Ÿ\]öXù]Q\úõ‹éÇàûNÇà€€⁄⁄Y\Àù\]J‹›äŸ^JNà›äò[YJHõ‹àŸ^Kò[YH[à€›\òŸKö][\ 
+_JBà^Ÿ\
+]öXù]Q\úõ‹ã\Q\úõ‹ãò[YQ\úõ‹äNÇà€€ù[ùYBàõ‹à][H[àô\‹€úŸ\ŒÇàXY\ú»HŸ]]ä][KöXY\ú»ãõ€ôJBàYàXY\ú»\»õ€ôNÇà€€ù[ùYBàò]◊›ò[Y\Œà\›‹›óHH◊BàŸ]€\›HŸ]]äXY\úÀôŸ]€\›ãõ€ôJBàYàÿ[XõJŸ]€\›
+NÇàûNÇàò]◊›ò[Y\Àô^[ô
+›äò[YJHõ‹àò[YH[àŸ]€\›
+úŸ]X€€⁄⁄YHäJBà^Ÿ\
+Ÿ^Q\úõ‹ã\Q\úõ‹ãò[YQ\úõ‹äNÇà\‹¬àYàõ›ò]◊›ò[Y\ŒÇàûNÇàò]»HXY\úÀôŸ]
+úŸ]X€€⁄⁄YHãàäBà^Ÿ\
+]öXù]Q\úõ‹ãŸ^Q\úõ‹ã\Q\úõ‹äNÇàò]»HàÇàYàò]ŒÇàò]◊›ò[Y\Àò\[ô
+›äò] JBàõ‹àò]»[àò]◊›ò[Y\ŒÇà\úŸYH⁄[\P€€⁄⁄YJ
+BàûNÇà\úŸYõÿY
+ò] Bà^Ÿ\
+€€⁄⁄YQ\úõ‹ã\Q\úõ‹ãò[YQ\úõ‹äNÇà€€ù[ùYBà€€⁄⁄Y\Àù\]Jà¬à›äŸ^JNà›ä[‹úŸ[ùò[YJBàõ‹àŸ^K[‹úŸ[[à\úŸYö][\ 
+BàYà[‹úŸ[ùò[YBàBà
+Bàõ‹àXY\ó€ò[YH[à
+àûX]]]⁄Ÿ[àãàûXXÿŸ\‹À]⁄Ÿ[àãàò]]‹ö^ò][€àãà
+NÇàûNÇàò]◊›⁄Ÿ[àH›äXY\úÀôŸ]
+XY\ó€ò[YKàäH‹ààäKú›ö\
+
+Bà^Ÿ\
+]öXù]Q\úõ‹ãŸ^Q\úõ‹ã\Q\úõ‹äNÇàò]◊›⁄Ÿ[àHàÇàYàò]◊›⁄Ÿ[éÇà€€⁄⁄Y\ÀúŸ]Yò][
+ù⁄Ÿ[àãò]◊›⁄Ÿ[ãúô[[›ô\ôYö^
+êôX\ô\àäKú›ö\
+
+JBàô]\õàé»ãöõ⁄[äàû⁄Ÿ^_O^›ò[Y_Hàõ‹àŸ^Kò[YH[à€€⁄⁄Y\Àö][\ 
+JBÇÇôYàô\]Y\›‹^Y\õ⁄◊Ÿ[XZ[ÿ€ŸJ[XZ[à›ãõﬁNà›äHOà›éÇààà¥'¥`¥/Ù`4,4,¥.ÙcÙ-t`à4/¥-4/t/¥`4,4-Ù/¥,¥bÙ.H4.¥/¥-4.4,¥/¥-Ù,¥`4,4bt,4-t`à€€⁄⁄YH4/t-t-Ù,4,¥-t`4b4dt/t/t/¥.H]]t`t-t`t`t.4.àààÇàûNÇàúõ€H›\õÿŸôöH[\‹ùô\]Y\›»\»›\õ‹ô\]Y\›¬à^Ÿ\[\‹ù\úõ‹à\»^ŒÇàòZ\ŸHù[ù[YQ\úõ‹äò›\õÿŸôöH4/t-H4`Ù`t`¥,4/t/¥,¥.Ù-t/H4,à4`¥-t.¥`Ùbt-t.H4`t,t/¥`4.¥-HäHúõ€H^¬àŸ\‹⁄[€àH›\õ‹ô\]Y\›ÀîŸ\‹⁄[€äà[\\ú€€ò]OHò⁄õ€YHãàõﬁO\õﬁKà[Y[›]LçKà
+Bà^[ÿYH¬àõ‹\ò][€ìò[YHéàôŸ][XZ[]]€ŸHãàú]Y\ûHéà
+àõ]]][€àŸ][XZ[]]€ŸJ	[XZ[à›ö[ô»JH◊àÇààŸ][XZ[]]€ŸJ[ú]àŸ[XZ[à	[XZ[JWüHÇà
+Kàùò\öXXõ\»éà»ô[XZ[éà[XZ[KàBàô\‹€úŸHHŸ\‹⁄[€ãú‹›
+àöŒãÀ‹^Y\õ⁄Àò€€KŸ‹ò\[ãàú€€è\^[ÿYàXY\úœW‹^Y\õ⁄◊ÿ]]⁄XY\ú ôŸ][XZ[]]€ŸHäKà
+Bà]HH‹^Y\õ⁄◊‹ô\‹€úŸW⁄ú€€äô\‹€úŸJBàYàõ›]KôŸ]
+ô]HãﬂJKôŸ]
+ôŸ][XZ[]]€ŸHäNÇàòZ\ŸHù[ù[YQ\úõ‹äî^Y\õ⁄»4/t-H4/Ù/¥-4`¥,¥-t`4-4.4.»4/¥`¥/Ù`4,4,¥.¥`»4.¥/¥-4,äBàô]\õà‹^Y\õ⁄◊‹Ÿ\‹⁄[€óÿ€€⁄⁄Y\ Ÿ\‹⁄[€ãô\‹€úŸJBÇÇôYàô\öYûW‹^Y\õ⁄◊Ÿ[XZ[ÿ€ŸJà[XZ[à›ã€ŸNà›ãõﬁNà›ãŸ\‹⁄[€óÿ€€⁄⁄YNà›ÇäHOà\V‹›ãX›‹›ã[ûWWNÇààà¥'Ù/¥-4`¥,¥-t`4-¥-4,4-t`à4.¥/¥-4.4,¥/¥-Ù,¥`4,4bt,4-t`à4/Ù/¥.Ù/tbÙ.H€€⁄⁄YKt-Ù,4,Ù/¥.Ù/¥,¥/¥.à4.4/Ù`4/¥a4.4.ÙcöY]Ÿ\ãàààÇàûNÇàúõ€H›\õÿŸôöH[\‹ùô\]Y\›»\»›\õ‹ô\]Y\›¬à^Ÿ\[\‹ù\úõ‹à\»^ŒÇàòZ\ŸHù[ù[YQ\úõ‹äò›\õÿŸôöH4/t-H4`Ù`t`¥,4/t/¥,¥.Ù-t/H4,à4`¥-t.¥`Ùbt-t.H4`t,t/¥`4.¥-HäHúõ€H^¬àŸ\‹⁄[€àH›\õ‹ô\]Y\›ÀîŸ\‹⁄[€äà[\\ú€€ò]OHò⁄õ€YHãàõﬁO\õﬁKà[Y[›]LçKà
+Bà^[ÿYH¬àõ‹\ò][€ìò[YHéàò⁄X⁄—[XZ[]]€ŸHãàú]Y\ûHéàVQTì“◊–“P“◊—SPRS‘UQTñKàùò\öXXõ\»éà»ö[ú]éà»ô[XZ[éà[XZ[ò€ŸHéà€Ÿ__KàBàô\‹€úŸHHŸ\‹⁄[€ãú‹›
+àöŒãÀ‹^Y\õ⁄Àò€€KŸ‹ò\[ãàú€€è\^[ÿYàXY\úœW‹^Y\õ⁄◊ÿ]]⁄XY\ú ò⁄X⁄—[XZ[]]€ŸHãŸ\‹⁄[€óÿ€€⁄⁄YJKà
+Bà]HH‹^Y\õ⁄◊‹ô\‹€úŸW⁄ú€€äô\‹€úŸJBàöY]Ÿ\àH]KôŸ]
+ô]HãﬂJKôŸ]
+ò⁄X⁄—[XZ[]]€ŸHäBàYàõ›öY]Ÿ\éÇàòZ\ŸHù[ù[YQ\úõ‹äî^Y\õ⁄»4/t-H4/Ù/¥-4`¥,¥-t`4-4.4.»4.¥/¥-äBà€€⁄⁄YHH‹^Y\õ⁄◊‹Ÿ\‹⁄[€óÿ€€⁄⁄Y\ Ÿ\‹⁄[€ãô\‹€úŸJBàY\ôŸYàX›‹›ã›óHHﬂBàõ‹àò]»[à
+Ÿ\‹⁄[€óÿ€€⁄⁄YK€€⁄⁄YJNÇàõ‹à\ù[àò]Àú‹]
+é»äNÇàYàèHà[à\ùÇàŸ^Kò[YHH\ùú‹]
+èHãJBàY\ôŸY⁄Ÿ^Kú›ö\
+
+WHHò[YKú›ö\
+
+Bà»^Y\õ⁄»4/Ù/¥`t`¥-t/Ù-t/t/t/à4/Ù-t`4-t,¥/¥-4.4`à4`t-t`t`t.4.4`H€€⁄⁄YH⁄Ÿ[ò4/t,]ZYÇà»4't-H4`¥`4-t,t`Ù-t/4.¥/¥/t.¥`4-t`¥/t/¥-H4.4/4cŒà4`t`4,4-Ù`»4/Ù/¥`t.Ù-H4ct`¥/¥.H4a4`Ù/t.¥a¥.4.4/¥,t`4,4,t/¥`¥aÙ.4.Çà»4`t/¥-Ù-4,4dt`àXÿ€›[ù4.4,¥bÙ-ÙbÙ,¥,4-t`àŸ]
+
+K4`¥/à4-t`t`¥c4/Ù`4/¥,¥-t`4cÙ-t`à4`t-t`t`t.4cà4`»4`t,4/4/¥,Ù/à^Y\õ⁄ÀÇàYàõ›Y\ôŸYÇàòZ\ŸHù[ù[YQ\úõ‹äàî^Y\õ⁄»4/Ù/¥-4`¥,¥-t`4-4.4.»4.¥/¥-4/t/à4/t-H4,¥-t`4/t`Ù.»€€⁄⁄YH4`t-t`t.4.Çà
+Bàô]\õàé»ãöõ⁄[äàû⁄Ÿ^_O^›ò[Y_Hàõ‹àŸ^Kò[YH[àY\ôŸYö][\ 
+JKöY]Ÿ\ÇÇÇôYà€\Y
+ò[YNà[ûK⁄^ôNà[ùHÃ
+HOà›éÇà^H›äò[YH‹ààäBàô]\õà^Yà[ä^
+HH⁄^ôH[ŸH^Œà⁄^ôHHWH
+»∏†)àÇÇÇôYàô[ô\ó›[\]Jà^à›ãà
+ãàY\‹ÿYŸNà[ûHõ€ôHHõ€ôKà‹ô\éà[ûHõ€ôHHõ€ôKàô]öY]Œà[ûHõ€ôHHõ€ôKàXÿ€›[ùàXÿ€›[ùõ€ôHHõ€ôKà⁄]⁄Yà[ù›àõ€ôHHõ€ôKà⁄]€ò[YNà›àõ€ôHHõ€ôKäHOà›éÇààà¥'Ù/¥-4`t`¥,4,¥.ÙcÙ-t`à4,t-t-Ù/¥/Ù,4`t/tbÙ-H4`¥-t.¥`t`¥/¥,¥bÙ-H4/Ù-t`4-t/4-t/t/tbÙ-H4,à4.4`tat/¥-4cÙbt.4-H4`t/¥/¥,tbt-t/t.4c»ù[î^KàààÇàõ›»H]][YKõõ› [Y^õ€ôKù] Kò\›[Y^õ€ôJ
+Bà\Ÿ\õò[YHH⁄]€ò[YH‹ààÇàY\‹ÿYŸW›^HàÇàYàY\‹ÿYŸH\»õ›õ€ôNÇà\Ÿ\õò[YHHY\‹ÿYŸKò]]‹à‹àY\‹ÿYŸKò⁄]€ò[YH‹à\Ÿ\õò[YBà⁄]€ò[YHHY\‹ÿYŸKò⁄]€ò[YH‹à⁄]€ò[YBà⁄]⁄YHY\‹ÿYŸKò⁄]⁄YYà⁄]⁄Y\»õ€ôH[ŸH⁄]⁄YàY\‹ÿYŸW›^H›äY\‹ÿYŸJBàYà‹ô\à\»õ›õ€ôNÇà\Ÿ\õò[YHH‹ô\ãòù^Y\ó›\Ÿ\õò[YH‹à\Ÿ\õò[YBà⁄]⁄YH‹ô\ãò⁄]⁄YYà⁄]⁄Y\»õ€ôH[ŸH⁄]⁄YàYàô]öY]»\»õ€ôH[ô‹ô\à\»õ›õ€ôNÇàô]öY]»HŸ]]ä‹ô\ãúô]öY]»ãõ€ôJBà‹ô\ó›]HHàÇàYà‹ô\à\»õ›õ€ôNÇà‹ô\ó›]HHŸ]]ä‹ô\ãù]Hãõ€ôJH‹àŸ]]ä‹ô\ãô\ÿ‹ö\[€àãõ€ôJH‹ààÇàò\öXXõ\»H¬àâù[Ÿ]Héàõ›Àú›ôù[YJâYâ[KâVHäKàâ]Héàõ›Àú›ôù[YJâYâ[KâVHäKàâù[›[YHéàõ›Àú›ôù[YJâRâSNâT»äKàâ[YHéàõ›Àú›ôù[YJâRâSHäKàâ\Ÿ\õò[YHéà›ä\Ÿ\õò[YH‹ààäKàâ⁄]€ò[YHéà›ä⁄]€ò[YH‹à\Ÿ\õò[YH‹ààäKàâ⁄]⁄Yéà›ä⁄]⁄Y‹ààäKàâY\‹ÿYŸW›^éàY\‹ÿYŸW›^àâXÿ€›[ù€ò[YHéà›äXÿ€›[ùù\Ÿ\õò[YHYàXÿ€›[ù[ŸHàäKàâXÿ€›[ù⁄Yéà›äXÿ€›[ùöYYàXÿ€›[ù[ŸHàäKàâ‹ô\ó⁄Yéà›ä‹ô\ãöYYà‹ô\à[ŸHàäKàâ‹ô\ó€[ö»éààöŒãÀŸù[ú^Kò€€K€‹ô\úÀﬁ€‹ô\ãöYK»àYà‹ô\à[ŸHàãàâ‹ô\ó›]Héà›ä‹ô\ó›]JKàâ›\ú»éà›äŸ]]äô]öY]Àú›\ú»ãàäH‹ààäKàâò][ô»éà›äŸ]]äô]öY]Àú›\ú»ãàäH‹ààäKàâô]öY]◊›^éà›äŸ]]äô]öY]Àù^ãàäH‹ààäKàâô]öY]◊‹ô\Héà›äŸ]]äô]öY]Àúô\HãàäH‹ààäKàBàõ‹àò\öXXõH[à€‹ùY
+ò\öXXõ\ÀŸ^O[[ãô]ô\úŸOUùYJNÇà^H^úô\XŸJò\öXXõKò\öXXõ\÷›ò\öXXõWJBàô]\õà^ÇÇôYàô[ô\ó‹^Y\õ⁄◊›[\]Jà^à›ãXÿ€›[ùà[ûK
+ã⁄]à[ûHõ€ôHHõ€ôKY\‹ÿYŸNà[ûHõ€ôHHõ€ôKàX[à[ûHõ€ôHHõ€ôKäHOà›éÇààà¥'Ù/¥-4`t`¥,4,¥.ÙcÙ-t`à4/¥,tbt.4-H4/Ù-t`4-t/4-t/t/tbÙ-H4,t-t-»4/Ù`4.4,¥cÙ-Ù.¥.4.à4/¥,tb¥-t.¥`¥,4/ù[î^KàààÇàù^Y\àHŸ]]äY\‹ÿYŸKù\Ÿ\àãõ€ôJH‹àŸ]]äX[ù\Ÿ\àãõ€ôJBà][HHŸ]]äX[ö][Hãõ€ôJBà^H^úô\XŸJâY\‹ÿYŸW›^ã›äŸ]]äY\‹ÿYŸKù^ãàäH‹ààäJBà^H^úô\XŸJâ‹ô\ó€[ö»ãàäBàô]\õàô[ô\ó›[\]Jà^àXÿ€›[ùXXÿ€›[ùà⁄]⁄YYŸ]]ä⁄]öYãõ€ôJKà⁄]€ò[YOYŸ]]äù^Y\ãù\Ÿ\õò[YHãõ€ôJH‹àŸ]]ä⁄]öYãõ€ôJKà‹ô\èT⁄[\Sò[Y\‹XŸJàY\›äŸ]]äX[öYãàäJKàù^Y\ó›\Ÿ\õò[YOYŸ]]äù^Y\ãù\Ÿ\õò[YHãõ€ôJKà⁄]⁄YYŸ]]ä⁄]öYãõ€ôJKà]OYŸ]]ä][Kõò[YHãõ€ôJKà
+HYàX[[ŸHõ€ôKà
+BÇÇôYàõ‹õX]€[€ô^Jò[YNàõÿ]
+HOà›éÇàô]\õààû›ò[YNãåôüHãúô\XŸJããàäKúú›ö\
+åäKúú›ö\
+ãàäBÇÇôYà^Y\õ⁄◊‹ZY‹ö[‹ö]Y\ ò[Y\Œà\›–[ûWJHOà\›–[ûWNÇààà¥'¥`t`¥,4,¥.ÙcÙ-t`à4/Ù.Ù,4`¥/tbÙ-H4`¥,4`4.4a4b»^Y\õ⁄»4.4`t/¥`4`¥.4`4`Ù-t`à4.4aH4/Ù/à4a¥-t/t-KàààÇàô\›[H◊Bàõ‹àò[YH[àò[Y\ŒÇàûNÇàöXŸHH[ù
+Ÿ]]äò[YKúöXŸHã
+H‹à
+Bà^Ÿ\
+\Q\úõ‹ãò[YQ\úõ‹äNÇà€€ù[ùYBàYàöXŸHà[ôŸ]]äò[YKöYãõ€ôJNÇàô\›[ò\[ô
+ò[YJBàô]\õà€‹ùY
+ô\›[Ÿ^O[[XôH][Nà[ù
+][KúöXŸJJBÇÇôYà^Y\õ⁄◊‹ö[‹ö]W€Xô[
+ò[YNà[ûJHOà›éÇàò[YHH›äŸ]]äò[YKõò[YHãõ€ôJH‹à¥'Ù`4/¥-4,¥.4-¥-t/t.4-HäBà\ö[ŸH[ù
+Ÿ]]äò[YKú\ö[Ÿã
+H‹à
+BàöXŸHH[ù
+Ÿ]]äò[YKúöXŸHã
+H‹à
+Bà\ò][€àHàà0≠»‹\ö[ŸH4-4/KààYà\ö[Ÿ[ŸHàÇàô]\õààû€ò[Y_^Ÿ\ò][€üH0≠»Ÿõ‹õX]€[€ô^JöXŸJ_H8†ØHÇÇÇôYà⁄][ó›€‹ö◊⁄›\ú ›\ùà[ù[ôà[ù›\éà[ù
+HOàõ€€ÇàYà›\ùOH[ô[ôOHçÇàô]\õàùYBàYà›\ù[ôÇàô]\õà›\ùH›\à[ôàô]\õà›\àèH›\ù‹à›\à[ôÇÇôYà^òX›€‹ô\ó⁄Y
+ò[YNà[ûJHOà›àõ€ôNÇàX]⁄HôKúŸX\ò⁄
+àà –KVòK^åNWÀW^ÕJHã›äò[YH‹ààäJBàô]\õàX]⁄ô‹õ›\
+JHYàX]⁄[ŸHõ€ôBÇÇôYàõ‹õX[^ôW‹ô]öY]◊‹ô\Jò[YNà›äHOà›éÇà[ô\»Hò[YKú›ö\
+
+Kú‹][ô\ 
+VŒåLBàô]\õàóàãöõ⁄[ä[ô\ VŒéNNWKú›ö\
+
+BÇÇê]X€\‹¬ò€\‹»ÿ[\‘›]ŒÇà^\Œà[ùõ€ôBà›[à[ùHà€‹ŸYà[ùHàZYà[ùHàôYù[ôYà[ùHàù^Y\úŒàŸ]⁄[ùHHöY[
+Yò][ŸòX›‹ûO\Ÿ]
+Bàô]ô[ùYNàX›‹›ãõÿ]HHöY[
+Yò][ŸòX›‹ûO[[XôNàYò][X›
+õÿ]
+JBàôYù[ôY‹›[NàX›‹›ãõÿ]HHöY[
+Yò][ŸòX›‹ûO[[XôNàYò][X›
+õÿ]
+JBà›ÿ€›[ùŒà€›[ù\ñ‹›óHHöY[
+Yò][ŸòX›‹ûOP€›[ù\äBàù[òÿ]Yàõ€€Hò[ŸBÇÇôYàÿY‹ÿ[\◊‹›] Xÿ€›[ùàXÿ€›[ù^\Œà[ùõ€ôKX^‹YŸ\Œà[ùHå
+HOàÿ[\‘›]ŒÇààà¥(t/¥,t.4`4,4-t`à4`t`¥,4`¥.4`t`¥.4.¥`»4/Ù`4/¥-4,4-ã4/Ù`4/¥at/¥-4c»4`t`¥`4,4/t.4a¥b»4-Ù,4.¥,4-Ù/¥,à4-4/à4/t,4aÙ,4.Ù,4/Ù-t`4.4/¥-4,àààÇà[‹ÿ€›◊€õ›»H]][YKõõ› [Y^õ€ôJ[YY[J›\úœL JJKúô\XŸJö[ôõœSõ€ôJBà⁄[òŸHH[‹ÿ€›◊€õ›»H[YY[J^\œY^\ HYà^\»[ŸHõ€ôBà›]»Hÿ[\‘›] ^\ Bà›\ú€‹àHõ€ôBàÿÿ[HHõ€ôBà›Xòÿ]Y€‹öY\»Hõ€ôBàõ‹à»[àò[ôŸJX^‹YŸ\ NÇà›\ú€‹ã‹ô\úÀÿÿ[K›Xòÿ]Y€‹öY\»HXÿ€›[ùôŸ]‹ÿ[\ à›\ùŸúõ€OX›\ú€‹ãàÿÿ[O[ÿÿ[Kà›Xòÿ]Y€‹öY\œ\›Xòÿ]Y€‹öY\Àà
+BàôXX⁄Y‹\ö[Ÿ‹›\ùHò[ŸBàõ‹à‹ô\à[à‹ô\úŒÇàYà⁄[òŸH[ô‹ô\ãô]H⁄[òŸNÇàôXX⁄Y‹\ö[Ÿ‹›\ùHùYBà€€ù[ùYBà›]Àù›[
+œHBà›]Àòù^Y\úÀòY
+‹ô\ãòù^Y\ó⁄Y
+Bà›\úô[òﬁHH›ä‹ô\ãò›\úô[òﬁJBàYà‹ô\ãú›]\»\»\\Àì‹ô\î›]\Ÿ\Àê”‘—QÇà›]Àò€‹ŸY
+œHBà›]Àúô]ô[ùYVÿ›\úô[òﬁWH
+œH‹ô\ãúöXŸBà›]Àõ›ÿ€›[ù÷ÿ€\Y
+‹ô\ãô\ÿ‹ö\[€ãLå
+WH
+œHBà[Yà‹ô\ãú›]\»\»\\Àì‹ô\î›]\Ÿ\ÀîRQÇà›]ÀúZY
+œHBà[Yà‹ô\ãú›]\»[à¬à\\Àì‹ô\î›]\Ÿ\ÀîëQïSëQà\\Àì‹ô\î›]\Ÿ\ÀîTïPSW‘ëQïSëQàNÇà›]ÀúôYù[ôY
+œHBà›]ÀúôYù[ôY‹›[Vÿ›\úô[òﬁWH
+œH‹ô\ãúöXŸBàYàôXX⁄Y‹\ö[Ÿ‹›\ù‹àõ››\ú€‹éÇàúôXZ¬à[ŸNÇà›]Àùù[òÿ]YHõ€€
+›\ú€‹äBàô]\õà›]¬ÇÇôYàõ‹õX]‹ÿ[\◊‹›] ›]Œàÿ[\‘›] HOà›éÇà\ö[ŸH¥-Ù,4,¥`tdH4,¥`4-t/4c»àYà›]Àô^\»\»õ€ôH[ŸHà¥-Ù,‹›]Àô^\ﬂH4-4/KàÇàô]ô[ùYHHããöõ⁄[äààûŸõ‹õX]€[€ô^Jò[YJ_H⁄[ô\ÿÿ\J›\úô[òﬁJ_HÇàõ‹à›\úô[òﬁKò[YH[à€‹ùY
+›]Àúô]ô[ùYKö][\ 
+JBà
+H‹àåÇàôYù[ô»Hããöõ⁄[äààûŸõ‹õX]€[€ô^Jò[YJ_H⁄[ô\ÿÿ\J›\úô[òﬁJ_HÇàõ‹à›\úô[òﬁKò[YH[à€‹ùY
+›]ÀúôYù[ôY‹›[Kö][\ 
+JBà
+H‹àåÇà‹Hóàãöõ⁄[äààû⁄[ô^Kà⁄[ô\ÿÿ\J]J_H8†%èûÿ€›[ùOÿèàÇàõ‹à[ô^
+]K€›[ù
+H[à[ù[Y\ò]J›]Àõ›ÿ€›[ùÀõ[‹›ÿ€€[[€ä KJBà
+H‹à¥/t-t`à4-Ù,4.¥`4bÙ`¥bÙaH4-Ù,4.¥,4-Ù/¥,àÇàõ›HHóó∏¶®;Ó#»4%4/¥`t`¥.4,Ù/t`Ù`à4.Ù.4/4.4`àå4`t`¥`4,4/t.4aà4-Ù,4.¥,4-Ù/¥,ãààYà›]Àùù[òÿ]Y[ŸHàÇàô]\õà
+ààº'‰‚àè¥(t`¥,4`¥.4`t`¥.4.¥,‹\ö[ŸOÿèóóàÇàà¥$¥`t-t,Ù/à4-Ù,4.¥,4-Ù/¥,éàèû‹›]Àù›[OÿèóàÇàà¥%Ù,4.¥`4bÙ`¥/éàèû‹›]Àò€‹ŸYOÿèóàÇàà¥'¥-¥.4-4,4c¥`à4,¥bÙ/Ù/¥.Ù/t-t/t.4cŒàèû‹›]ÀúZYOÿèóàÇàà¥$¥/¥-Ù,¥`4,4`¥/¥,éàèû‹›]ÀúôYù[ôYOÿèà4/t,‹ôYù[ôﬂWàÇàà¥(Ù/t.4.¥,4.Ùc4/tbÙaH4/Ù/¥.¥`Ù/Ù,4`¥-t.Ù-t.Nàèû€[ä›]Àòù^Y\ú _OÿèóàÇàà¥$¥bÙ`4`ÙaÙ.¥,4/Ù/à4-Ù,4.¥`4bÙ`¥bÙ/àèû‹ô]ô[ùY_OÿèóóàÇààº'„·àè¥'Ù/¥/Ù`Ù.ÙcÙ`4/tbÙ-H4.Ù/¥`¥bœÿèóû›‹^€õ›_HÇà
+BÇÇê]X€\‹¬ò€\‹»›ù[‘ô\›[Çà€€[[€ó››[à[ùHà›\úô[òﬁW››[à[ùHà⁄[ôŸYà[ùHà\úõ‹úŒà\›‹›óHHöY[
+Yò][ŸòX›‹ûO[\›
+BÇÇôYàÿY€›⁄[ùô[ù‹ûJXÿ€›[ùàXÿ€›[ù
+HOà\V–[ûK\›–[ûWK\›–[ûWWNÇàõŸö[HHXÿ€›[ùôŸ]›\Ÿ\äXÿ€›[ùöY
+Bà›»HõŸö[KôŸ]€› 
+Bà€€[[€àH¬à›àõ‹à›[à›¬àYà›ú›Xòÿ]Y€‹ûKù\H\»\\Àî›Xêÿ]Y€‹ûU\\Àê””SS”ÇàBà›\úô[òﬁHH¬à›àõ‹à›[à›¬àYà›ú›Xòÿ]Y€‹ûKù\H\»\\Àî›Xêÿ]Y€‹ûU\\Àê’TîëSê÷BàBàô]\õàõŸö[K€€[[€ã›\úô[òﬁBÇÇôYà\Wÿù[◊€›ÿX›[€äXÿ€›[ùàXÿ€›[ùX›[€éà›äHOà›ù[‘ô\›[Çààà¥'4,4`t`t/¥,¥/à4/4-t/tcÙ-t`à4/¥,tbÙaÙ/tbÙ-H4.4,¥,4.Ùc¥`¥/tbÙ-H4/Ù`4-t-4.Ù/¥-¥-t/t.4c»4/¥-4/t/¥,Ù/à4,4.¥.¥,4`Ù/t`¥,àààÇàYàX›[€àõ›[à»òX›]ò]HãôXX›]ò]Hãô[]HüNÇàòZ\ŸHò[YQ\úõ‹ä¥'t-t.4-Ù,¥-t`t`¥/t/¥-H4-4-t.t`t`¥,¥.4-H4`H4.Ù/¥`¥,4/4.äBàÀ€€[[€ã›\úô[òﬁHHÿY€›⁄[ùô[ù‹ûJXÿ€›[ù
+Bàô\›[H›ù[‘ô\›[
+[ä€€[[€äK[ä›\úô[òﬁJJBàõ‹à›[à€€[[€éÇàûNÇàYàX›[€àOHô[]HéÇàXÿ€›[ùô[]W€›
+[ù
+›öY
+JBà[ŸNÇàöY[»HXÿ€›[ùôŸ]€›ŸöY[ [ù
+›öY
+JBàöY[ÀòX›]ôHHX›[€àOHòX›]ò]HÇàXÿ€›[ùúÿ]ôW€›
+öY[Àúô[ô]◊ŸöY[ 
+JBàô\›[ò⁄[ôŸY
+œHBà^Ÿ\^Ÿ\[€à\»^Œà»õ‹XNàìLHHTH4/¥/Ù-t`4,4a¥.4.H4`H4.Ù/¥`¥,4/4.4,¥bÙ,t`4,4`tbÙ,¥,4-t`à4`4,4-Ù/tbÙ-H4.4`t.¥.Ùc¥aÙ-t/t.4cÀÇàô\›[ô\úõ‹úÀò\[ô
+àû€›öYNàÿ€\Y
+^ÀLå
+_HäBÇà›Xòÿ]Y€‹öY\»H€›ú›Xòÿ]Y€‹ûKöYà›ú›Xòÿ]Y€‹ûHõ‹à›[à›\úô[òﬁ_Kùò[Y\ 
+Bàõ‹à›Xòÿ]Y€‹ûH[à›Xòÿ]Y€‹öY\ŒÇàûNÇàöY[»HXÿ€›[ùôŸ]ÿ⁄\ŸöY[ ›Xòÿ]Y€‹ûKöY
+Bàõ‹àŸôô\à[àöY[Àò⁄\€Ÿôô\úÀùò[Y\ 
+NÇàŸôô\ãòX›]ôHHX›[€àOHòX›]ò]HàYàX›[€àOHô[]Hà[ŸHò[ŸBàXÿ€›[ùúÿ]ôWÿ⁄\
+öY[Àúô[ô]◊ŸöY[ 
+JBàô\›[ò⁄[ôŸY
+œH[äöY[Àò⁄\€Ÿôô\ú Bà^Ÿ\^Ÿ\[€à\»^Œà»õ‹XNàìLHHTH4,¥,4.Ùc¥`¥/tbÙaH4.Ù/¥`¥/¥,à4,¥bÙ,t`4,4`tbÙ,¥,4-t`à4`4,4-Ù/tbÙ-H4.4`t.¥.Ùc¥aÙ-t/t.4cÀÇàô\›[ô\úõ‹úÀò\[ô
+à¥,¥,4.Ùc¥`¥,‹›Xòÿ]Y€‹ûKöYNàÿ€\Y
+^ÀLå
+_HäBàô]\õàô\›[ÇÇôYà‹ô\ó‹›]\◊€Xô[
+›]\Œà\\Àì‹ô\î›]\Ÿ\ HOà›éÇàô]\õà¬à\\Àì‹ô\î›]\Ÿ\ÀîRQà¥/¥/Ù.Ù,4aÙ-t/K4/¥-¥.4-4,4-t`à4,¥bÙ/Ù/¥.Ù/t-t/t.4c»ãà\\Àì‹ô\î›]\Ÿ\Àê”‘—Qà¥-Ù,4.¥`4bÙ`àãà\\Àì‹ô\î›]\Ÿ\ÀîëQïSëQà¥,¥/¥-Ù,¥`4,4`àãà\\Àì‹ô\î›]\Ÿ\ÀîTïPSW‘ëQïSëQà¥aÙ,4`t`¥.4aÙ/tbÙ.H4,¥/¥-Ù,¥`4,4`àãà\\Àì‹ô\î›]\Ÿ\ÀïSîRQà¥/t-H4/¥/Ù.Ù,4aÙ-t/HãàKôŸ]
+›]\À›]\Àõò[YKõ›Ÿ\ä
+JBÇÇôYàõ‹õX]€‹ô\ä‹ô\éà\\Àì‹ô\äHOà›éÇààà¥)4/¥`4/4.4`4`Ù-t`à4.¥,4`4`¥/¥aÙ.¥`»4-Ù,4.¥,4-Ù,4,t-t-»4,¥bÙ-4,4aÙ.4`t/¥at`4,4/tdt/t/tbÙaH4`t-t.¥`4-t`¥/¥,à4`¥/¥,¥,4`4,àààÇà]HH‹ô\ãù]H‹à
+‹ô\ãú›Xòÿ]Y€‹ûKõò[YHYà‹ô\ãú›Xòÿ]Y€‹ûH[ŸH∏†%äBà]Z[»H¬àº'‰Èàè¥%Ù,4.¥,4-»ù[î^OÿèàãààíQà€ŸOû⁄[ô\ÿÿ\J›ä‹ô\ãöY
+J_Oÿ€ŸOàãàà¥(t`¥,4`¥`Ù`Nàèû⁄[ô\ÿÿ\J‹ô\ó‹›]\◊€Xô[
+‹ô\ãú›]\ J_Oÿèàãàà¥(¥/¥,¥,4`à⁄[ô\ÿÿ\J€\Y
+]KL
+J_Hãàà¥&¥/¥.Ù.4aÙ-t`t`¥,¥/éàèû€‹ô\ãò[[›[ùOÿèàãàà¥(t`Ù/4/4,àèûŸõ‹õX]€[€ô^J‹ô\ãú›[J_H⁄[ô\ÿÿ\J›ä‹ô\ãò›\úô[òﬁJJ_Oÿèàãàà¥'Ù/¥.¥`Ù/Ù,4`¥-t.Ùcà⁄[ô\ÿÿ\J‹ô\ãòù^Y\ó›\Ÿ\õò[YH‹à	¯†%	 _H
+€ŸOû€‹ô\ãòù^Y\ó⁄YOÿ€ŸOäHãàà¥'Ù`4/¥-4,4,¥-taéà⁄[ô\ÿÿ\J‹ô\ãúŸ[\ó›\Ÿ\õò[YH‹à	¯†%	 _H
+€ŸOû€‹ô\ãúŸ[\ó⁄YOÿ€ŸOäHãàBàYà‹ô\ãúŸ\ùô\éÇà]Z[Àò\[ô
+à¥(t-t`4,¥-t`à⁄[ô\ÿÿ\J‹ô\ãúŸ\ùô\ãõò[YH‹à	¯†%	 _HäBàYà‹ô\ãú⁄YNÇà]Z[Àò\[ô
+à¥(t`¥/¥`4/¥/t,à⁄[ô\ÿÿ\J‹ô\ãú⁄YKõò[YH‹à	¯†%	 _HäBàYà‹ô\ãú^Y\éÇà]Z[Àò\[ô
+à¥'Ù-t`4`t/¥/t,4-éà⁄[ô\ÿÿ\J‹ô\ãú^Y\ä_HäBà]Z[Àò\[ô
+à¥)Ù,4`éà€ŸOû⁄[ô\ÿÿ\J›ä‹ô\ãò⁄]⁄Y
+J_Oÿ€ŸOàäBàô]\õàóàãöõ⁄[ä]Z[ BÇÇôYàõ‹õX]ÿ⁄]⁄\›‹ûJ⁄]à[ûKXÿ€›[ù⁄Yà[ù
+HOà\›‹›óNÇààà¥)4/¥`4/4.4`4`Ù-t`à4,¥`tcà4-4/¥`t`¥`Ù/Ù/t`Ùcà4.4`t`¥/¥`4.4cà4aÙ,4`¥,4,à4,¥,4.Ù.4-4/tbÙ-H[Y‹ò[HSt,t.Ù/¥.¥.àààÇà]HHàº'‰´è¥)Ù,4`à4`H⁄[ô\ÿÿ\J⁄]õò[YH‹à	¯†%	 _Oÿèà0≠»€ŸOûÿ⁄]öYOÿ€ŸOàÇàõÿ⁄‹Œà\›‹›óHH◊BàYà⁄]õ€⁄⁄[ô◊€[öŒÇàõÿ⁄‹Àò\[ô
+ààº'‰`è¥'Ù/¥.¥`Ù/Ù,4`¥-t.Ùc4`t/4/¥`¥`4.4`éèÿèàÇààèHôYèWû⁄[ô\ÿÿ\J⁄]õ€⁄⁄[ô◊€[öÀ][›OUùYJ_WèàÇààû⁄[ô\ÿÿ\J⁄]õ€⁄⁄[ô◊›^‹à	Ù.Ù/¥`â _OÿOàÇà
+Bàõ‹à][H[à⁄]õY\‹ÿYŸ\ŒÇà[ò€€Z[ô»Hò[ŸBàYà][Kò]]‹ó⁄YOHÇàX€€ã]]‹àH∏¶¶{Ó#»ãëù[î^HÇà[Yà][Kò]]‹ó⁄YOHXÿ€›[ù⁄Y‹à][KòûWÿõ›‹à][KòûW›ô\ù^ÇàX€€ã]]‹àHº'ÁËàã][Kò]]‹à‹à¥$¥b»Çà[ŸNÇàX€€ã]]‹àHº'Â-Hã][Kò]]‹à‹à⁄]õò[YH‹à¥'Ù/¥.¥`Ù/Ù,4`¥-t.ÙcÇà[ò€€Z[ô»HùYBàõŸHH][Kù^‹à
+âœHôYèHû⁄[ô\ÿÿ\J][Kö[XYŸW€[öÀ][›OUùYJ_Hè¥&4-Ù/¥,t`4,4-¥-t/t.4-OÿOâ»Yà][Kö[XYŸW€[ö»[ŸHñÙ,t-t-»4`¥-t.¥`t`¥,HäBàYà][Kù^ÇàõŸHH[ô\ÿÿ\J€\Y
+õŸKçå
+JBàY\‹ÿYŸWÿõÿ⁄»H
+ààèôOûÿõŸ_O‹ôOàÇàYà[ò€€Z[ô»[ô][Kù^à[ŸHàèõÿ⁄‹][›OûÿõŸ_Oÿõÿ⁄‹][›OàÇà
+Bàõÿ⁄‹Àò\[ô
+àû⁄X€€üHèû⁄[ô\ÿÿ\J]]‹ä_Oÿèóû€Y\‹ÿYŸWÿõÿ⁄ﬂHäBàYàõ›õÿ⁄‹ŒÇàõÿ⁄‹Àò\[ô
+¥(t/¥/¥,tbt-t/t.4.H4/Ù/¥.¥,4/t-t`ãàäBÇà⁄[ö‹Œà\›‹›óHH◊Bà›\úô[ùH]Bàõ‹àõÿ⁄»[àõÿ⁄‹ŒÇàÿ[ôY]HHàûÿ›\úô[ùWóûÿõÿ⁄ﬂHÇàYà[äÿ[ôY]JHàŒ[ô›\úô[ùOH]NÇà⁄[ö‹Àò\[ô
+›\úô[ù
+Bà›\úô[ùHõÿ⁄¬à[ŸNÇà›\úô[ùHÿ[ôY]Bà⁄[ö‹Àò\[ô
+›\úô[ù
+Bàô]\õà⁄[ö‹¬ÇÇôYàÿYŸù[ÿ⁄]
+Xÿ€›[ùàXÿ€›[ù⁄]⁄Yà[ùX^€Y\‹ÿYŸ\Œà[ùHå
+HOà\V›\\Àê⁄]õ€€NÇààà¥%Ù,4,Ù`4`Ù-¥,4-t`à4-4/¥`t`¥`Ù/Ù/t`Ùcà4.4`t`¥/¥`4.4cà4/t,4-Ù,4-4/Ù/à4`t`¥`4,4/t.4a¥,4/ù[î^KàààÇà⁄]HXÿ€›[ùôŸ]ÿ⁄]
+⁄]⁄YùYJBàY\‹ÿYŸ\»H\›
+⁄]õY\‹ÿYŸ\ BàŸY[ó⁄Y»H⁄][KöYõ‹à][H[àY\‹ÿYŸ\»Yà][KöY\»õ›õ€ô_Bàù[òÿ]YHò[ŸBà⁄[HŸY[ó⁄Y»[ô[äY\‹ÿYŸ\ HX^€Y\‹ÿYŸ\ŒÇà›\ú€‹àHZ[äŸY[ó⁄Y Bà€\àHXÿ€›[ùôŸ]ÿ⁄]⁄\›‹ûJ⁄]⁄Y›\ú€‹ã⁄]õò[YJBàô]◊⁄][\»H⁄][Hõ‹à][H[à€\àYà][KöY\»õ›õ€ôH[ô][KöYõ›[àŸY[ó⁄Y◊BàYàõ›ô]◊⁄][\ŒÇàúôXZ¬àY\‹ÿYŸ\Àô^[ô
+ô]◊⁄][\ BàŸY[ó⁄YÀù\]J][KöYõ‹à][H[àô]◊⁄][\ BàYàZ[ä][KöYõ‹à][H[àô]◊⁄][\ HèH›\ú€‹éÇàúôXZ¬àYà[äY\‹ÿYŸ\ HèHX^€Y\‹ÿYŸ\ŒÇàY\‹ÿYŸ\»H€‹ùY
+Y\‹ÿYŸ\ÀŸ^O[[XôH][Nà][KöY‹à
+VÀ[X^€Y\‹ÿYŸ\ŒóBàù[òÿ]YHùYBà[ŸNÇàY\‹ÿYŸ\Àú€‹ù
+Ÿ^O[[XôH][Nà][KöY‹à
+Bà⁄]õY\‹ÿYŸ\»HY\‹ÿYŸ\¬àô]\õà⁄]ù[òÿ]YÇÇôYàÿYŸ]Z[Yÿò[[òŸJXÿ€›[ùàXÿ€›[ù
+HOà\\Àêò[[òŸNÇààà¥'Ù/¥.Ù`ÙaÙ,4-t`à4/¥,tbt.4.H4.4-4/¥`t`¥`Ù/Ù/tbÙ.H4.à4,¥bÙ,¥/¥-4`»4,t,4.Ù,4/t`H4,¥/à4,¥`t-taH4,¥,4.Ùc¥`¥,4aKàààÇàõŸö[HHXÿ€›[ùôŸ]›\Ÿ\äXÿ€›[ùöY
+Bà›»HõŸö[KôŸ]ÿ€€[[€ó€› 
+BàYà›ŒÇàûNÇàô]\õàXÿ€›[ùôŸ]ÿò[[òŸJ›÷ÃKöY
+Bà^Ÿ\^Ÿ\[€éÇàŸŸŸ\ãôXùY ¥'t-H4`Ù-4,4.Ù/¥`tc4/Ù/¥.Ù`ÙaÙ.4`¥c4,t,4.Ù,4/t`H4aÙ-t`4-t-»4`t/¥,t`t`¥,¥-t/t/tbÙ.H4.Ù/¥`àã^◊⁄[ôõœUùYJBà›Xòÿ]Y€‹öY\»HXÿ€›[ùôŸ]‹€‹ùY‹›Xòÿ]Y€‹öY\ 
+V›\\Àî›Xêÿ]Y€‹ûU\\Àê””SS”óBàõ‹à›Xòÿ]Y€‹ûW⁄Y[à›Xòÿ]Y€‹öY\ŒÇàûNÇàXõX◊€›»HXÿ€›[ùôŸ]‹›Xòÿ]Y€‹ûW‹XõX◊€› \\Àî›Xêÿ]Y€‹ûU\\Àê””SS”ã›Xòÿ]Y€‹ûW⁄Y
+BàYàXõX◊€›ŒÇàô]\õàXÿ€›[ùôŸ]ÿò[[òŸJXõX◊€›÷ÃKöY
+Bà^Ÿ\^Ÿ\[€éÇàŸŸŸ\ãôXùY à¥'t-H4`Ù-4,4.Ù/¥`tc4/Ù/¥.Ù`ÙaÙ.4`¥c4,t,4.Ù,4/t`H4aÙ-t`4-t-»4/Ù/¥-4.¥,4`¥-t,Ù/¥`4.4cà	\»ãà›Xòÿ]Y€‹ûW⁄Yà^◊⁄[ôõœUùYKà
+Bà€€ù[ùYBàòZ\ŸHù[ù[YQ\úõ‹ä¥'t-H4/t,4.t-4-t/H4.Ù/¥`ã4aÙ-t`4-t-»4.¥/¥`¥/¥`4bÙ.Hù[î^H4/¥`¥-4,4dt`à4/Ù/¥-4`4/¥,t/tbÙ.H4,t,4.Ù,4/t`HäBÇÇê]X€\‹¬ò€\‹»Xÿ€›[ùù[ù[YNÇà[Y‹ò[W⁄Yà[ùàXÿ€›[ùàXÿ€›[ùàù[õô\éàù[õô\ÇàXÿ€›[ù⁄Ÿ^Nà[ùHàXÿ€›[ù€Xô[à›àHàÇàŸY\€€õ[ôWŸ[òXõYàõ€€HùYBà]]◊‹òZ\ŸWŸ[òXõYàõ€€Hò[ŸBà›‹Ÿ]ô[ùàôXY[ôÀë]ô[ùHöY[
+Yò][ŸòX›‹ûO]ôXY[ôÀë]ô[ù
+Bà\⁄‹Œà\›ÿ\ﬁ[ò⁄[Àï\⁄÷–[ûWWHHöY[
+Yò][ŸòX›‹ûO[\›
+BàòX⁄Ÿ‹õ›[ô›\⁄‹ŒàŸ]ÿ\ﬁ[ò⁄[Àï\⁄÷–[ûWWHHöY[
+Yò][ŸòX›‹ûO\Ÿ]
+BàòZ\ŸW€ÿ⁄Œà\ﬁ[ò⁄[Àìÿ⁄»HöY[
+Yò][ŸòX›‹ûOX\ﬁ[ò⁄[Àìÿ⁄ Bà\›‹òZ\ŸWÿ]à]][YHõ€ôHHõ€ôBàô^‹òZ\ŸWÿ]àõÿ]Hà\›‹òZ\ŸW‹›[[X\ûNà›àH¥-tbtdH4/t-H4-Ù,4/Ù`Ù`t.¥,4.Ù/¥`tcÇàòZ\ŸW‹ÿ⁄Y[NàX›⁄[ùõÿ]HHöY[
+Yò][ŸòX›‹ûOYX›
+BÇÇê]X€\‹¬ò€\‹»^Y\õ⁄‘ù[ù[YNÇà[Y‹ò[W⁄Yà[ùàXÿ€›[ùà[ûBàXÿ€›[ù⁄Ÿ^Nà[ùHàXÿ€›[ù€Xô[à›àHàÇà›‹Ÿ]ô[ùà\ﬁ[ò⁄[Àë]ô[ùHöY[
+Yò][ŸòX›‹ûOX\ﬁ[ò⁄[Àë]ô[ù
+Bà\⁄Œà\ﬁ[ò⁄[Àï\⁄÷–[ûWHõ€ôHHõ€ôBàXõ\⁄€ÿ⁄Œà\ﬁ[ò⁄[Àìÿ⁄»HöY[
+Yò][ŸòX›‹ûOX\ﬁ[ò⁄[Àìÿ⁄ BàY\‹ÿYŸW⁄YŒàX›‹›ã›óHHöY[
+Yò][ŸòX›‹ûOYX›
+BàX[‹›]\Ÿ\ŒàX›‹›ã›óHHöY[
+Yò][ŸòX›‹ûOYX›
+Bàô]öY]◊⁄YŒàŸ]‹›óHHöY[
+Yò][ŸòX›‹ûO\Ÿ]
+Bà[ö]X[^ôYàõ€€Hò[ŸBàô^ÿ]]◊‹Xõ\⁄ÿ]àõÿ]Hà€ŸòZ[\ô\Œà[ùHÇÇò€\‹»ù[ù[YSX[òYŸ\éÇàYà◊⁄[ö]◊ Ÿ[ãõ›àõ›éà]Xò\ŸKŸX‹ô]ŒàŸX‹ô]õﬁ
+NÇàŸ[ãòõ›Hõ›àŸ[ãôàHÇàŸ[ãúŸX‹ô]»HŸX‹ô]¬àŸ[ãúù[ù[Y\ŒàX›⁄[ùXÿ€›[ùù[ù[YWHHﬂBàŸ[ãú^Y\õ⁄◊‹ù[ù[Y\ŒàX›⁄[ù^Y\õ⁄‘ù[ù[YWHHﬂBàŸ[ãôù[ú^WÿXÿ€›[ù‹ù[ù[Y\ŒàX›⁄[ùXÿ€›[ùù[ù[YWHHﬂBàŸ[ãú^Y\õ⁄◊ÿXÿ€›[ù‹ù[ù[Y\ŒàX›⁄[ù^Y\õ⁄‘ù[ù[YWHHﬂBàŸ[ãõ€‹à\ﬁ[ò⁄[ÀêXú›òX›]ô[ù€‹õ€ôHHõ€ôBàŸ[ãù[]€àHY⁄[ï[]€îŸ\ùöXŸJãŸX‹ô] BàŸ[ãúY⁄[ú»HY⁄[ìX[òYŸ\äãõ›Ÿ[ãù[]€äBàŸ[ãú^Y\õ⁄◊‹Y⁄[ú»H^Y\õ⁄‘Y⁄[ìX[òYŸ\äãõ›
+BàŸ[ãò€€õôX›[€ó›\⁄‹ŒàX››\V‹›ã[ùK\ﬁ[ò⁄[Àï\⁄÷–[ûWWHHﬂBÇà\ﬁ[ò»Yà‹ô[ÿYŸù[ú^W‹Y⁄[ú àŸ[ã[Y‹ò[W⁄Yà[ùù[ù[YNàXÿ€›[ùù[ù[YBà
+HOàõ€ôNÇààà¥'Ù-t`4-t-Ù,4/Ù`Ù`t.¥,4-t`à4/Ù.Ù,4,Ù.4/tbÀ4/t-H4/Ù/¥-Ù,¥/¥.ÙcÙc»4.4aH4at`Ù.¥,4/4,t.Ù/¥.¥.4`4/¥,¥,4`¥c4/Ù/¥-4.¥.Ùc¥aÙ-t/t.4-H4,4.¥.¥,4`Ù/t`¥,àààÇàYà[Y‹ò[W⁄Y[àŸ[ãúY⁄[úÀúù[ù[Y\ŒÇàûNÇà]ÿZ]\ﬁ[ò⁄[ÀùÿZ]Ÿõ‹äàŸ[ãúY⁄[úÀú›‹‹ù[ù[YJ[Y‹ò[W⁄Y
+Kà[Y[›]TQ“Só‘’‘’SQS’Uà
+Bà^Ÿ\[Y[›]\úõ‹éÇàŸŸŸ\ãùÿ\õö[ô à¥'¥`t`¥,4/t/¥,¥.¥,ù[î^Kt/Ù.Ù,4,Ù.4/t/¥,à4/Ù/¥.Ùc4-Ù/¥,¥,4`¥-t.Ùc»	\»4/Ù`4-t,¥bÙ`t.4.Ù,4`¥,4.t/t,4`Ù`àãà[Y‹ò[W⁄Yà
+BàŸ[ãúY⁄[úÀúù[ù[Y\Àú‹
+[Y‹ò[W⁄Yõ€ôJBà^Ÿ\^Ÿ\[€éÇàŸŸŸ\ãô^Ÿ\[€äà¥'t-H4`Ù-4,4.Ù/¥`tc4/¥`t`¥,4/t/¥,¥.4`¥cù[î^Kt/Ù.Ù,4,Ù.4/tb»4/Ù/¥.Ùc4-Ù/¥,¥,4`¥-t.Ùc»	\»ãà[Y‹ò[W⁄Yà
+BàŸ[ãúY⁄[úÀúù[ù[Y\Àú‹
+[Y‹ò[W⁄Yõ€ôJBàûNÇà]ÿZ]\ﬁ[ò⁄[ÀùÿZ]Ÿõ‹äàŸ[ãúY⁄[úÀõÿY‹ù[ù[YJ[Y‹ò[W⁄Yù[ù[YJKà[Y[›]TQ“Só”–Q’SQS’Uà
+Bà^Ÿ\[Y[›]\úõ‹éÇàŸŸŸ\ãùÿ\õö[ô à¥%Ù,4/Ù`Ù`t.àù[î^Kt/Ù.Ù,4,Ù.4/t/¥,à4/Ù/¥.Ùc4-Ù/¥,¥,4`¥-t.Ùc»	\»4/Ù`4-t,¥bÙ`t.4.»4`¥,4.t/t,4`Ù`é»Çà¥/¥`t/t/¥,¥/t/¥.Hù[ù[YH4/Ù`4/¥-4/¥.Ù-¥.4`à4`4,4,t/¥`¥`»4,t-t-»4/t.4aHãà[Y‹ò[W⁄Yà
+BàŸ[ãúY⁄[úÀúù[ù[Y\Àú‹
+[Y‹ò[W⁄Yõ€ôJBà^Ÿ\^Ÿ\[€éÇàŸŸŸ\ãô^Ÿ\[€äà¥'t-H4`Ù-4,4.Ù/¥`tc4-Ù,4/Ù`Ù`t`¥.4`¥cù[î^Kt/Ù.Ù,4,Ù.4/tb»4/Ù/¥.Ùc4-Ù/¥,¥,4`¥-t.Ùc»	\Œ»Çà¥/¥`t/t/¥,¥/t/¥.Hù[ù[YH4/Ù`4/¥-4/¥.Ù-¥.4`à4`4,4,t/¥`¥`»4,t-t-»4/t.4aHãà[Y‹ò[W⁄Yà
+BàŸ[ãúY⁄[úÀúù[ù[Y\Àú‹
+[Y‹ò[W⁄Yõ€ôJBÇàYà›\ùÿXÿ€›[ù⁄[óÿòX⁄Ÿ‹õ›[ô
+àŸ[ãà[Y‹ò[W⁄Yà[ùàX\öŸ]XŸNà›ãàõ›Œà[ûKà
+ãàõ›YûNàõ€€Hò[ŸKà
+HOà\ﬁ[ò⁄[Àï\⁄÷–[ûWNÇààà¥%Ù,4/Ù`Ù`t.¥,4-t`à4`t/¥at`4,4/tdt/t/tbÙ.H4,4.¥.¥,4`Ù/t`à4,t-t-»4,t.Ù/¥.¥.4`4/¥,¥.¥.[Y‹ò[H€[ô»4.‹›\ùàààÇàXÿ€›[ù⁄Ÿ^HH[ù
+õ›÷»öYóJBàŸ^HH
+X\öŸ]XŸKXÿ€›[ù⁄Ÿ^JBà›\úô[ùHŸ[ãò€€õôX›[€ó›\⁄‹ÀôŸ]
+Ÿ^JBàYà›\úô[ù[ôõ››\úô[ùô€ôJ
+NÇàô]\õà›\úô[ùÇà\ﬁ[ò»Yà€€õôX›
+
+HOàõ€ôNÇàŸ][ô‹»Hõ€ôBàûNÇàŸ][ô‹»H]ÿZ]Ÿ[ãôãôŸ]›\Ÿ\ä[Y‹ò[W⁄Y
+BàYàX\öŸ]XŸHOHôù[ú^HéÇàù[ù[YHH]ÿZ]Ÿ[ãú›\ù
+à[Y‹ò[W⁄Yàõ›œ\õ›ÀàXZŸWÿX›]ôOXõ€€
+àŸ][ô‹¬à[ô[ù
+Ÿ][ô‹÷»òX›]ôWŸù[ú^WÿXÿ€›[ù⁄YóH‹à
+BàOHXÿ€›[ù⁄Ÿ^Bà
+Kà
+Bà[òXõYHõ€€
+Ÿ][ô‹»[ôŸ][ô‹÷»õõ›YûW‹ﬁ\›[HóJBà›XÿŸ\‹◊›^Hº'ÁËàù[î^Hù[õô\à4,¥/¥`t`t`¥,4/t/¥,¥.Ù-t/H4/Ù/¥`t.Ù-H4-Ù,4/Ù`Ù`t.¥,4,t/¥`¥,àÇà[ŸNÇàù[ù[YHH]ÿZ]Ÿ[ãú›\ù‹^Y\õ⁄ à[Y‹ò[W⁄Yàõ›œ\õ›ÀàXZŸWÿX›]ôOXõ€€
+àŸ][ô‹¬à[ô[ù
+Ÿ][ô‹÷»òX›]ôW‹^Y\õ⁄◊ÿXÿ€›[ù⁄YóH‹à
+BàOHXÿ€›[ù⁄Ÿ^Bà
+Kà
+Bà[òXõYHõ€€
+Ÿ][ô‹»[ôŸ][ô‹÷»ú^Y\õ⁄◊€õ›YûW‹ﬁ\›[HóJBà›XÿŸ\‹◊›^Hº'ÁËà4(t.Ù-t-¥-t/t.4-H4-Ù,4,4.¥.¥,4`Ù/t`¥/¥/4,¥/¥`t`t`¥,4/t/¥,¥.Ù-t/t/à4/Ù/¥`t.Ù-H4-Ù,4/Ù`Ù`t.¥,4,t/¥`¥,àÇàYàõ›YûH[ô[òXõYÇà]ÿZ]Ÿ[ãúÿYôW€õ›YûJà[Y‹ò[W⁄Yà›XÿŸ\‹◊›^àX\öŸ]XŸO[X\öŸ]XŸKàXÿ€›[ù‹ù[ù[YO\ù[ù[YKà
+Bà^Ÿ\\ﬁ[ò⁄[Àêÿ[òŸ[Y\úõ‹éÇàòZ\ŸBà^Ÿ\^Ÿ\[€à\»^ŒÇàŸŸŸ\ãô^Ÿ\[€äà¥'t-H4`Ù-4,4.Ù/¥`tc4-Ù,4/Ù`Ù`t`¥.4`¥c	\Àt,4.¥.¥,4`Ù/t`à4/Ù/¥.Ùc4-Ù/¥,¥,4`¥-t.Ùc»	\»ãàX\öŸ]XŸKà[Y‹ò[W⁄Yà
+Bà[òXõYHõ€€
+àŸ][ô‹¬à[ôŸ][ô‹÷¬àõõ›YûW‹ﬁ\›[HÇàYàX\öŸ]XŸHOHôù[ú^HÇà[ŸHú^Y\õ⁄◊€õ›YûW‹ﬁ\›[HÇàBà
+BàYàõ›YûH[ô[òXõYÇàYàX\öŸ]XŸHOHôù[ú^HéÇà\úõ‹ó›^Hù[ú^Wÿ€€õôX›[€óŸ\úõ‹ó€Y\‹ÿYŸJ^ Bà[ŸNÇà\úõ‹ó›^Hî^Y\õ⁄»4/t-H4/Ù`4.4/tcÙ.»€€⁄⁄YH4.4.Ù.4/Ù`4/¥.¥`t.àÇàûNÇà]ÿZ]Ÿ[ãúÿYôW€õ›YûJà[Y‹ò[W⁄Yàà∏¶®;Ó#»Ÿ\úõ‹ó›^H4'¥,t/t/¥,¥.4`¥-H4-4,4/t/tbÙ-H4,4.¥.¥,4`Ù/t`¥,àãàX\öŸ]XŸO[X\öŸ]XŸKàXÿ€›[ù€ò[YO\õ›÷»õXô[óKàXÿ€›[ùŸ^\õò[⁄Y\õ›÷»ô^\õò[⁄YóKà
+Bà^Ÿ\\ﬁ[ò⁄[Àêÿ[òŸ[Y\úõ‹éÇàòZ\ŸBà^Ÿ\^Ÿ\[€éÇàŸŸŸ\ãô^Ÿ\[€äà¥'t-H4`Ù-4,4.Ù/¥`tc4`t/¥/¥,tbt.4`¥c4/¥,H4/¥b4.4,t.¥-H4/Ù/¥-4.¥.Ùc¥aÙ-t/t.4c»	\»4/Ù/¥.Ùc4-Ù/¥,¥,4`¥-t.Ùcà	\»ãàX\öŸ]XŸKà[Y‹ò[W⁄Yà
+BÇà\⁄»H\ﬁ[ò⁄[Àò‹ôX]W›\⁄ à€€õôX›
+
+Kò[YOYàò€€õôX›^€X\öŸ]XŸ_K^ÿXÿ€›[ù⁄Ÿ^_HÇà
+BàŸ[ãò€€õôX›[€ó›\⁄‹÷⁄Ÿ^WHH\⁄¬ÇàYà\ÿÿ\ô
+€ôNà\ﬁ[ò⁄[Àï\⁄÷–[ûWJHOàõ€ôNÇàûNÇà\úõ‹àH€ôKô^Ÿ\[€ä
+Bà^Ÿ\\ﬁ[ò⁄[Àêÿ[òŸ[Y\úõ‹éÇà\úõ‹àHõ€ôBàYà\úõ‹à\»õ›õ€ôNÇàŸŸŸ\ãô\úõ‹äà¥'t-t/¥,t`4,4,t/¥`¥,4/t/t,4c»4/¥b4.4,t.¥,4a4/¥/t/¥,¥/¥,Ù/à4/Ù/¥-4.¥.Ùc¥aÙ-t/t.4c»	\»4,4.¥.¥,4`Ù/t`¥,	\»ãàX\öŸ]XŸKàXÿ€›[ù⁄Ÿ^Kà^◊⁄[ôõœJ\J\úõ‹äK\úõ‹ã\úõ‹ãó◊›òXŸXòX⁄◊◊ Kà
+BàYàŸ[ãò€€õôX›[€ó›\⁄‹ÀôŸ]
+Ÿ^JH\»€ôNÇàŸ[ãò€€õôX›[€ó›\⁄‹Àú‹
+Ÿ^Kõ€ôJBÇà\⁄ÀòYŸ€ôWÿÿ[òX⁄ \ÿÿ\ô
+Bàô]\õà\⁄¬Çà\ﬁ[ò»Yà›\ù‹ÿ]ôY
+Ÿ[äHOàõ€ôNÇàŸ[ãõ€‹H\ﬁ[ò⁄[ÀôŸ]‹ù[õö[ô◊€€‹
+
+BÇà\ﬁ[ò»YàÿY‹õ›‹ X\öŸ]XŸNà›äHOà\›–[ûWNÇàûNÇàYàX\öŸ]XŸHOHôù[ú^HéÇàô]\õà\›
+]ÿZ]Ÿ[ãôãòX›]ôW›\Ÿ\ú 
+JBàô]\õà\›
+]ÿZ]Ÿ[ãôãòX›]ôW‹^Y\õ⁄◊›\Ÿ\ú 
+JBà^Ÿ\\ﬁ[ò⁄[Àêÿ[òŸ[Y\úõ‹éÇàòZ\ŸBà^Ÿ\^Ÿ\[€éÇàŸŸŸ\ãô^Ÿ\[€äà¥'t-H4`Ù-4,4.Ù/¥`tc4/Ù/¥.Ù`ÙaÙ.4`¥c4`t/¥at`4,4/tdt/t/tbÙ-H	\Àt,4.¥.¥,4`Ù/t`¥bŒ»4,t/¥`à4/Ù`4/¥-4/¥.Ù-¥.4`à4-Ù,4/Ù`Ù`t.àãàX\öŸ]XŸKà
+Bàô]\õà◊BÇàù[ú^W‹õ›‹À^Y\õ⁄◊‹õ›‹»H]ÿZ]\ﬁ[ò⁄[Àôÿ]\äàÿY‹õ›‹ ôù[ú^HäKÿY‹õ›‹ ú^Y\õ⁄»äBà
+Bàõ‹àX\öŸ]XŸKõ›‹»[à
+à
+ôù[ú^Hãù[ú^W‹õ›‹ Kà
+ú^Y\õ⁄»ã^Y\õ⁄◊‹õ›‹ Kà
+NÇàõ‹àõ›»[àõ›‹ŒÇàûNÇàŸ[ãú›\ùÿXÿ€›[ù⁄[óÿòX⁄Ÿ‹õ›[ô
+à[ù
+õ›÷»ù[Y‹ò[W⁄YóJKX\öŸ]XŸKõ›Àõ›YûOUùYBà
+Bà^Ÿ\\ﬁ[ò⁄[Àêÿ[òŸ[Y\úõ‹éÇàòZ\ŸBà^Ÿ\^Ÿ\[€éÇàŸŸŸ\ãô^Ÿ\[€äà¥'t-H4`Ù-4,4.Ù/¥`tc4-Ù,4/Ù.Ù,4/t.4`4/¥,¥,4`¥c4,¥/¥`t`t`¥,4/t/¥,¥.Ù-t/t.4-H	\Àt,4.¥.¥,4`Ù/t`¥,»Çà¥/¥`t`¥,4.Ùc4/tbÙ-H4,4.¥.¥,4`Ù/t`¥b»4/Ù`4/¥-4/¥.Ù-¥,4`à4-Ù,4/Ù`Ù`t.àãàX\öŸ]XŸKà
+BÇà\ﬁ[ò»Yà›\ù‹^Y\õ⁄ àŸ[ãà[Y‹ò[W⁄Yà[ùàõ›Œà\ﬁ[ò‹ÀîôX€‹ôõ€ôHHõ€ôKàXÿ€›[ùà[ûHõ€ôHHõ€ôKà
+ãàXZŸWÿX›]ôNàõ€€HùYKà
+HOà^Y\õ⁄‘ù[ù[YNÇàõ›»Hõ›»‹à]ÿZ]Ÿ[ãôãôŸ]ÿX›]ôW€X\öŸ]XŸWÿXÿ€›[ù
+[Y‹ò[W⁄Yú^Y\õ⁄»äBàYàõ›õ›»‹àõ›õ›÷»úõﬁWŸ[ò»óH‹àõ›õ›÷»ò‹ôY[ùX[Ÿ[ò»óNÇàòZ\ŸHù[ù[YQ\úõ‹äî^Y\õ⁄»4/t-H4/t,4`t`¥`4/¥-t/HäBàXÿ€›[ù⁄Ÿ^HH[ù
+õ›÷»öYóJBàYàXÿ€›[ù⁄Ÿ^H[àŸ[ãú^Y\õ⁄◊ÿXÿ€›[ù‹ù[ù[Y\ŒÇà]ÿZ]Ÿ[ãú›‹‹^Y\õ⁄◊ÿXÿ€›[ù
+Xÿ€›[ù⁄Ÿ^JBàYàXÿ€›[ù\»õ€ôNÇàõﬁHHŸ[ãúŸX‹ô]ÀôX‹û\
+õ›÷»úõﬁWŸ[ò»óJBà€€⁄⁄YHHŸ[ãúŸX‹ô]ÀôX‹û\
+õ›÷»ò‹ôY[ùX[Ÿ[ò»óJBàXÿ€›[ùH‹ôX]W‹^Y\õ⁄◊ÿXÿ€›[ù
+€€⁄⁄YKõﬁJBà]ÿZ]\ﬁ[ò⁄[ÀùÿZ]Ÿõ‹ä\ﬁ[ò⁄[Àù◊›ôXY
+Xÿ€›[ùôŸ]
+K[Y[›]ML
+Bàù[ù[YHH^Y\õ⁄‘ù[ù[YJà[Y‹ò[W⁄Y][Y‹ò[W⁄YàXÿ€›[ùXXÿ€›[ùàXÿ€›[ù⁄Ÿ^OXXÿ€›[ù⁄Ÿ^KàXÿ€›[ù€Xô[\›äõ›÷»õXô[óJKà
+BàŸ[ãú^Y\õ⁄◊ÿXÿ€›[ù‹ù[ù[Y\÷ÿXÿ€›[ù⁄Ÿ^WHHù[ù[YBàYàXZŸWÿX›]ôH‹à[Y‹ò[W⁄Yõ›[àŸ[ãú^Y\õ⁄◊‹ù[ù[Y\ŒÇàYà[Y‹ò[W⁄Y[àŸ[ãú^Y\õ⁄◊‹Y⁄[úÀúù[ù[Y\ŒÇà]ÿZ]Ÿ[ãú^Y\õ⁄◊‹Y⁄[úÀú›‹‹ù[ù[YJ[Y‹ò[W⁄Y
+BàŸ[ãú^Y\õ⁄◊‹ù[ù[Y\÷›[Y‹ò[W⁄YHHù[ù[YBà]ÿZ]Ÿ[ãú^Y\õ⁄◊‹Y⁄[úÀõÿY‹ù[ù[YJ[Y‹ò[W⁄Yù[ù[YJBàù[ù[YKù\⁄»H\ﬁ[ò⁄[Àò‹ôX]W›\⁄ Ÿ[ãó‹^Y\õ⁄◊‹€€€‹
+ù[ù[YJJBàŸŸŸ\ãö[ôõ àî^Y\õ⁄»ù[ù[YH4-Ù,4/Ù`Ùbt-t/Nà[Y‹ò[OI\»Xÿ€›[ùI\»^Y\õ⁄œI\»ãà[Y‹ò[W⁄YàXÿ€›[ù⁄Ÿ^KàXÿ€›[ùöYà
+Bàô]\õàù[ù[YBÇà\ﬁ[ò»YàXõ\⁄‹^Y\õ⁄◊ŸòYù àŸ[ãà[Y‹ò[W⁄Yà[ùàù[ù[YW€›ô\úöYNà^Y\õ⁄‘ù[ù[YHõ€ôHHõ€ôKà
+HOà\V⁄[ù[ù\›‹›óWNÇàù[ù[YHHù[ù[YW€›ô\úöYH‹àŸ[ãú^Y\õ⁄◊‹ù[ù[Y\ÀôŸ]
+[Y‹ò[W⁄Y
+BàYàõ›ù[ù[YH‹à^Y\õ⁄“][T›]\Ÿ\»\»õ€ôNÇàòZ\ŸHù[ù[YQ\úõ‹äî^Y\õ⁄»4/t-H4/Ù/¥-4.¥.Ùc¥aÙdt/HäBà\ﬁ[ò»⁄]ù[ù[YKúXõ\⁄€ÿ⁄ŒÇàYŸHH]ÿZ]\ﬁ[ò⁄[Àù◊›ôXY
+àù[ù[YKòXÿ€›[ùôŸ]€^W⁄][\Àà›]\Ÿ\œV‘^Y\õ⁄“][T›]\Ÿ\ÀëêQïKà€›[ùLçà
+BàòYù»H\›
+Ÿ]]äYŸKö][\»ã◊JH‹à◊JBàXõ\⁄YHà\úõ‹úŒà\›‹›óHH◊Bàõ‹à][H[àòYùŒÇàûNÇà›]\Ÿ\»H]ÿZ]\ﬁ[ò⁄[Àù◊›ôXY
+àù[ù[YKòXÿ€›[ùôŸ]⁄][W‹ö[‹ö]W‹›]\Ÿ\Àà][KöYà][KúöXŸKà
+BàúôYW‹›]\»Hô^
+à
+›]\»õ‹à›]\»[à›]\Ÿ\»Yà[ù
+›]\ÀúöXŸH‹à
+HOH
+Kàõ€ôKà
+BàYàõ›úôYW‹›]\ŒÇàòZ\ŸHù[ù[YQ\úõ‹ä¥/t-t`à4,t-t`t/Ù.Ù,4`¥/t/¥,Ù/à4`t`¥,4`¥`Ù`t,4/Ù`Ù,t.Ù.4.¥,4a¥.4.äBà]ÿZ]\ﬁ[ò⁄[Àù◊›ôXY
+àù[ù[YKòXÿ€›[ùúXõ\⁄⁄][Kà][KöYàúôYW‹›]\ÀöYà
+BàXõ\⁄Y
+œHBà^Ÿ\^Ÿ\[€à\»^ŒÇàŸŸŸ\ãô^Ÿ\[€äî^Y\õ⁄Œà4/t-H4/¥/Ù`Ù,t.Ù.4.¥/¥,¥,4/H4/Ù`4-t-4/4-t`à	\»ã][KöY
+Bà\úõ‹úÀò\[ô
+àûÿ€\Y
+Ÿ]]ä][K	€ò[YIÀ][KöY
+K
+_Nàÿ€\Y
+^ÀLå
+_HäBàô]\õàXõ\⁄Y[äòYù K\úõ‹ú¬Çà\ﬁ[ò»Yà‹õÿŸ\‹◊‹^Y\õ⁄◊€Y\‹ÿYŸJàŸ[ãù[ù[YNà^Y\õ⁄‘ù[ù[YKõ›Œà\ﬁ[ò‹ÀîôX€‹ô⁄]à[ûKY\‹ÿYŸNà[ûBà
+HOàõ€ôNÇàŸ[ô\àHŸ]]äY\‹ÿYŸKù\Ÿ\àãõ€ôJBàYà›äŸ]]äŸ[ô\ãöYãàäJHOH›äù[ù[YKòXÿ€›[ùöY
+NÇàô]\õÇà^H
+Ÿ]]äY\‹ÿYŸKù^ãàäH‹ààäKú›ö\
+
+BàYàõ›^Çàô]\õÇà€€[X[ôH^òÿ\ŸYõ€
+
+Bà€€[X[ô‹ù[HH]ÿZ]Ÿ[ãôãôö[ô‹^Y\õ⁄◊ÿ€€[X[ô‹ô\Jàù[ù[YKù[Y‹ò[W⁄Y€€[X[ôà
+BàYà€€[X[ô‹ù[NÇàô\‹€úŸHHô[ô\ó‹^Y\õ⁄◊›[\]Jà€€[X[ô‹ù[V»úô\‹€úŸHóKù[ù[YKòXÿ€›[ù⁄]X⁄]Y\‹ÿYŸO[Y\‹ÿYŸBà
+BàûNÇà]ÿZ]\ﬁ[ò⁄[Àù◊›ôXY
+ù[ù[YKòXÿ€›[ùúŸ[ô€Y\‹ÿYŸK›ä⁄]öY
+Kô\‹€úŸJBà^Ÿ\^Ÿ\[€éÇàŸŸŸ\ãô^Ÿ\[€äî^Y\õ⁄Œà4/t-H4/¥`¥/Ù`4,4,¥.Ù-t/H4/¥`¥,¥-t`à4/t,4.¥/¥/4,4/t-4`»	\»ã€€[X[ô
+Bà[ŸNÇàYà€€[X[ô‹ù[V»õõ›YûHóNÇà]ÿZ]Ÿ[ãúÿYôW€õ›YûJàù[ù[YKù[Y‹ò[W⁄Yà∏£*;Ó#»è¥(t`4,4,t/¥`¥,4.Ù,4.¥/¥/4,4/t-4,ÿèóóàÇàà¥&¥/¥/4,4/t-4,à€ŸOû⁄[ô\ÿÿ\J€€[X[ô
+_Oÿ€ŸOóàÇàà¥'Ù/¥.¥`Ù/Ù,4`¥-t.Ùcàèû⁄[ô\ÿÿ\J€\Y
+Ÿ]]äŸ[ô\ã	›\Ÿ\õò[YIÀ	¯†%	 KLå
+J_OÿèóàÇàà¥)Ù,4`éà€ŸOû⁄[ô\ÿÿ\J›ä⁄]öY
+J_Oÿ€ŸOàãàX\öŸ]XŸOHú^Y\õ⁄»ãàXÿ€›[ù‹ù[ù[YO\ù[ù[YKà
+Bàô]\õÇà›\àH]][YKõõ› 
+Kò\›[Y^õ€ôJ
+Kö›\ÇàYàõ›
+àõ›÷»ú^Y\õ⁄◊ÿ]]‹ô\WŸ[òXõYóBà[ô⁄][ó›€‹ö◊⁄›\ú àõ›÷»ú^Y\õ⁄◊ÿ]]‹ô\W›€‹ö◊‹›\ùóKàõ›÷»ú^Y\õ⁄◊ÿ]]‹ô\W›€‹ö◊Ÿ[ôóKà›\ãà
+Bà[ô]ÿZ]Ÿ[ãôãò€Z[W‹^Y\õ⁄◊ÿ]]‹ô\Jàù[ù[YKù[Y‹ò[W⁄Yà›ä⁄]öY
+Kàõ›÷»ú^Y\õ⁄◊ÿ]]‹ô\Wÿ€€€›€ó€Z[ù]\»óKà
+Bà
+NÇàô]\õÇà[^HH[ù
+õ›÷»ú^Y\õ⁄◊ÿ]]‹ô\WŸ[^W‹ŸX€€ô»óJBàYà[^NÇà]ÿZ]\ﬁ[ò⁄[Àú€Y\
+[^JBàYà
+àŸ[ãú^Y\õ⁄◊ÿXÿ€›[ù‹ù[ù[Y\ÀôŸ]
+ù[ù[YKòXÿ€›[ù⁄Ÿ^JH\»õ›ù[ù[YBà‹àù[ù[YKú›‹Ÿ]ô[ùö\◊‹Ÿ]
+
+Bà
+NÇàô]\õÇàô\‹€úŸHHô[ô\ó‹^Y\õ⁄◊›[\]Jàõ›÷»ú^Y\õ⁄◊ÿ]]‹ô\W›^óKù[ù[YKòXÿ€›[ù⁄]X⁄]Y\‹ÿYŸO[Y\‹ÿYŸBà
+BàûNÇà]ÿZ]\ﬁ[ò⁄[Àù◊›ôXY
+ù[ù[YKòXÿ€›[ùúŸ[ô€Y\‹ÿYŸK›ä⁄]öY
+Kô\‹€úŸJBà^Ÿ\^Ÿ\[€éÇàŸŸŸ\ãô^Ÿ\[€äî^Y\õ⁄Œà4,4,¥`¥/¥/¥`¥,¥-t`à4/t-H4/¥`¥/Ù`4,4,¥.Ù-t/H4,à4aÙ,4`à	\»ã⁄]öY
+BÇà\ﬁ[ò»Yà‹õÿŸ\‹◊‹^Y\õ⁄◊Ÿ[]ô\ûJàŸ[ãù[ù[YNà^Y\õ⁄‘ù[ù[YKõ›Œà\ﬁ[ò‹ÀîôX€‹ôX[à[ûBà
+HOàõ€ôNÇàYàõ›õ›÷»ú^Y\õ⁄◊ÿ]]◊Ÿ[]ô\ûWŸ[òXõYóNÇàô]\õÇà›]\»HŸ]]äŸ]]äX[ú›]\»ãõ€ôJKõò[YHãàäBàYà›]\»õ›[à»îSëSë»ãîRQüNÇàô]\õÇà][HHŸ]]äX[ö][Hãõ€ôJBà⁄]HŸ]]äX[ò⁄]ãõ€ôJBà][W⁄YH›äŸ]]ä][KöYãàäH‹ààäBà⁄]⁄YH›äŸ]]ä⁄]öYã⁄]
+H‹ààäBàYàõ›][W⁄Y‹àõ›⁄]⁄YÇàŸŸŸ\ãùÿ\õö[ô î^Y\õ⁄Œà4`»4`t-4-t.Ù.¥.	\»4/t-t`à4`¥/¥,¥,4`4,4.4.Ù.4aÙ,4`¥,ãŸ]]äX[öYã∏†%äJBàô]\õÇà€Z[HH]ÿZ]Ÿ[ãôãò€Z[W‹^Y\õ⁄◊Ÿ[]ô\ûJàù[ù[YKù[Y‹ò[W⁄Y›äX[öY
+K][W⁄Yà
+BàYàõ›€Z[NÇàô]\õÇàù[KõŸX›Àô[XZ[ö[ôÀ\úõ‹àH€Z[BàYà\úõ‹éÇàYàõ›÷»ú^Y\õ⁄◊€õ›YûWŸ[]ô\ûHóNÇà]ÿZ]Ÿ[ãúÿYôW€õ›YûJàù[ù[YKù[Y‹ò[W⁄Yà∏ßcè¥'¥b4.4,t.¥,4,4,¥`¥/¥,¥bÙ-4,4aÙ.ÿèóóàÇàà¥(t-4-t.Ù.¥,à€ŸOû⁄[ô\ÿÿ\J›äX[öY
+J_Oÿ€ŸOóàÇàà¥'¥,tb¥cÙ,¥.Ù-t/t.4-Nàèû⁄[ô\ÿÿ\J€\Y
+ù[V…⁄][W›]I◊KÃ
+J_OÿèóàÇàà¥'Ù`4.4aÙ.4/t,à€ŸOû⁄[ô\ÿÿ\J\úõ‹ä_Oÿ€ŸOàãàX\öŸ]XŸOHú^Y\õ⁄»ãàXÿ€›[ù‹ù[ù[YO\ù[ù[YKà
+Bàô]\õÇà[]ô\ûW›^Hô[ô\ó‹^Y\õ⁄◊›[\]Jàù[V»úô\‹€úŸHóKù[ù[YKòXÿ€›[ù⁄]X⁄]X[YX[à
+Kúô\XŸJâõŸX›ãóàãöõ⁄[äõŸX› JBàûNÇà]ÿZ]\ﬁ[ò⁄[Àù◊›ôXY
+ù[ù[YKòXÿ€›[ùúŸ[ô€Y\‹ÿYŸK⁄]⁄Y[]ô\ûW›^
+Bà^Ÿ\^Ÿ\[€à\»^Œà»õ‹XNàìLHH^Y\õ⁄–TH^‹Ÿ\»]\õŸŸ[ô[›\»ò[ú‹‹ù\úõ‹úÀÇà]ÿZ]Ÿ[ãôãúô\›‹ôW‹^Y\õ⁄◊Ÿ[]ô\ûW‹õŸX› àù[ù[YKù[Y‹ò[W⁄Yù[V»öYóKõŸX›¬à
+Bà]ÿZ]Ÿ[ãôãôö[ö\⁄‹^Y\õ⁄◊Ÿ[]ô\ûJàù[ù[YKù[Y‹ò[W⁄Y›äX[öY
+KôòZ[Yã€\Y
+^Àå
+Bà
+BàYàõ›÷»ú^Y\õ⁄◊€õ›YûWŸ[]ô\ûHóNÇà]ÿZ]Ÿ[ãúÿYôW€õ›YûJàù[ù[YKù[Y‹ò[W⁄Yà∏ßcè¥$4,¥`¥/¥,¥bÙ-4,4aÙ,4/t-H4/¥`¥/Ù`4,4,¥.Ù-t/t,ÿèóóàÇàà¥(t-4-t.Ù.¥,à€ŸOû⁄[ô\ÿÿ\J›äX[öY
+J_Oÿ€ŸOóàÇàà¥'Ù`4.4aÙ.4/t,à€ŸOû⁄[ô\ÿÿ\J€\Y
+^Àå
+J_Oÿ€ŸOàãàX\öŸ]XŸOHú^Y\õ⁄»ãàXÿ€›[ù‹ù[ù[YO\ù[ù[YKà
+Bàô]\õÇÇà€€\][€àH¥/t-H4-Ù,4/Ù`4,4b4.4,¥,4.Ù/¥`tcÇàYàõ›÷»ú^Y\õ⁄◊ÿ]]◊ÿ€€ôö\õWŸ[òXõYóNÇàYà^Y\õ⁄“][QX[›]\Ÿ\»\»õ€ôNÇà€€\][€àH¥/t-H4,¥bÙ/Ù/¥.Ù/t-t/t/éà4,t.4,t.Ù.4/¥`¥-t.¥,4/t-H4-Ù,4,Ù`4`Ù-Ù.4.Ù,4`t`¥,4`¥`Ù`tb»Çà[ŸNÇàûNÇà]ÿZ]\ﬁ[ò⁄[Àù◊›ôXY
+àù[ù[YKòXÿ€›[ùù\]WŸX[à›äX[öY
+Kà^Y\õ⁄“][QX[›]\Ÿ\Àî—Sïà
+Bà€€\][€àH¥-Ù,4.¥,4-»4/¥`¥/4-taÙ-t/H4,¥bÙ/Ù/¥.Ù/t-t/t/tbÙ/Çà^Ÿ\^Ÿ\[€à\»^ŒÇà€€\][€àHà¥/t-H4`Ù-4,4.Ù/¥`tc4/¥`¥/4-t`¥.4`¥c4,¥bÙ/Ù/¥.Ù/t-t/t/tbÙ/àÿ€\Y
+^Àç
+_HÇàŸŸŸ\ãô^Ÿ\[€äî^Y\õ⁄Œà4/t-H4/¥,t/t/¥,¥.Ùdt/H4`t`¥,4`¥`Ù`H4`t-4-t.Ù.¥.	\»ãX[öY
+Bà]ÿZ]Ÿ[ãôãôö[ö\⁄‹^Y\õ⁄◊Ÿ[]ô\ûJàù[ù[YKù[Y‹ò[W⁄Y›äX[öY
+KúŸ[ùã[]ô\ûW›^à
+BàYàõ›÷»ú^Y\õ⁄◊€õ›YûWŸ[]ô\ûHóNÇà]ÿZ]Ÿ[ãúÿYôW€õ›YûJàù[ù[YKù[Y‹ò[W⁄Yà∏ß!Hè¥$4,¥`¥/¥,¥bÙ-4,4aÙ,4,¥bÙ/Ù/¥.Ù/t-t/t,ÿèóóàÇàà¥(t-4-t.Ù.¥,à€ŸOû⁄[ô\ÿÿ\J›äX[öY
+J_Oÿ€ŸOóàÇàà¥'¥,tb¥cÙ,¥.Ù-t/t.4-Nàèû⁄[ô\ÿÿ\J€\Y
+ù[V…⁄][W›]I◊KÃ
+J_OÿèóàÇàà¥'¥`t`¥,4`¥/¥.éàèû‹ô[XZ[ö[ôﬂOÿèóàÇàà¥(t`¥,4`¥`Ù`Nàèû⁄[ô\ÿÿ\J€€\][€ä_OÿèóóàÇààèôOû⁄[ô\ÿÿ\J€\Y
+[]ô\ûW›^Lå
+J_O‹ôOàãàX\öŸ]XŸOHú^Y\õ⁄»ãàXÿ€›[ù‹ù[ù[YO\ù[ù[YKà
+BÇà\ﬁ[ò»Yà‹^Y\õ⁄◊‹€ò\⁄›
+Ÿ[ãù[ù[YNà^Y\õ⁄‘ù[ù[YJHOà\V–[ûK[ûK[ûWNÇàX[◊ÿÿ[H¬àò€›[ùéàçàô\ôX›[€àéà^Y\õ⁄“][QX[\ôX›[€úÀì’UàBàô]\õà]ÿZ]\ﬁ[ò⁄[Àôÿ]\äà\ﬁ[ò⁄[Àù◊›ôXY
+ù[ù[YKòXÿ€›[ùôŸ]ÿ⁄]À€›[ùLç
+Kà\ﬁ[ò⁄[Àù◊›ôXY
+ù[ù[YKòXÿ€›[ùôŸ]ŸX[À
+äôX[◊ÿÿ[
+Kà\ﬁ[ò⁄[Àù◊›ôXY
+ù[ù[YKòXÿ€›[ùôŸ]€^W‹ô]öY]‹À€›[ùLç
+Kà
+BÇà\ﬁ[ò»Yà⁄[ôW‹^Y\õ⁄◊‹€ò\⁄›
+àŸ[ãù[ù[YNà^Y\õ⁄‘ù[ù[YKõ›Œà\ﬁ[ò‹ÀîôX€‹ô€ò\⁄›à\V–[ûK[ûK[ûWBà
+HOàõ€ôNÇà⁄]◊‹YŸKX[◊‹YŸKô]öY]‹◊‹YŸHH€ò\⁄›à⁄]»H\›
+Ÿ]]ä⁄]◊‹YŸKò⁄]»ã◊JH‹à◊JBàX[»H\›
+Ÿ]]äX[◊‹YŸKôX[»ã◊JH‹à◊JBàô]öY]‹»H\›
+Ÿ]]äô]öY]‹◊‹YŸKúô]öY]‹»ã◊JH‹à◊JBàY\‹ÿYŸW⁄Y»H¬à›ä⁄]öY
+Nà›ä⁄]õ\›€Y\‹ÿYŸKöY
+Bàõ‹à⁄][à⁄]¬àYàŸ]]ä⁄]õ\›€Y\‹ÿYŸHãõ€ôJBàBàX[‹›]\Ÿ\»H¬à›äX[öY
+NàŸ]]äŸ]]äX[ú›]\»ãõ€ôJKõò[YHãïSí”ì’”àäBàõ‹àX[[àX[¬àBàô]öY]◊⁄Y»H‹›äô]öY]ÀöY
+Hõ‹àô]öY]»[àô]öY]‹ﬂBàYàõ›ù[ù[YKö[ö]X[^ôYÇàù[ù[YKõY\‹ÿYŸW⁄Y»HY\‹ÿYŸW⁄Y¬àù[ù[YKôX[‹›]\Ÿ\»HX[‹›]\Ÿ\¬àù[ù[YKúô]öY]◊⁄Y»Hô]öY]◊⁄Y¬àù[ù[YKö[ö]X[^ôYHùYBàô]\õÇÇàõ‹à⁄][à⁄]ŒÇàY\‹ÿYŸHHŸ]]ä⁄]õ\›€Y\‹ÿYŸHãõ€ôJBàYàY\‹ÿYŸH[ôù[ù[YKõY\‹ÿYŸW⁄YÀôŸ]
+›ä⁄]öY
+JHOH›äY\‹ÿYŸKöY
+NÇà]ÿZ]Ÿ[ãó‹õÿŸ\‹◊‹^Y\õ⁄◊€Y\‹ÿYŸJù[ù[YKõ›À⁄]Y\‹ÿYŸJBàYàŸ[ãôŸ]‹^Y\õ⁄ ù[ù[YKù[Y‹ò[W⁄Y
+H\»ù[ù[YNÇà]ÿZ]Ÿ[ãú^Y\õ⁄◊‹Y⁄[úÀô\‹]⁄
+àù[ù[YKù[Y‹ò[W⁄YêíSë’◊”ëU◊”QT‘–Q—Hã⁄]Y\‹ÿYŸBà
+BÇàYàõ›÷»ú^Y\õ⁄◊€õ›YûW€Y\‹ÿYŸ\»óNÇàõ‹à⁄][à⁄]ŒÇàY\‹ÿYŸHHŸ]]ä⁄]õ\›€Y\‹ÿYŸHãõ€ôJBàYàõ›Y\‹ÿYŸH‹àù[ù[YKõY\‹ÿYŸW⁄YÀôŸ]
+›ä⁄]öY
+JHOH›äY\‹ÿYŸKöY
+NÇà€€ù[ùYBàŸ[ô\àHŸ]]äY\‹ÿYŸKù\Ÿ\àãõ€ôJBàYà›äŸ]]äŸ[ô\ãöYãàäJHOH›äù[ù[YKòXÿ€›[ùöY
+NÇà€€ù[ùYBà]ÿZ]Ÿ[ãúÿYôW€õ›YûJàù[ù[YKù[Y‹ò[W⁄Yàº'‰´è¥'t/¥,¥/¥-H4`t/¥/¥,tbt-t/t.4-OÿèóóàÇààº'‰i4'¥`éàèû⁄[ô\ÿÿ\J€\Y
+Ÿ]]äŸ[ô\ã	›\Ÿ\õò[YIÀ	¯†%	 KLå
+J_OÿèóàÇààº'·•4)Ù,4`éà€ŸOû⁄[ô\ÿÿ\J›ä⁄]öY
+J_Oÿ€ŸOóóàÇààèôOû⁄[ô\ÿÿ\J€\Y
+Ÿ]]äY\‹ÿYŸK	›^	Àõ€ôJH‹à	÷Ù.4-Ù/¥,t`4,4-¥-t/t.4-WIÀM
+J_O‹ôOàãàX\öŸ]XŸOHú^Y\õ⁄»ãàXÿ€›[ù‹ù[ù[YO\ù[ù[YKàô\W€X\ö›\JàŸ^Xõÿ\ô
+÷ ∏°™{Ó#»4'¥`¥,¥-t`¥.4`¥cãàú◊‹ô\Nûÿ⁄]öYHäK
+º'‰´4)Ù,4`àãàú◊ÿ⁄]Ÿù[ûÿ⁄]öYNåäWWJBàYàŸ[ãôŸ]‹^Y\õ⁄ ù[ù[YKù[Y‹ò[W⁄Y
+H\»ù[ù[YBà[ŸHŸ^Xõÿ\ô
+÷ º'Â!4'Ù-t`4-t.¥.Ùc¥aÙ.4`¥c4`tc»4/t,4,4.¥.¥,4`Ù/t`àãàòXÿ€›[ù‹Ÿ[X›ú^Y\õ⁄Œû‹ù[ù[YKòXÿ€›[ù⁄Ÿ^_HäWWJBà
+Kà
+BÇàõ‹àX[[àX[ŒÇàYàù[ù[YKôX[‹›]\Ÿ\ÀôŸ]
+›äX[öY
+JH\»õ€ôNÇà]ÿZ]Ÿ[ãó‹õÿŸ\‹◊‹^Y\õ⁄◊Ÿ[]ô\ûJù[ù[YKõ›ÀX[
+BàYà
+àù[ù[YKôX[‹›]\Ÿ\ÀôŸ]
+›äX[öY
+JHOHX[‹›]\Ÿ\÷‹›äX[öY
+WBà[ôŸ[ãôŸ]‹^Y\õ⁄ ù[ù[YKù[Y‹ò[W⁄Y
+H\»ù[ù[YBà
+NÇà]ÿZ]Ÿ[ãú^Y\õ⁄◊‹Y⁄[úÀô\‹]⁄
+àù[ù[YKù[Y‹ò[W⁄YàêíSë’◊—PS–“Së—QãàX[àù[ù[YKôX[‹›]\Ÿ\ÀôŸ]
+›äX[öY
+JKà
+BÇàYàõ›÷»ú^Y\õ⁄◊€õ›YûWŸX[»óNÇàõ‹àX[[àX[ŒÇàX[⁄YH›äX[öY
+Bà›]\»HX[‹›]\Ÿ\÷ŸX[⁄YBàô]ö[›\»Hù[ù[YKôX[‹›]\Ÿ\ÀôŸ]
+X[⁄Y
+BàYàô]ö[›\»OH›]\ŒÇà€€ù[ùYBà][HHŸ]]äX[ö][Hãõ€ôJBàù^Y\àHŸ]]äX[ù\Ÿ\àãõ€ôJBà]HH¥'t/¥,¥,4c»4`t-4-t.Ù.¥,àYàô]ö[›\»\»õ€ôH[ŸH¥(t`¥,4`¥`Ù`H4`t-4-t.Ù.¥.4.4-Ù/4-t/tdt/HÇà]ÿZ]Ÿ[ãúÿYôW€õ›YûJàù[ù[YKù[Y‹ò[W⁄Yààº'‰Èàèû›]_OÿèóóàÇààº'·•4(t-4-t.Ù.¥,à€ŸOû⁄[ô\ÿÿ\JX[⁄Y
+_Oÿ€ŸOóàÇààº'‰„4(t`¥,4`¥`Ù`Nàèû⁄[ô\ÿÿ\J›]\ _OÿèóàÇààº'‰i4'Ù/¥.¥`Ù/Ù,4`¥-t.Ùcàèû⁄[ô\ÿÿ\J€\Y
+Ÿ]]äù^Y\ã	›\Ÿ\õò[YIÀ	¯†%	 KLå
+J_OÿèóàÇààº'„Ì»4'¥,tb¥cÙ,¥.Ù-t/t.4-Nàèû⁄[ô\ÿÿ\J€\Y
+Ÿ]]ä][K	€ò[YIÀ	¯†%	 KÃ
+J_OÿèóàÇààº'‰¨4)¥-t/t,àèûŸõ‹õX]€[€ô^JŸ]]ä][K	‹öXŸIÀ
+J_H8†ØOÿèàãàX\öŸ]XŸOHú^Y\õ⁄»ãàXÿ€›[ù‹ù[ù[YO\ù[ù[YKàô\W€X\ö›\JàŸ^Xõÿ\ô
+÷ º'‰Èà4(t-4-t.Ù.¥,ãàú◊ŸX[ûŸX[⁄YHäWWJBàYàŸ[ãôŸ]‹^Y\õ⁄ ù[ù[YKù[Y‹ò[W⁄Y
+H\»ù[ù[YBà[ŸHŸ^Xõÿ\ô
+÷ º'Â!4'Ù-t`4-t.¥.Ùc¥aÙ.4`¥c4`tc»4/t,4,4.¥.¥,4`Ù/t`àãàòXÿ€›[ù‹Ÿ[X›ú^Y\õ⁄Œû‹ù[ù[YKòXÿ€›[ù⁄Ÿ^_HäWWJBà
+Kà
+BÇàYàõ›÷»ú^Y\õ⁄◊€õ›YûW‹ô]öY]‹»óNÇàõ‹àô]öY]»[àô]öY]‹ŒÇàYà›äô]öY]ÀöY
+H[àù[ù[YKúô]öY]◊⁄YŒÇà€€ù[ùYBà‹ôX]‹àHŸ]]äô]öY]Àò‹ôX]‹àãõ€ôJBàX[HŸ]]äô]öY]ÀôX[ãõ€ôJBà][HHŸ]]äX[ö][Hãõ€ôJBàò][ô»H[ù
+Ÿ]]äô]öY]Àúò][ô»ã
+H‹à
+Bà]ÿZ]Ÿ[ãúÿYôW€õ›YûJàù[ù[YKù[Y‹ò[W⁄Yà∏´dè¥'t/¥,¥bÙ.H4/¥`¥-ÙbÙ,èÿèóóàÇààº'‰i4$4,¥`¥/¥`àèû⁄[ô\ÿÿ\J€\Y
+Ÿ]]ä‹ôX]‹ã	›\Ÿ\õò[YIÀ	¯†%	 KLå
+J_OÿèóàÇààº'„'»4'¥a¥-t/t.¥,àèû…¯´d	»
+àò][ôﬂH
+‹ò][ôﬂKÕJOÿèóàÇààº'„Ì»4'¥,tb¥cÙ,¥.Ù-t/t.4-Nàèû⁄[ô\ÿÿ\J€\Y
+Ÿ]]ä][K	€ò[YIÀ	¯†%	 KL
+J_OÿèóóàÇààèôOû⁄[ô\ÿÿ\J€\Y
+Ÿ]]äô]öY]À	›^	Àõ€ôJH‹à	Ù$t-t-»4.¥/¥/4/4-t/t`¥,4`4.4c…ÀLå
+J_O‹ôOàãàX\öŸ]XŸOHú^Y\õ⁄»ãàXÿ€›[ù‹ù[ù[YO\ù[ù[YKàô\W€X\ö›\JàŸ^Xõÿ\ô
+÷ º'‰Èà4(t-4-t.Ù.¥,ãàú◊ŸX[ûŸŸ]]äX[	⁄Y	À	… _HäWWJBàYàX[[ôŸ[ãôŸ]‹^Y\õ⁄ ù[ù[YKù[Y‹ò[W⁄Y
+H\»ù[ù[YBà[ŸHŸ^Xõÿ\ô
+÷ º'Â!4'Ù-t`4-t.¥.Ùc¥aÙ.4`¥c4`tc»4/t,4,4.¥.¥,4`Ù/t`àãàòXÿ€›[ù‹Ÿ[X›ú^Y\õ⁄Œû‹ù[ù[YKòXÿ€›[ù⁄Ÿ^_HäWWJBà
+Kà
+BÇàõ‹àô]öY]»[àô]öY]‹ŒÇàYà
+à›äô]öY]ÀöY
+Hõ›[àù[ù[YKúô]öY]◊⁄Y¬à[ôŸ[ãôŸ]‹^Y\õ⁄ ù[ù[YKù[Y‹ò[W⁄Y
+H\»ù[ù[YBà
+NÇà]ÿZ]Ÿ[ãú^Y\õ⁄◊‹Y⁄[úÀô\‹]⁄
+àù[ù[YKù[Y‹ò[W⁄YêíSë’◊”ëU◊‘ëUíQU»ãô]öY]¬à
+BÇàù[ù[YKõY\‹ÿYŸW⁄Y»HY\‹ÿYŸW⁄Y¬àù[ù[YKôX[‹›]\Ÿ\»HX[‹›]\Ÿ\¬àù[ù[YKúô]öY]◊⁄Y»Hô]öY]◊⁄Y¬Çà\ﬁ[ò»Yà‹^Y\õ⁄◊‹€€€‹
+Ÿ[ãù[ù[YNà^Y\õ⁄‘ù[ù[YJHOàõ€ôNÇà⁄[Hõ›ù[ù[YKú›‹Ÿ]ô[ùö\◊‹Ÿ]
+
+NÇàûNÇàõ›»H]ÿZ]Ÿ[ãôãôŸ]›\Ÿ\äù[ù[YKù[Y‹ò[W⁄Y
+BàYàõ›õ›»‹àõ›õ›÷»ú^Y\õ⁄◊ÿX›]ôHóNÇàô]\õÇà€ò\⁄›H]ÿZ]Ÿ[ãó‹^Y\õ⁄◊‹€ò\⁄›
+ù[ù[YJBà]ÿZ]Ÿ[ãó⁄[ôW‹^Y\õ⁄◊‹€ò\⁄›
+ù[ù[YKõ›À€ò\⁄›
+BàYàŸ[ãôŸ]‹^Y\õ⁄ ù[ù[YKù[Y‹ò[W⁄Y
+H\»ù[ù[YNÇà]ÿZ]Ÿ[ãú^Y\õ⁄◊‹Y⁄[úÀô\‹]⁄
+àù[ù[YKù[Y‹ò[W⁄YêíSë’◊’P“»Çà:˜_t∂âûÀk∫wµÁHùYôô\ôY[ú]ö[J][V»ú€›\òŸHóKô[ò€ŸJù]ãNäKö[[ò[YOZ][V»ôö[[ò[YHóJKàÿ\[€èYà¥&4`tat/¥-4/t.4.à^Y\õ⁄Àt/Ù.Ù,4,Ù.4/t,èû⁄[ô\ÿÿ\J][V…€ò[YI◊J_Oÿèãà4'Ù`4/¥,¥-t`4c4`¥-H4-t,Ù/à4/Ù-t`4-t-4`Ù`t`¥,4/t/¥,¥.¥/¥.Kàãà
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]Kú›\ù›⁄]
+ú◊‹◊ÿ\⁄ŒàäJBà\ﬁ[ò»Yà^Y\õ⁄◊ÿÿ][Ÿ◊⁄[ú›[ÿ\⁄ ÿ[òX⁄Œàÿ[òX⁄‘]Y\ûJHOàõ€ôNÇà]ZYHÿ[òX⁄Àô]Kú‹]
+éàãJVÃWBà][HH]ÿZ]ãôŸ]‹^Y\õ⁄◊ÿÿ][Ÿ◊‹Y⁄[ä]ZY
+BàYàõ›][NÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä¥'Ù.Ù,4,Ù.4/H4/t-t-4/¥`t`¥`Ù/Ù-t/Hã⁄›◊ÿ[\ùUùYJBàô]\õÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä
+Bà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\äàà¥(Ù`t`¥,4/t/¥,¥.4`¥cèû⁄[ô\ÿÿ\J][V…€ò[YI◊J_Oÿèè◊óàÇà¥'Ù.Ù,4,Ù.4/H4,¥bÙ/Ù/¥.Ù/tcÙ-t`¥`tc»4,¥/t`Ù`¥`4.4/Ù`4/¥a¥-t`t`t,4,t/¥`¥,4.4/Ù/¥.Ù`ÙaÙ.4`à4-4/¥`t`¥`Ù/»4.à^Y\õ⁄Àt,4.¥.¥,4`Ù/t`¥`ÀÇà¥`t-t`¥.4.4,¥/¥-Ù/4/¥-¥/t/¥`t`¥cÙ/]€ãt/Ù`4/¥a¥-t`t`t,à4&¥,4`¥,4.Ù/¥,»4/t-H4,Ù,4`4,4/t`¥.4`4`Ù-t`à4,t-t-Ù/¥/Ù,4`t/t/¥`t`¥c4.¥/¥-4,àãàô\W€X\ö›\ZŸ^Xõÿ\ô
+¬à º'‰ÈH4(t.¥,4aÙ,4`¥c4.4/Ù`4/¥,¥-t`4.4`¥cãàú◊‹◊‹€›\òŸNû›]ZYHäWKà ¥+»4-4/¥,¥-t`4cÙcà8†%4`Ù`t`¥,4/t/¥,¥.4`¥cãàú◊‹◊⁄[ú›[û›]ZYHäWKà ¥'¥`¥/4-t/t,ãàú◊‹◊›öY]Œû›]ZYNåäWKàJKà
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]Kú›\ù›⁄]
+ú◊‹◊⁄[ú›[àäJBà\ﬁ[ò»Yà^Y\õ⁄◊ÿÿ][Ÿ◊⁄[ú›[
+ÿ[òX⁄Œàÿ[òX⁄‘]Y\ûJHOàõ€ôNÇà]ZYHÿ[òX⁄Àô]Kú‹]
+éàãJVÃWBà][HH]ÿZ]ãôŸ]‹^Y\õ⁄◊ÿÿ][Ÿ◊‹Y⁄[ä]ZY
+Bàù[ù[YHH]ÿZ]ô\]Z\ôW‹^Y\õ⁄◊‹ù[ù[YJÿ[òX⁄ÀõY\‹ÿYŸKÿ[òX⁄Àôúõ€W›\Ÿ\ãöY
+BàYàõ›][H‹àõ›ù[ù[YNÇàô]\õÇàYàX[òYŸ\ãú^Y\õ⁄◊‹Y⁄[úÀö\◊Ÿ[òXõY
+ÿ[òX⁄Àôúõ€W›\Ÿ\ãöY]ZY
+H‹à
+àX[òYŸ\ãú^Y\õ⁄◊‹Y⁄[úÀúù[ù[Y\ÀôŸ]
+ÿ[òX⁄Àôúõ€W›\Ÿ\ãöY
+Bà[ô]ZY[àX[òYŸ\ãú^Y\õ⁄◊‹Y⁄[úÀúù[ù[Y\÷ÿÿ[òX⁄Àôúõ€W›\Ÿ\ãöYKúY⁄[ú¬à
+NÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä¥'Ù.Ù,4,Ù.4/H4`Ù-¥-H4`Ù`t`¥,4/t/¥,¥.Ù-t/Hã⁄›◊ÿ[\ùUùYJBàô]\õÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä¥(Ù`t`¥,4/t,4,¥.Ù.4,¥,4c∏†)àäBàûNÇàY⁄[àH]ÿZ]X[òYŸ\ãú^Y\õ⁄◊‹Y⁄[úÀö[ú›[
+àÿ[òX⁄Àôúõ€W›\Ÿ\ãöY][V»ôö[[ò[YHóK][V»ú€›\òŸHóKù[ù[YBà
+Bà^Ÿ\^Ÿ\[€à\»^ŒÇàŸŸŸ\ãô^Ÿ\[€ä¥'t-H4`Ù`t`¥,4/t/¥,¥.Ù-t/H^Y\õ⁄Àt/Ù.Ù,4,Ù.4/H4.4-»4.¥,4`¥,4.Ù/¥,Ù,äBà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\äà∏ßc4(Ù`t`¥,4/t/¥,¥.¥,4/t-H4,¥bÙ/Ù/¥.Ù/t-t/t,à⁄[ô\ÿÿ\J€\Y
+^Àå
+J_HäBàô]\õÇà]ÿZ]ãö[ò‹ô[Y[ù‹^Y\õ⁄◊ÿÿ][Ÿ◊⁄[ú›[
+]ZY
+Bà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\äàà∏ß!H^Y\õ⁄Àt/Ù.Ù,4,Ù.4/Hèû⁄[ô\ÿÿ\JY⁄[ãõò[YJ_Oÿèà4`Ù`t`¥,4/t/¥,¥.Ù-t/Kàãàô\W€X\ö›\ZŸ^Xõÿ\ô
+÷ 	¯¶¶{Ó#»4'¥`¥.¥`4bÙ`¥c4/Ù.Ù,4,Ù.4/IÀàú◊‹Nû›]ZYHäWWJKà
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]HOHú◊‹Y⁄[óŸÿ‹»äBà\ﬁ[ò»Yà^Y\õ⁄◊‹Y⁄[óŸÿ‹ ÿ[òX⁄Œàÿ[òX⁄‘]Y\ûJHOàõ€ôNÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä
+Bà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\äàº'‰Êàèî^Y\õ⁄»Y⁄[à—œÿèóóàÇà¥'Ù.Ù,4,Ù.4/tb»8†%4/¥-4.4/t/¥aÙ/tbÙ-HUãN4a4,4.t.Ùb»]€à4-4/àLLà4&¥$Kà4'¥/t.4/Ù/¥.Ù`ÙaÙ,4c¥`à4`t/¥,tbÙ`¥.4c»4`t/¥/¥,tbt-t/t.4.KÇà¥`t-4-t.Ù/¥.ã4/¥`¥-ÙbÙ,¥/¥,à4.4/Ù-t`4.4/¥-4.4aÙ-t`t.¥.4.H4`¥.4.ã4,4/t,4`t`¥`4/¥.t.¥.4`t`¥`4/¥cÙ`¥`tc»4,4,¥`¥/¥/4,4`¥.4aÙ-t`t.¥.4.4-»—USë‘Ààãàô\W€X\ö›\ZŸ^Xõÿ\ô
+¬à º'Ê†4$tbÙ`t`¥`4bÙ.H4`t`¥,4`4`àãú◊Ÿÿ‹Œú›\ùäK
+º'ÈÏH4(t`¥`4`Ù.¥`¥`Ù`4,ãú◊Ÿÿ‹Œú›ùX›\ôHäWKà ∏¶®H4)t`Ù.¥.ãú◊Ÿÿ‹Œö€⁄‹»äK
+∏¶¶{Ó#»4't,4`t`¥`4/¥.t.¥.ãú◊Ÿÿ‹ŒúŸ][ô‹»äWKà º'ÈÎH4&¥,4`¥,4.Ù/¥,»ãú◊Ÿÿ‹Œòÿ][Ÿ»äWKà º'‰ÈH4(t.¥,4aÙ,4`¥c4/Ù/¥.Ù/t`Ùcà4-4/¥.¥`Ù/4-t/t`¥,4a¥.4càãú◊Ÿÿ‹◊Ÿ›€õÿYäWKà º'ÊËH4$t-t-Ù/¥/Ù,4`t/t/¥`t`¥cãú◊Ÿÿ‹ŒúÿYô]HäWKà ∏´!{Ó#»4'Ù.Ù,4,Ù.4/tb»ãú◊‹Y⁄[ú»äWKàJKà
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]HOHú◊Ÿÿ‹◊Ÿ›€õÿYäBà\ﬁ[ò»Yà^Y\õ⁄◊‹Y⁄[óŸÿ‹◊Ÿ›€õÿY
+ÿ[òX⁄Œàÿ[òX⁄‘]Y\ûJHOàõ€ôNÇàYàõ›VQTì“◊‘Q“Só—–’SQSïUS”ó‘Uö\◊Ÿö[J
+NÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä¥)4,4.t.»4-4/¥.¥`Ù/4-t/t`¥,4a¥.4.4/¥`¥`t`Ù`¥`t`¥,¥`Ù-t`àã⁄›◊ÿ[\ùUùYJBàô]\õÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä¥'¥`¥/Ù`4,4,¥.ÙcÙcà4-4/¥.¥`Ù/4-t/t`¥,4a¥.4c∏†)àäBà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\óŸÿ›[Y[ù
+àî“[ú]ö[JVQTì“◊‘Q“Só—–’SQSïUS”ó‘U
+Kàÿ\[€èH¥'Ù/¥.Ù/t,4c»4-4/¥.¥`Ù/4-t/t`¥,4a¥.4c»^Y\õ⁄»Y⁄[à—Àà4%tdH4/4/¥-¥/t/à4/Ù-t`4-t-4,4`¥c4/t-t.t`4/¥`t-t`¥.4,¥/4-t`t`¥-H4`H4-Ù,4-4,4/t.4-t/4/t,4/Ù.Ù,4,Ù.4/Kàãà
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]Kú›\ù›⁄]
+ú◊Ÿÿ‹ŒàäJBà\ﬁ[ò»Yà^Y\õ⁄◊‹Y⁄[óŸÿ‹◊‹YŸJÿ[òX⁄Œàÿ[òX⁄‘]Y\ûJHOàõ€ôNÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä
+BàYŸHHÿ[òX⁄Àô]Kú‹]
+éàãJVÃWBàYŸ\»H¬àú›\ùéà
+àº'Ê†è¥$tbÙ`t`¥`4bÙ.H4`t`¥,4`4`èÿèóóàÇàåKà4$¥/¥-Ùc4/4.4`¥-H4b4,4,t.Ù/¥/H4.4-»4`t.¥,4aÙ.4,¥,4-t/4/¥.H4-4/¥.¥`Ù/4-t/t`¥,4a¥.4.óàÇàåãà4(t/¥-Ù-4,4.t`¥-H4/t/¥,¥bÙ.HURQ4.4-Ù,4/Ù/¥.Ù/t.4`¥-H4/4-t`¥,4-4,4/t/tbÙ-KóàÇàåÀà4'¥,tb¥cÙ,¥.4`¥-H—USë‘ÀP’S”î»4.4,¥`t-H4`t/Ù.4`t.¥.íSë’◊ ãóàÇàçà4%Ù,4,Ù`4`Ù-Ù.4`¥-HúH4aÙ-t`4-t-»0™Ù'Ù.Ù,4,Ù.4/tb»8°§à4%Ù,4,Ù`4`Ù-Ù.4`¥c4/Ù.Ù,4,Ù.4/pÆÀóàÇàçKà4'Ù`4/¥,¥-t`4c4`¥-H4/t,4`t`¥`4/¥.t.¥.4.4`t/¥,tbÙ`¥.4c»4/t,4`¥-t`t`¥/¥,¥/¥/4,4.¥.¥,4`Ù/t`¥-KàÇà
+Kàú›ùX›\ôHéà
+àº'ÈÏHè¥(t`¥`4`Ù.¥`¥`Ù`4,ÿèóóàÇà¥'¥,tcÙ-Ù,4`¥-t.Ùc4/tb»êSQKëTî“S”ãT–‘íTS”ã‘ëQUÀURQ—USë‘◊‘Q—K—USë‘ÀÇàêP’S”îÀíSë’◊—SUH4.4,¥`t-H4`t/Ù.4`t.¥.4at`Ù.¥/¥,ãà4'¥,t`4,4,t/¥`¥aÙ.4.à4/Ù/¥.Ù`ÙaÙ,4-t`à›»Çà¥,4.¥.¥,4`Ù/t`à4-4/¥`t`¥`Ù/Ù-t/H4.¥,4.à€ŸOò›òXÿ€›[ùÿ€ŸOã4/t,4`t`¥`4/¥.t.¥.8†%€ŸOò›ôŸ]‹Ÿ][ô 
+Oÿ€ŸOãàÇà
+Kàö€⁄‹»éà
+à∏¶®Hè¥)t`Ù.¥.ÿèóóàÇàè€ŸOêíSë’◊‘’Tïÿ€ŸOã€ŸOêíSë’◊‘’‘ÿ€ŸOã€ŸOêíSë’◊’P“œÿ€ŸOãÇàè€ŸOêíSë’◊”ëU◊”QT‘–Q—Oÿ€ŸOã€ŸOêíSë’◊—PS–“Së—Qÿ€ŸOãÇàè€ŸOêíSë’◊”ëU◊‘ëUíQUœÿ€ŸOã€ŸOêíSë’◊‘—USë◊–“Së—Qÿ€ŸOãóóàÇà¥%4/¥/Ù`Ù`t.¥,4c¥`¥`tc»Yà4.\ﬁ[ò»Yãà4(t.4/tat`4/¥/t/tbÙ-H4a4`Ù/t.¥a¥.4.4,¥bÙ/Ù/¥.Ù/tcÙc¥`¥`tc»4,¥/t-H]ô[ù€‹àÇà
+KàúŸ][ô‹»éà
+à∏¶¶{Ó#»è¥'t,4`t`¥`4/¥.t.¥.ÿèóóàÇàî—USë‘»4/Ù/¥-4-4-t`4-¥.4,¥,4-t`à4`¥.4/Ùb»õ€€[ù›à4.⁄⁄XŸKà4$t/¥`à4,4,¥`¥/¥/4,4`¥.4aÙ-t`t.¥.4`t/¥-Ù-4,4dt`àÇà¥/Ù/¥`t`¥/¥cÙ/t/t`Ùcà4.¥/t/¥/Ù.¥`»0™Ù't,4`t`¥`4/¥.t.¥.0ÆÀ4/Ù`4/¥,¥-t`4cÙ-t`à4-Ù/t,4aÙ-t/t.4c»4.4`t/¥at`4,4/tcÙ-t`à4.4aH4,à‹›‹ôT‘SàÇàêP’S”î»4-4/¥,t,4,¥.ÙcÙ-t`à4.¥/t/¥/Ù.¥.4`4`ÙaÙ/tbÙaH4-4-t.t`t`¥,¥.4.H4/t,4`¥`»4-¥-H4`t`¥`4,4/t.4a¥`ÀàÇà
+Kàòÿ][Ÿ»éà
+àº'ÈÎHè¥'Ù`Ù,t.Ù.4.¥,4a¥.4cœÿèóóàÇà¥(Ù`t`¥,4/t/¥,¥.4`¥-H4.4/Ù`4/¥,¥-t`4c4`¥-H4`t,¥/¥.H4/Ù.Ù,4,Ù.4/K4/¥`¥.¥`4/¥.t`¥-H4-t,Ù/à4.¥,4`4`¥/¥aÙ.¥`À4/t,4-¥/4.4`¥-H0™Ù'¥/Ù`Ù,t.Ù.4.¥/¥,¥,4`¥c0Æ»Çà¥.4-4/¥,t,4,¥c4`¥-H4/¥/Ù.4`t,4/t.4-H4/t,4-Ù/t,4aÙ-t/t.4cÀ4/t,4`t`¥`4/¥.t.¥.4-Ù,4,¥.4`t.4/4/¥`t`¥-t.H4.4/¥,Ù`4,4/t.4aÙ-t/t.4.KàÇà¥)Ù`Ù-¥/¥.H4.4.Ù.4/¥a4.4a¥.4,4.Ùc4/tbÙ.HURQ4/Ù-t`4-t-Ù,4/Ù.4`t,4`¥c4/t-t.Ùc4-ÙcÀàÇà
+KàúÿYô]Héà
+àº'ÊËHè¥$t-t-Ù/¥/Ù,4`t/t/¥`t`¥cÿèóóàÇà¥'Ù.Ù,4,Ù.4/H8†%4.4`t/Ù/¥.Ù/tcÙ-t/4bÙ.H]€ãt.¥/¥-4`H4-4/¥`t`¥`Ù/Ù/¥/4.à^Y\õ⁄Àt`t-t`t`t.4.4.4/¥.¥`4`Ù-¥-t/t.4cà4/Ù`4/¥a¥-t`t`t,àÇà¥'Ù`4/¥,¥-t`4cÙ.t`¥-H4.4`tat/¥-4/t.4.ã4/t-H4`t/¥at`4,4/tcÙ.t`¥-H€€⁄⁄YH4.4/Ù`4/¥.¥`t.4,à4.¥/¥-4-H4.4.Ù.4.Ù/¥,Ù,4aKàÇà¥'¥a4.4a¥.4,4.Ùc4/t/¥,Ù/à4`t`¥,4,t.4.Ùc4/t/¥,Ù/à^Y\õ⁄»TH4/t-t`ã4/Ù/¥ct`¥/¥/4`»4/¥,t`4,4,t,4`¥bÙ,¥,4.t`¥-H4/¥b4.4,t.¥.4`t-t`¥.4.4.4-Ù/4-t/t-t/t.4c»4`tat-t/4bÀàÇà
+KàBà^HYŸ\ÀôŸ]
+YŸJBàYàõ›^Çà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\ä¥(4,4-Ù-4-t.»4-4/¥.¥`Ù/4-t/t`¥,4a¥.4.4/t-H4/t,4.t-4-t/KàäBàô]\õÇà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\ä^ô\W€X\ö›\ZŸ^Xõÿ\ô
+÷ 	¯´!{Ó#»4%4/¥.¥`Ù/4-t/t`¥,4a¥.4c…À	‹◊‹Y⁄[óŸÿ‹… WWJJBÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]HOHú◊‹Y⁄[ó›\ÿY›ÿ\õö[ô»äBà\ﬁ[ò»Yà^Y\õ⁄◊‹Y⁄[ó›\ÿY›ÿ\õö[ô ÿ[òX⁄Œàÿ[òX⁄‘]Y\ûJHOàõ€ôNÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä
+Bà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\äà∏¶®;Ó#»è¥$¥/t.4/4,4/t.4-OÿèóàÇàî^Y\õ⁄Àt/Ù.Ù,4,Ù.4/H4,¥bÙ/Ù/¥.Ù/tcÙ-t`¥`tc»4`H4/Ù`4,4,¥,4/4.4/Ù`4/¥a¥-t`t`t,4,t/¥`¥,4.4/Ù/¥.Ù`ÙaÙ,4-t`à4-4/¥`t`¥`Ù/»4.à4,4.¥.¥,4`Ù/t`¥`ÀàÇà¥'Ù`4/¥-4/¥.Ù-¥,4.t`¥-H4`¥/¥.Ùc4.¥/à4-t`t.Ù.4-4/¥,¥-t`4cÙ-t`¥-H4,4,¥`¥/¥`4`»4.4/Ù`4/¥,¥-t`4.4.Ù.4.4`tat/¥-4/tbÙ.H4.¥/¥-àãàô\W€X\ö›\ZŸ^Xõÿ\ô
+¬à ¥+»4/Ù/¥/t.4/4,4cà4`4.4`t.àãú◊‹Y⁄[ó›\ÿYÿ€€ôö\õHäWKà ¥'¥`¥/4-t/t,ãú◊‹Y⁄[ú»äWKàJKà
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]HOHú◊‹Y⁄[ó›\ÿYÿ€€ôö\õHäBà\ﬁ[ò»Yà^Y\õ⁄◊‹Y⁄[ó›\ÿYÿ€€ôö\õJÿ[òX⁄Œàÿ[òX⁄‘]Y\ûK›]Nàî”P€€ù^
+HOàõ€ôNÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä
+BàYàõ›]ÿZ]ô\]Z\ôW‹^Y\õ⁄◊‹ù[ù[YJÿ[òX⁄ÀõY\‹ÿYŸKÿ[òX⁄Àôúõ€W›\Ÿ\ãöY
+NÇàô]\õÇà]ÿZ]›]Kò€X\ä
+Bà]ÿZ]›]KúŸ]‹›]J^Y\õ⁄‘Y⁄[î›]Kôö[JBà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\ä¥'¥`¥/Ù`4,4,¥c4`¥-H4/¥-4.4/t/¥aÙ/tbÙ.HUãN4a4,4.t.»^Y\õ⁄Àt/Ù.Ù,4,Ù.4/t,úH4-4/àLLà4&¥$Kà4%4.Ùc»4/¥`¥/4-t/tbŒàÿÿ[òŸ[äBÇàõ›]\ãõY\‹ÿYŸJ^Y\õ⁄‘Y⁄[î›]Kôö[JBà\ﬁ[ò»Yà^Y\õ⁄◊‹Y⁄[ó›\ÿYŸö[JY\‹ÿYŸNàY\‹ÿYŸK›]Nàî”P€€ù^
+HOàõ€ôNÇàÿ›[Y[ùHY\‹ÿYŸKôÿ›[Y[ùàYàõ›ÿ›[Y[ù‹àõ›
+ÿ›[Y[ùôö[W€ò[YH‹ààäKõ›Ÿ\ä
+Kô[ô›⁄]
+ãúHäNÇà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\ä∏ßc4'¥`¥/Ù`4,4,¥c4`¥-H4-4/¥.¥`Ù/4-t/t`à4`H4`4,4`tb4.4`4-t/t.4-t/úKàäBàô]\õÇàYàÿ›[Y[ùôö[W‹⁄^ôH[ôÿ›[Y[ùôö[W‹⁄^ôHàLLà
+àLçÇà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\ä∏ßc4(4,4-Ù/4-t`4/Ù.Ù,4,Ù.4/t,4/t-H4-4/¥.Ù-¥-t/H4/Ù`4-t,¥bÙb4,4`¥cLLà4&¥$KàäBàô]\õÇàù[ù[YHH]ÿZ]ô\]Z\ôW‹^Y\õ⁄◊‹ù[ù[YJY\‹ÿYŸKY\‹ÿYŸKôúõ€W›\Ÿ\ãöY
+BàYàõ›ù[ù[YNÇà]ÿZ]›]Kò€X\ä
+Bàô]\õÇàùYôô\àHû]\“S 
+Bà]ÿZ]Y\‹ÿYŸKòõ›ô›€õÿY
+ÿ›[Y[ù\›[ò][€èXùYôô\äBàûNÇà€›\òŸHHùYôô\ãôŸ]ò[YJ
+KôX€ŸJù]ãN\⁄Y»äBàY⁄[àH]ÿZ]X[òYŸ\ãú^Y\õ⁄◊‹Y⁄[úÀö[ú›[
+àY\‹ÿYŸKôúõ€W›\Ÿ\ãöYÿ›[Y[ùôö[W€ò[YK€›\òŸKù[ù[YBà
+Bà^Ÿ\[öX€ŸQX€ŸQ\úõ‹éÇà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\ä∏ßc4)4,4.t.»4-4/¥.Ù-¥-t/H4,tbÙ`¥c4`¥-t.¥`t`¥/¥,¥bÙ/UãN]€ãt/4/¥-4`Ù.Ù-t/àäBàô]\õÇà^Ÿ\^Y\õ⁄‘Y⁄[ïò[Y][€ë\úõ‹à\»^ŒÇà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\äà∏ßc4'Ù.Ù,4,Ù.4/H4/¥`¥.¥.Ù/¥/tdt/Nà⁄[ô\ÿÿ\J›ä^ J_HäBàô]\õÇà^Ÿ\^Ÿ\[€à\»^ŒÇàŸŸŸ\ãô^Ÿ\[€ä¥'t-H4`Ù-4,4.Ù/¥`tc4`Ù`t`¥,4/t/¥,¥.4`¥c^Y\õ⁄Àt/Ù.Ù,4,Ù.4/HäBà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\äà∏ßc4'¥b4.4,t.¥,4`Ù`t`¥,4/t/¥,¥.¥.à⁄[ô\ÿÿ\J€\Y
+^Àå
+J_HäBàô]\õÇà]ÿZ]›]Kò€X\ä
+Bà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\äà∏ß!H^Y\õ⁄Àt/Ù.Ù,4,Ù.4/Hèû⁄[ô\ÿÿ\JY⁄[ãõò[YJ_Oÿèà4`Ù`t`¥,4/t/¥,¥.Ù-t/KàäBà]ÿZ]⁄›◊‹^Y\õ⁄◊€^W‹Y⁄[ú Y\‹ÿYŸKY\‹ÿYŸKôúõ€W›\Ÿ\ãöY
+BÇà\ﬁ[ò»Yà⁄›◊‹^Y\õ⁄◊‹Y⁄[ó⁄[ôõ \ôŸ]àY\‹ÿYŸK\Ÿ\ó⁄Yà[ù]ZYà›äHOàõ€ôNÇàù[ù[YHHX[òYŸ\ãú^Y\õ⁄◊‹Y⁄[úÀúù[ù[Y\ÀôŸ]
+\Ÿ\ó⁄Y
+BàY⁄[àHù[ù[YKúY⁄[úÀôŸ]
+]ZY
+HYàù[ù[YH[ŸHõ€ôBàYàõ›Y⁄[éÇà]ÿZ]\ôŸ]ò[ú›Ÿ\ä¥'Ù.Ù,4,Ù.4/H4/t-H4/t,4.t-4-t/KàäBàô]\õÇàXõXÿ][€àH]ÿZ]ãôŸ]‹^Y\õ⁄◊ÿÿ][Ÿ◊‹Y⁄[ä]ZY
+Bàõ›‹»H◊BàYàY⁄[ãúŸ][ô‹◊‹YŸNÇàõ›‹Àò\[ô
+ ∏¶¶{Ó#»4't,4`t`¥`4/¥.t.¥.ãàú◊‹Œû›]ZYHäWJBàXõXÿ][€ó‹›]\»H¥'t-H4/¥/Ù`Ù,t.Ù.4.¥/¥,¥,4/HÇàYàXõXÿ][€éÇàYàXõXÿ][€ñ»ö\◊€ŸôöX⁄X[óNÇàXõXÿ][€ó‹›]\»Hº'ÊËH4/¥a4.4a¥.4,4.Ùc4/t,4c»4/Ù`Ù,t.Ù.4.¥,4a¥.4c»Çàõ›‹Àò\[ô
+ º'ÈÎH4'¥`¥.¥`4bÙ`¥c4,à4.¥,4`¥,4.Ù/¥,Ù-Hãàú◊‹◊›öY]Œû›]ZYNåäWJBà[YàXõXÿ][€ñ»õ›€ô\ó›[Y‹ò[W⁄YóHOH\Ÿ\ó⁄YÇàXõXÿ][€ó‹›]\»H∏ß!H4/¥/Ù`Ù,t.Ù.4.¥/¥,¥,4/H4,¥,4/4.Çàõ›‹Àò\[ô
+ º'‰ÁH4'¥,t/t/¥,¥.4`¥c4/Ù`Ù,t.Ù.4.¥,4a¥.4càãàú◊‹Xó‹›\ùû›]ZYHäWJBàõ›‹Àò\[ô
+ ¥(Ù,t`4,4`¥c4.4-»4.¥,4`¥,4.Ù/¥,Ù,ãàú◊›[úXóÿ\⁄Œû›]ZYHäWJBà[ŸNÇàXõXÿ][€ó‹›]\»H¥'¥/Ù`Ù,t.Ù.4.¥/¥,¥,4/H4-4`4`Ù,Ù.4/4/Ù/¥.Ùc4-Ù/¥,¥,4`¥-t.Ù-t/Çàõ›‹Àò\[ô
+ º'ÈÎH4'¥`¥.¥`4bÙ`¥c4,à4.¥,4`¥,4.Ù/¥,Ù-Hãàú◊‹◊›öY]Œû›]ZYNåäWJBà[Yà]ZYõ›[àVQTì“◊‘ëPQW‘Q“Só–ñW’URQÇàõ›‹Àò\[ô
+ º'„$4'¥/Ù`Ù,t.Ù.4.¥/¥,¥,4`¥c4,à4.¥,4`¥,4.Ù/¥,Ù-Hãàú◊‹Xó‹›\ùû›]ZYHäWJBàõ›‹Àô^[ô
+¬à ¥$¥bÙ.¥.Ùc¥aÙ.4`¥càYàY⁄[ãô[òXõY[ŸH¥$¥.¥.Ùc¥aÙ.4`¥cãàú◊‹û›]ZYHäWKà º'Â‰H4(Ù-4,4.Ù.4`¥cãàú◊‹ÿ\⁄Œû›]ZYHäWKà ∏´!{Ó#»4'4/¥.4/Ù.Ù,4,Ù.4/tb»ãú◊€^W‹Y⁄[ú»äWKàJBà€⁄‹◊ÿ€›[ùH›[J[äò[YJHõ‹àò[YH[àY⁄[ãö€⁄‹Àùò[Y\ 
+JBà]ÿZ]\ôŸ]ò[ú›Ÿ\äààº'ÈÍHèû⁄[ô\ÿÿ\JY⁄[ãõò[YJ_Oÿèàû⁄[ô\ÿÿ\JY⁄[ãùô\ú⁄[€ä_WàÇààû⁄[ô\ÿÿ\JY⁄[ãô\ÿ‹ö\[€ä_WóàÇàà¥$4,¥`¥/¥`à⁄[ô\ÿÿ\JY⁄[ãò‹ôY] _WàÇààïURQà€ŸOû‹Y⁄[ãù]ZYOÿ€ŸOóàÇàà¥)t`Ù.¥/¥,éàèû⁄€⁄‹◊ÿ€›[ùOÿèà0≠»4-4-t.t`t`¥,¥.4.Nàèû€[äY⁄[ãòX›[€ú _OÿèóàÇàà¥'t,4`t`¥`4/¥.t.¥.àÿõ€€⁄X€€äY⁄[ãúŸ][ô‹◊‹YŸJ_WàÇàà¥&¥,4`¥,4.Ù/¥,Œà⁄[ô\ÿÿ\JXõXÿ][€ó‹›]\ _WàÇàà¥(t/¥`t`¥/¥cÙ/t.4-Nàÿõ€€⁄X€€äY⁄[ãô[òXõY
+_Hãàô\W€X\ö›\ZŸ^Xõÿ\ô
+õ›‹ Kà
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]Kú›\ù›⁄]
+ú◊‹NàäJBà\ﬁ[ò»Yà^Y\õ⁄◊‹Y⁄[ó⁄[ôõ ÿ[òX⁄Œàÿ[òX⁄‘]Y\ûK›]Nàî”P€€ù^
+HOàõ€ôNÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä
+Bà]ÿZ]›]Kò€X\ä
+Bà]ÿZ]⁄›◊‹^Y\õ⁄◊‹Y⁄[ó⁄[ôõ ÿ[òX⁄ÀõY\‹ÿYŸKÿ[òX⁄Àôúõ€W›\Ÿ\ãöYÿ[òX⁄Àô]Kú‹]
+éàãJVÃWJBÇà\ﬁ[ò»Yà⁄›◊‹^Y\õ⁄◊‹Y⁄[ó‹Ÿ][ô‹ \ôŸ]àY\‹ÿYŸK\Ÿ\ó⁄Yà[ù]ZYà›äHOàõ€ôNÇàù[ù[YHHX[òYŸ\ãú^Y\õ⁄◊‹Y⁄[úÀúù[ù[Y\ÀôŸ]
+\Ÿ\ó⁄Y
+BàY⁄[àHù[ù[YKúY⁄[úÀôŸ]
+]ZY
+HYàù[ù[YH[ŸHõ€ôBàYàõ›Y⁄[à‹àõ›Y⁄[ãúŸ][ô‹◊‹YŸNÇà]ÿZ]\ôŸ]ò[ú›Ÿ\ä¥(t`¥`4,4/t.4a¥,4/t,4`t`¥`4/¥-t.à4/t-H4/t,4.t-4-t/t,àäBàô]\õÇàò[Y\»Hù[ù[YKúŸ][ô‹ÀôŸ]
+]ZYﬂJBàõ›‹»H◊Bàõ‹à[ô^
+Ÿ^K‹X H[à[ù[Y\ò]JY⁄[ãúŸ][ô‹◊‹ÿ⁄[XKö][\ 
+JNÇàò[YHHò[Y\ÀôŸ]
+Ÿ^K‹X÷»ôYò][óJBàõ›‹Àò\[ô
+ ààû‹‹X÷…€Xô[	◊_Nàÿ€\Y
+^Y\õ⁄◊‹Ÿ][ô◊€Xô[
+‹XÀò[YJKåä_Hãààú◊‹Ÿ]û›]ZYNû⁄[ô^Hãà
+WJBàõ‹à[ô^X›[€à[à[ù[Y\ò]JY⁄[ãòX›[€úÀùò[Y\ 
+JNÇàõ›‹Àò\[ô
+ X›[€ñ»õXô[óKàú◊‹X›û›]ZYNû⁄[ô^HäWJBàõ›‹Àò\[ô
+ ∏´!{Ó#»4&à4/Ù.Ù,4,Ù.4/t`»ãàú◊‹Nû›]ZYHäWJBà]ÿZ]\ôŸ]ò[ú›Ÿ\äàà∏¶¶{Ó#»è¥'t,4`t`¥`4/¥.t.¥.à⁄[ô\ÿÿ\JY⁄[ãõò[YJ_OÿèóóàÇà¥'t,4-¥/4.4`¥-H4/t,4`t`¥`4/¥.t.¥`»4-4.Ùc»4.4-Ù/4-t/t-t/t.4cÀà4%Ù/t,4aÙ-t/t.4c»4`t/¥at`4,4/tcÙc¥`¥`tc»4,à‹›‹ôT‘S4.4,¥/¥`t`t`¥,4/t,4,¥.Ù.4,¥,4c¥`¥`tc»4/Ù/¥`t.Ù-H4/Ù-t`4-t-Ù,4/Ù`Ù`t.¥,àãàô\W€X\ö›\ZŸ^Xõÿ\ô
+õ›‹ Kà
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]Kú›\ù›⁄]
+ú◊‹ŒàäJBà\ﬁ[ò»Yà^Y\õ⁄◊‹Y⁄[ó‹Ÿ][ô‹ ÿ[òX⁄Œàÿ[òX⁄‘]Y\ûJHOàõ€ôNÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä
+Bà]ÿZ]⁄›◊‹^Y\õ⁄◊‹Y⁄[ó‹Ÿ][ô‹ ÿ[òX⁄ÀõY\‹ÿYŸKÿ[òX⁄Àôúõ€W›\Ÿ\ãöYÿ[òX⁄Àô]Kú‹]
+éàãJVÃWJBÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]Kú›\ù›⁄]
+ú◊‹Ÿ]àäJBà\ﬁ[ò»Yà^Y\õ⁄◊‹Y⁄[ó‹Ÿ][ô◊ÿ⁄[ôŸJÿ[òX⁄Œàÿ[òX⁄‘]Y\ûK›]Nàî”P€€ù^
+HOàõ€ôNÇàÀ]ZYò]◊⁄[ô^Hÿ[òX⁄Àô]Kú‹]
+éàãäBàù[ù[YHHX[òYŸ\ãú^Y\õ⁄◊‹Y⁄[úÀúù[ù[Y\ÀôŸ]
+ÿ[òX⁄Àôúõ€W›\Ÿ\ãöY
+BàY⁄[àHù[ù[YKúY⁄[úÀôŸ]
+]ZY
+HYàù[ù[YH[ŸHõ€ôBàYàõ›Y⁄[à‹àõ›Y⁄[ãô[òXõYÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä¥(t/t,4aÙ,4.Ù,4,¥.¥.Ùc¥aÙ.4`¥-H4/Ù.Ù,4,Ù.4/Hã⁄›◊ÿ[\ùUùYJBàô]\õÇà][\»H\›
+Y⁄[ãúŸ][ô‹◊‹ÿ⁄[XKö][\ 
+JBàûNÇàŸ^K‹X»H][\÷⁄[ù
+ò]◊⁄[ô^
+WBà^Ÿ\
+ò[YQ\úõ‹ã[ô^\úõ‹äNÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä¥'t,4`t`¥`4/¥.t.¥,4/t-H4/t,4.t-4-t/t,ã⁄›◊ÿ[\ùUùYJBàô]\õÇà›\úô[ùHù[ù[YKúŸ][ô‹ÀôŸ]
+]ZYﬂJKôŸ]
+Ÿ^K‹X÷»ôYò][óJBàYà‹X÷»ù\HóHOHòõ€€éÇà]ÿZ]X[òYŸ\ãú^Y\õ⁄◊‹Y⁄[úÀúŸ]‹Ÿ][ô ÿ[òX⁄Àôúõ€W›\Ÿ\ãöY]ZYŸ^Kõ›õ€€
+›\úô[ù
+JBà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä¥(t/¥at`4,4/t-t/t/àäBà]ÿZ]⁄›◊‹^Y\õ⁄◊‹Y⁄[ó‹Ÿ][ô‹ ÿ[òX⁄ÀõY\‹ÿYŸKÿ[òX⁄Àôúõ€W›\Ÿ\ãöY]ZY
+Bàô]\õÇàYà‹X÷»ù\HóHOHò⁄⁄XŸHéÇà⁄⁄XŸ\»H\›
+‹X÷»ò⁄⁄XŸ\»óJBà[ô^H⁄⁄XŸ\Àö[ô^
+›ä›\úô[ù
+JHYà›ä›\úô[ù
+H[à⁄⁄XŸ\»[ŸHLBà]ÿZ]X[òYŸ\ãú^Y\õ⁄◊‹Y⁄[úÀúŸ]‹Ÿ][ô ÿ[òX⁄Àôúõ€W›\Ÿ\ãöY]ZYŸ^K⁄⁄XŸ\÷ [ô^
+»JH	H[ä⁄⁄XŸ\ WJBà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä¥$¥bÙ,t`4,4/H4`t.Ù-t-4`Ùc¥bt.4.H4,¥,4`4.4,4/t`àäBà]ÿZ]⁄›◊‹^Y\õ⁄◊‹Y⁄[ó‹Ÿ][ô‹ ÿ[òX⁄ÀõY\‹ÿYŸKÿ[òX⁄Àôúõ€W›\Ÿ\ãöY]ZY
+Bàô]\õÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä
+Bà]ÿZ]›]Kò€X\ä
+Bà]ÿZ]›]KúŸ]‹›]J^Y\õ⁄‘Y⁄[î›]KúŸ][ô◊›ò[YJBà]ÿZ]›]Kù\]WŸ]J◊‹Y⁄[ó›]ZY]]ZY◊‹Y⁄[ó‹Ÿ][ôœZŸ^JBà€€ú›òZ[ù»H
+àà¥/¥`à‹‹XÀôŸ]
+	€Z[âÀ	¯¢$∏¢'â _H4-4/à‹‹XÀôŸ]
+	€X^	À	 ¯¢'â _HÇàYà‹X÷»ù\HóHOHö[ùÇà[ŸHà¥/¥`à‹‹XÀôŸ]
+	€Z[ó€[ô›	À
+_H4-4/à‹‹XÀôŸ]
+	€X^€[ô›	Àå
+_H4`t.4/4,¥/¥.Ù/¥,àÇà
+Bà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\äàà¥$¥,¥-t-4.4`¥-H4/t/¥,¥/¥-H4-Ù/t,4aÙ-t/t.4-H0™œèû⁄[ô\ÿÿ\J‹X÷…€Xô[	◊J_Oÿè∞Æ»
+ÿ€€ú›òZ[ùﬂJKà4%4.Ùc»4/¥`¥/4-t/tbŒàÿÿ[òŸ[Çà
+BÇàõ›]\ãõY\‹ÿYŸJ^Y\õ⁄‘Y⁄[î›]KúŸ][ô◊›ò[YKãù^
+Bà\ﬁ[ò»Yà^Y\õ⁄◊‹Y⁄[ó‹Ÿ][ô◊‹ÿ]ôJY\‹ÿYŸNàY\‹ÿYŸK›]Nàî”P€€ù^
+HOàõ€ôNÇà]HH]ÿZ]›]KôŸ]Ÿ]J
+Bà]ZYH]KôŸ]
+ú◊‹Y⁄[ó›]ZYäBàŸ^HH]KôŸ]
+ú◊‹Y⁄[ó‹Ÿ][ô»äBàYàõ›]ZY‹àõ›Ÿ^NÇà]ÿZ]›]Kò€X\ä
+Bàô]\õÇàûNÇà]ÿZ]X[òYŸ\ãú^Y\õ⁄◊‹Y⁄[úÀúŸ]‹Ÿ][ô Y\‹ÿYŸKôúõ€W›\Ÿ\ãöY]ZYŸ^KY\‹ÿYŸKù^
+Bà^Ÿ\
+Ÿ^Q\úõ‹ãò[YQ\úõ‹äH\»^ŒÇà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\äà∏ßc4%Ù/t,4aÙ-t/t.4-H4/t-H4`t/¥at`4,4/t-t/t/éà⁄[ô\ÿÿ\J›ä^ J_HäBàô]\õÇà]ÿZ]›]Kò€X\ä
+Bà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\ä∏ß!H4't,4`t`¥`4/¥.t.¥,4`t/¥at`4,4/t-t/t,àäBà]ÿZ]⁄›◊‹^Y\õ⁄◊‹Y⁄[ó‹Ÿ][ô‹ Y\‹ÿYŸKY\‹ÿYŸKôúõ€W›\Ÿ\ãöY]ZY
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]Kú›\ù›⁄]
+ú◊‹X›àäJBà\ﬁ[ò»Yà^Y\õ⁄◊‹Y⁄[óÿX›[€äÿ[òX⁄Œàÿ[òX⁄‘]Y\ûJHOàõ€ôNÇàÀ]ZYò]◊⁄[ô^Hÿ[òX⁄Àô]Kú‹]
+éàãäBàù[ù[YHHX[òYŸ\ãú^Y\õ⁄◊‹Y⁄[úÀúù[ù[Y\ÀôŸ]
+ÿ[òX⁄Àôúõ€W›\Ÿ\ãöY
+BàY⁄[àHù[ù[YKúY⁄[úÀôŸ]
+]ZY
+HYàù[ù[YH[ŸHõ€ôBàYàõ›Y⁄[à‹àõ›Y⁄[ãô[òXõYÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä¥(t/t,4aÙ,4.Ù,4,¥.¥.Ùc¥aÙ.4`¥-H4/Ù.Ù,4,Ù.4/Hã⁄›◊ÿ[\ùUùYJBàô]\õÇàX›[€ú»H\›
+Y⁄[ãòX›[€ú BàûNÇàX›[€ó⁄YHX›[€ú÷⁄[ù
+ò]◊⁄[ô^
+WBà^Ÿ\
+ò[YQ\úõ‹ã[ô^\úõ‹äNÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä¥%4-t.t`t`¥,¥.4-H4/t-H4/t,4.t-4-t/t/àã⁄›◊ÿ[\ùUùYJBàô]\õÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä¥$¥bÙ/Ù/¥.Ù/tcÙc∏†)àäBàûNÇàô\›[H]ÿZ]X[òYŸ\ãú^Y\õ⁄◊‹Y⁄[úÀúù[óÿX›[€äÿ[òX⁄Àôúõ€W›\Ÿ\ãöY]ZYX›[€ó⁄Y
+Bà^Ÿ\^Ÿ\[€à\»^ŒÇàŸŸŸ\ãô^Ÿ\[€ä¥'¥b4.4,t.¥,4-4-t.t`t`¥,¥.4c»^Y\õ⁄Àt/Ù.Ù,4,Ù.4/t,	\»ã]ZY
+Bà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\äà∏ßc4%4-t.t`t`¥,¥.4-H4-Ù,4,¥-t`4b4.4.Ù/¥`tc4/¥b4.4,t.¥/¥.Nà€ŸOû⁄[ô\ÿÿ\J€\Y
+^ÀÃ
+J_Oÿ€ŸOàäBàô]\õÇàYàô\›[\»õ›õ€ôNÇà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\ä€\Y
+›äô\›[
+KŒL
+JBà]ÿZ]⁄›◊‹^Y\õ⁄◊‹Y⁄[ó‹Ÿ][ô‹ ÿ[òX⁄ÀõY\‹ÿYŸKÿ[òX⁄Àôúõ€W›\Ÿ\ãöY]ZY
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]Kú›\ù›⁄]
+ú◊‹àäJBà\ﬁ[ò»Yà^Y\õ⁄◊‹Y⁄[ó›ŸŸ€Jÿ[òX⁄Œàÿ[òX⁄‘]Y\ûJHOàõ€ôNÇà]ZYHÿ[òX⁄Àô]Kú‹]
+éàãJVÃWBàûNÇà[òXõYH]ÿZ]X[òYŸ\ãú^Y\õ⁄◊‹Y⁄[úÀùŸŸ€Jÿ[òX⁄Àôúõ€W›\Ÿ\ãöY]ZY
+Bà^Ÿ\Ÿ^Q\úõ‹éÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä¥'Ù.Ù,4,Ù.4/H4/t-H4/t,4.t-4-t/Hã⁄›◊ÿ[\ùUùYJBàô]\õÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä¥'Ù.Ù,4,Ù.4/H4,¥.¥.Ùc¥aÙdt/HàYà[òXõY[ŸH¥'Ù.Ù,4,Ù.4/H4,¥bÙ.¥.Ùc¥aÙ-t/HäBà]ÿZ]⁄›◊‹^Y\õ⁄◊‹Y⁄[ó⁄[ôõ ÿ[òX⁄ÀõY\‹ÿYŸKÿ[òX⁄Àôúõ€W›\Ÿ\ãöY]ZY
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]Kú›\ù›⁄]
+ú◊‹ÿ\⁄ŒàäJBà\ﬁ[ò»Yà^Y\õ⁄◊‹Y⁄[óŸ[]Wÿ\⁄ ÿ[òX⁄Œàÿ[òX⁄‘]Y\ûJHOàõ€ôNÇà]ZYHÿ[òX⁄Àô]Kú‹]
+éàãJVÃWBà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä
+Bà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\äà¥(Ù-4,4.Ù.4`¥c^Y\õ⁄Àt/Ù.Ù,4,Ù.4/K4-t,Ù/à4.4`tat/¥-4/t.4.à4.4/t,4`t`¥`4/¥.t.¥.»ãàô\W€X\ö›\ZŸ^Xõÿ\ô
+÷ ¥%4,4`Ù-4,4.Ù.4`¥cãàú◊‹ŸŒû›]ZYHäK
+¥'¥`¥/4-t/t,ãàú◊‹Nû›]ZYHäWWJKà
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]Kú›\ù›⁄]
+ú◊‹ŸŒàäJBà\ﬁ[ò»Yà^Y\õ⁄◊‹Y⁄[óŸ[]Jÿ[òX⁄Œàÿ[òX⁄‘]Y\ûJHOàõ€ôNÇà]ZYHÿ[òX⁄Àô]Kú‹]
+éàãJVÃWBà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä¥(Ù-4,4.ÙcÙc∏†)àäBà]ÿZ]X[òYŸ\ãú^Y\õ⁄◊‹Y⁄[úÀô[]Jÿ[òX⁄Àôúõ€W›\Ÿ\ãöY]ZY
+Bà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\ä∏ß!H^Y\õ⁄Àt/Ù.Ù,4,Ù.4/H4`Ù-4,4.Ùdt/KàäBà]ÿZ]⁄›◊‹^Y\õ⁄◊€^W‹Y⁄[ú ÿ[òX⁄ÀõY\‹ÿYŸKÿ[òX⁄Àôúõ€W›\Ÿ\ãöY
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]Kú›\ù›⁄]
+ú◊‹Xó‹›\ùàäJBà\ﬁ[ò»Yà^Y\õ⁄◊ÿÿ][Ÿ◊‹Xõ\⁄‹›\ù
+ÿ[òX⁄Œàÿ[òX⁄‘]Y\ûK›]Nàî”P€€ù^
+HOàõ€ôNÇà]ZYHÿ[òX⁄Àô]Kú‹]
+éàãJVÃWBàY⁄[àH]ÿZ]ãôŸ]‹^Y\õ⁄◊‹Y⁄[äÿ[òX⁄Àôúõ€W›\Ÿ\ãöY]ZY
+BàXõXÿ][€àH]ÿZ]ãôŸ]‹^Y\õ⁄◊ÿÿ][Ÿ◊‹Y⁄[ä]ZY
+BàYàõ›Y⁄[éÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä¥(Ù`t`¥,4/t/¥,¥.Ù-t/t/tbÙ.H4/Ù.Ù,4,Ù.4/H4/t-H4/t,4.t-4-t/Hã⁄›◊ÿ[\ùUùYJBàô]\õÇàYàXõXÿ][€à[ô
+XõXÿ][€ñ»ö\◊€ŸôöX⁄X[óH‹àXõXÿ][€ñ»õ›€ô\ó›[Y‹ò[W⁄YóHOHÿ[òX⁄Àôúõ€W›\Ÿ\ãöY
+NÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä¥+t`¥/¥`àURQ4`Ù-¥-H4/¥/Ù`Ù,t.Ù.4.¥/¥,¥,4/H4-4`4`Ù,Ù.4/4,4,¥`¥/¥`4/¥/ã⁄›◊ÿ[\ùUùYJBàô]\õÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä
+Bà]ÿZ]›]Kò€X\ä
+Bà]ÿZ]›]KúŸ]‹›]J^Y\õ⁄–ÿ][Ÿ‘Xõ\⁄›]Kô\ÿ‹ö\[€äBà]ÿZ]›]Kù\]WŸ]J◊ÿÿ][Ÿ◊›]ZY]]ZY
+Bà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\äàà¥'¥`¥/Ù`4,4,¥c4`¥-H4/¥/Ù.4`t,4/t.4-H^Y\õ⁄Àt/Ù.Ù,4,Ù.4/t,à4/t,4-Ù/t,4aÙ-t/t.4-K4/t,4`t`¥`4/¥.t.¥,4.¥/¥/4,4/t-4bÀÙ-4-t.t`t`¥,¥.4cÀÇàà¥-Ù,4,¥.4`t.4/4/¥`t`¥.4.4/¥,Ù`4,4/t.4aÙ-t/t.4cÀà4'¥`à‘Q“Só––US—◊—T–‘íTS”ó”RSüH4-4/à‘Q“Só––US—◊—T–‘íTS”ó”PVH4`t.4/4,¥/¥.Ù/¥,ãóó¥%4.Ùc»4/¥`¥/4-t/tbŒàÿÿ[òŸ[Çà
+BÇàõ›]\ãõY\‹ÿYŸJ^Y\õ⁄–ÿ][Ÿ‘Xõ\⁄›]Kô\ÿ‹ö\[€ããù^
+Bà\ﬁ[ò»Yà^Y\õ⁄◊ÿÿ][Ÿ◊‹Xõ\⁄Ÿ\ÿ‹ö\[€äY\‹ÿYŸNàY\‹ÿYŸK›]Nàî”P€€ù^
+HOàõ€ôNÇàûNÇà\ÿ‹ö\[€àHò[Y]Wÿÿ][Ÿ◊Ÿ\ÿ‹ö\[€äY\‹ÿYŸKù^‹ààäBà^Ÿ\ò[YQ\úõ‹à\»^ŒÇà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\äà∏ßc⁄[ô\ÿÿ\J›ä^ J_HäBàô]\õÇà]ZYH
+]ÿZ]›]KôŸ]Ÿ]J
+JKôŸ]
+ú◊ÿÿ][Ÿ◊›]ZYäBàY⁄[àH]ÿZ]ãôŸ]‹^Y\õ⁄◊‹Y⁄[äY\‹ÿYŸKôúõ€W›\Ÿ\ãöY]ZY
+HYà]ZY[ŸHõ€ôBàYàõ›Y⁄[éÇà]ÿZ]›]Kò€X\ä
+Bà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\ä∏ßc4'Ù.Ù,4,Ù.4/H4,t/¥.Ùc4b4-H4/t-H4`Ù`t`¥,4/t/¥,¥.Ù-t/KàäBàô]\õÇà]ÿZ]›]Kù\]WŸ]J◊ÿÿ][Ÿ◊Ÿ\ÿ‹ö\[€èY\ÿ‹ö\[€äBà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\äàº'Â#àè¥'Ù`4-t-4/Ù`4/¥`t/4/¥`¥`4/Ù`Ù,t.Ù.4.¥,4a¥.4.^Y\õ⁄œÿèóóàÇààèèû⁄[ô\ÿÿ\JY⁄[ñ…€ò[YI◊J_Oÿèàû⁄[ô\ÿÿ\JY⁄[ñ…›ô\ú⁄[€â◊J_WàÇààèOû⁄[ô\ÿÿ\JY⁄[ñ…Ÿ\ÿ‹ö\[€â◊J_O⁄OóóàÇààû⁄[ô\ÿÿ\J\ÿ‹ö\[€ä_WóàÇàà¥'Ù`Ù,t.Ù.4aÙ/tbÙ.H4,4,¥`¥/¥`àèû⁄[ô\ÿÿ\J[Y‹ò[W‹Xõ\⁄\ó€ò[YJY\‹ÿYŸKôúõ€W›\Ÿ\äJ_Oÿèàãàô\W€X\ö›\ZŸ^Xõÿ\ô
+÷ ∏ß!H4'¥/Ù`Ù,t.Ù.4.¥/¥,¥,4`¥cãàú◊‹XóŸŒû›]ZYHäK
+¥'¥`¥/4-t/t,ãàú◊‹Nû›]ZYHäWWJKà
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]Kú›\ù›⁄]
+ú◊‹XóŸŒàäJBà\ﬁ[ò»Yà^Y\õ⁄◊ÿÿ][Ÿ◊‹Xõ\⁄Ÿ ÿ[òX⁄Œàÿ[òX⁄‘]Y\ûK›]Nàî”P€€ù^
+HOàõ€ôNÇà]ZYHÿ[òX⁄Àô]Kú‹]
+éàãJVÃWBà]HH]ÿZ]›]KôŸ]Ÿ]J
+BàYà]KôŸ]
+ú◊ÿÿ][Ÿ◊›]ZYäHOH]ZY‹àõ›]KôŸ]
+ú◊ÿÿ][Ÿ◊Ÿ\ÿ‹ö\[€àäNÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä¥(t-t`t`t.4c»4/Ù`Ù,t.Ù.4.¥,4a¥.4.4.4`t`¥-t.¥.Ù,ã⁄›◊ÿ[\ùUùYJBàô]\õÇàXõ\⁄YH]ÿZ]ãúXõ\⁄‹^Y\õ⁄◊ÿÿ][Ÿ◊‹Y⁄[äàÿ[òX⁄Àôúõ€W›\Ÿ\ãöYà]ZYà[Y‹ò[W‹Xõ\⁄\ó€ò[YJÿ[òX⁄Àôúõ€W›\Ÿ\äKà]V»ú◊ÿÿ][Ÿ◊Ÿ\ÿ‹ö\[€àóKà
+Bà]ÿZ]›]Kò€X\ä
+Bà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä¥'¥/Ù`Ù,t.Ù.4.¥/¥,¥,4/t/ààYàXõ\⁄Y[ŸH¥'Ù`Ù,t.Ù.4.¥,4a¥.4c»4/t-H4,¥bÙ/Ù/¥.Ù/t-t/t,ã⁄›◊ÿ[\ù[õ›Xõ\⁄Y
+BàYàXõ\⁄YÇà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\ä∏ß!H^Y\õ⁄Àt/Ù.Ù,4,Ù.4/H4/¥/Ù`Ù,t.Ù.4.¥/¥,¥,4/H4,à4/¥,tbt-t/4.¥,4`¥,4.Ù/¥,Ù-Kàãô\W€X\ö›\ZŸ^Xõÿ\ô
+÷ 	¸'ÈÎH4'¥`¥.¥`4bÙ`¥c	Ààú◊‹◊›öY]Œû›]ZYNåäWWJJBÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]Kú›\ù›⁄]
+ú◊›[úXóÿ\⁄ŒàäJBà\ﬁ[ò»Yà^Y\õ⁄◊ÿÿ][Ÿ◊›[úXõ\⁄ÿ\⁄ ÿ[òX⁄Œàÿ[òX⁄‘]Y\ûJHOàõ€ôNÇà]ZYHÿ[òX⁄Àô]Kú‹]
+éàãJVÃWBà][HH]ÿZ]ãôŸ]‹^Y\õ⁄◊ÿÿ][Ÿ◊‹Y⁄[ä]ZY
+BàYàõ›][H‹à][V»õ›€ô\ó›[Y‹ò[W⁄YóHOHÿ[òX⁄Àôúõ€W›\Ÿ\ãöY‹à][V»ö\◊€ŸôöX⁄X[óNÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä¥(Ù-4,4.Ù.4`¥c4ct`¥`»4/Ù`Ù,t.Ù.4.¥,4a¥.4cà4/t-t.Ùc4-Ùc»ã⁄›◊ÿ[\ùUùYJBàô]\õÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä
+Bà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\äàà¥(Ù,t`4,4`¥cèû⁄[ô\ÿÿ\J][V…€ò[YI◊J_Oÿèà4.4-»4.¥,4`¥,4.Ù/¥,Ù,^Y\õ⁄œ»4(Ù`t`¥,4/t/¥,¥.Ù-t/t/tbÙ-H4.¥/¥/Ù.4.4/¥`t`¥,4/t`Ù`¥`tcÀàãàô\W€X\ö›\ZŸ^Xõÿ\ô
+÷ ¥%4,4`Ù,t`4,4`¥cãàú◊›[úXóŸŒû›]ZYHäK
+¥'¥`¥/4-t/t,ãàú◊‹Nû›]ZYHäWWJKà
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]Kú›\ù›⁄]
+ú◊›[úXóŸŒàäJBà\ﬁ[ò»Yà^Y\õ⁄◊ÿÿ][Ÿ◊›[úXõ\⁄Ÿ ÿ[òX⁄Œàÿ[òX⁄‘]Y\ûJHOàõ€ôNÇà]ZYHÿ[òX⁄Àô]Kú‹]
+éàãJVÃWBàô[[›ôYH]ÿZ]ãù[úXõ\⁄‹^Y\õ⁄◊ÿÿ][Ÿ◊‹Y⁄[äÿ[òX⁄Àôúõ€W›\Ÿ\ãöY]ZY
+Bà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä¥'Ù`Ù,t.Ù.4.¥,4a¥.4c»4`Ù-4,4.Ù-t/t,àYàô[[›ôY[ŸH¥'Ù`Ù,t.Ù.4.¥,4a¥.4c»4/t-H4/t,4.t-4-t/t,äBà]ÿZ]⁄›◊‹^Y\õ⁄◊‹Y⁄[ó⁄[ôõ ÿ[òX⁄ÀõY\‹ÿYŸKÿ[òX⁄Àôúõ€W›\Ÿ\ãöY]ZY
+BÇà\ﬁ[ò»Yà⁄›◊ÿZW‹Y⁄[óÿùZ[\ä\ôŸ]àY\‹ÿYŸK\Ÿ\ó⁄Yà[ù
+HOàõ€ôNÇàŸ][ô‹»H]ÿZ]ãôŸ]‹Y⁄[óÿùZ[\ó‹Ÿ][ô‹ \Ÿ\ó⁄Y
+Bà€€ôöY›\ôYHõ€€
+Ÿ][ô‹÷»ò\W›⁄Ÿ[óŸ[ò»óH[ôŸ][ô‹÷»õ[Ÿ[⁄YóJBàù[õö[ô»H\Ÿ\ó⁄Y[àZWÿùZ[\ó⁄õÿú¬à]ÿZ]\ôŸ]ò[ú›Ÿ\äà∏ß*èêRKt.¥/¥/t`t`¥`4`Ù.¥`¥/¥`4/Ù.Ù,4,Ù.4/t/¥,èÿèóóàÇà¥'¥/Ù.4b4.4`¥-H4/t`Ù-¥/tbÙ.Hù[î^Kt/Ù.Ù,4,Ù.4/H4/¥,tbÙaÙ/tbÙ/4`¥-t.¥`t`¥/¥/à4$t/¥`à4/Ù-t`4-t-4,4`t`à4/4/¥-4-t.Ù.4/Ù/¥.Ù/t`ÙcàÇà¥-4/¥.¥`Ù/4-t/t`¥,4a¥.4cã4`t/¥-Ù-4,4`t`à4.4`tat/¥-4/t.4.ã4-Ù,4`¥-t/4/¥`¥-4-t.Ùc4/tbÙ/4ct`¥,4/Ù/¥/4/Ù`4/¥,¥-t`4.4`à4`t.4/t`¥,4.¥`t.4`H4.Çà¥`t/¥/¥`¥,¥-t`¥`t`¥,¥.4-H4.¥/¥/t`¥`4,4.¥`¥`Àà4(Ù`t/Ù-tb4/tbÙ.H4`4-t-Ù`Ù.Ùc4`¥,4`à4,4,¥`¥/¥/4,4`¥.4aÙ-t`t.¥.4/Ù/¥cÙ,¥.4`¥`tc»4,à0™Ù'4/¥.4/Ù.Ù,4,Ù.4/tbÆÀóóàÇà∏¶®;Ó#»4(t,Ù-t/t-t`4.4`4/¥,¥,4/t/tbÙ.H]€ãt.¥/¥-4,¥bÙ/Ù/¥.Ù/tcÙ-t`¥`tc»4`H4/Ù`4,4,¥,4/4.4/Ù`4/¥a¥-t`t`t,4,t/¥`¥,à4&¥/¥/t`t`¥`4`Ù.¥`¥/¥`Çà¥,t.Ù/¥.¥.4`4`Ù-t`à4/t-t`t.¥/¥.Ùc4.¥/à4/¥`t/¥,t/à4/¥/Ù,4`t/tbÙaH4.¥/¥/t`t`¥`4`Ù.¥a¥.4.K4/t/à4/Ù-t`4-t-4/Ù`Ù,t.Ù.4.¥,4a¥.4-t.H4,¥`tdH4`4,4,¥/t/àÇà¥`4-t.¥/¥/4-t/t-4`Ù-t`¥`tc»4/Ù`4/¥,¥-t`4.4`¥c4.4`tat/¥-4/t.4.ãóóàÇàà¥'t,4`t`¥`4/¥.t.¥.TNà…¯ß!H4,Ù/¥`¥/¥,¥b…»Yà€€ôöY›\ôY[ŸH	¯ßc4/t-H4-Ù,4/Ù/¥.Ù/t-t/tb…ﬂWàÇàà¥%Ù,4-4,4aÙ,à…¸'È%à4,¥bÙ/Ù/¥.Ù/tcÙ-t`¥`tc…»Yàù[õö[ô»[ŸH	Ù`t,¥/¥,t/¥-4-t/IﬂHãàô\W€X\ö›\ZŸ^Xõÿ\ô
+¬à ∏ß*4'Ù-t`4-t.t`¥.4.à4`t/¥-Ù-4,4/t.4càãòZWÿùZ[\óÿ‹ôX]HäWKà ∏¶¶{Ó#»4't,4`t`¥`4/¥.t.¥.ãòZWÿùZ[\ó‹Ÿ][ô‹»äWKà ∏´!{Ó#»4'Ù.Ù,4,Ù.4/tb»ãúY⁄[ú»äWKàJKà
+BÇà\ﬁ[ò»Yà⁄›◊ÿZW‹Y⁄[óÿùZ[\ó‹Ÿ][ô‹ \ôŸ]àY\‹ÿYŸK\Ÿ\ó⁄Yà[ù
+HOàõ€ôNÇàŸ][ô‹»H]ÿZ]ãôŸ]‹Y⁄[óÿùZ[\ó‹Ÿ][ô‹ \Ÿ\ó⁄Y
+Bà]ÿZ]\ôŸ]ò[ú›Ÿ\äà∏¶¶{Ó#»è¥'t,4`t`¥`4/¥.t.¥.RKt.¥/¥/t`t`¥`4`Ù.¥`¥/¥`4,ÿèóóàÇààêò\ŸHTìà€ŸOû⁄[ô\ÿÿ\J›äŸ][ô‹÷…ÿ\Wÿò\ŸW›\õ	◊JJ_Oÿ€ŸOóàÇààêTKt`¥/¥.¥-t/Nà€ŸOû–RW–ïRSTó’“—Só”PT“»YàŸ][ô‹÷…ÿ\W›⁄Ÿ[óŸ[ò…◊H[ŸH	Ù/t-H4-Ù,4-4,4/IﬂOÿ€ŸOóàÇààíQ4/4/¥-4-t.Ù.à€ŸOû⁄[ô\ÿÿ\J›äŸ][ô‹÷…€[Ÿ[⁄Y	◊H‹à	Ù/t-H4-Ù,4-4,4/I J_Oÿ€ŸOóóàÇà¥&4`t/Ù/¥.Ùc4-Ù`Ù-t`¥`tc»4/¥a4.4a¥.4,4.Ùc4/tbÙ.H[ùõ‹X»—Àà4%4.Ùc»4`t/¥,¥/4-t`t`¥.4/4/¥,Ù/à4/Ù`4/¥.¥`t.4`Ù.¥,4-¥.4`¥-H4-t,Ù/à»ò\ŸHTìàãàô\W€X\ö›\ZŸ^Xõÿ\ô
+¬à º'„$4&4-Ù/4-t/t.4`¥cò\ŸHTìãòZWÿùZ[\ó‹Ÿ]òò\ŸHäWKà º'Â$H4&4-Ù/4-t/t.4`¥cTKt`¥/¥.¥-t/HãòZWÿùZ[\ó‹Ÿ]ù⁄Ÿ[àäWKà º'ÈË4&4-Ù/4-t/t.4`¥cQ4/4/¥-4-t.Ù.ãòZWÿùZ[\ó‹Ÿ]õ[Ÿ[äWKà ∏´!{Ó#»4&¥/¥/t`t`¥`4`Ù.¥`¥/¥`ãòZWÿùZ[\àäWKàJKà
+BÇà\ﬁ[ò»YàZWŸŸ[ô\ò][€ó›[Y\äà›]\◊€Y\‹ÿYŸNàY\‹ÿYŸKà\ŸNàX›‹›ã›óKà›‹Ÿ]ô[ùà\ﬁ[ò⁄[Àë]ô[ùà
+HOàõ€ôNÇà›\ùYH\ﬁ[ò⁄[ÀôŸ]‹ù[õö[ô◊€€‹
+
+Kù[YJ
+Bà⁄[Hõ››‹Ÿ]ô[ùö\◊‹Ÿ]
+
+NÇà[\ŸYH[ù
+\ﬁ[ò⁄[ÀôŸ]‹ù[õö[ô◊€€‹
+
+Kù[YJ
+HH›\ùY
+BàûNÇà]ÿZ]›]\◊€Y\‹ÿYŸKôY]›^
+àº'È%àè¥%4`Ù/4,4c∏†)èÿèóàÇàà∏£ÏH4'Ù`4/¥b4.Ù/éàèûŸ[\ŸYH4`t-t.ãèÿèóàÇààû‹\ŸV…€Xô[	◊_HÇà
+Bà^Ÿ\[Y‹ò[PòYô\]Y\›\»^ŒÇàYàõY\‹ÿYŸH\»õ›[ŸYöYYàõ›[à›ä^ Kòÿ\ŸYõ€
+
+NÇàŸŸŸ\ãùÿ\õö[ô ¥'t-H4/¥,t/t/¥,¥.Ùdt/H4`¥,4.t/4-t`RKt.¥/¥/t`t`¥`4`Ù.¥`¥/¥`4,à	\»ã^ Bà^Ÿ\^Ÿ\[€éÇàŸŸŸ\ãùÿ\õö[ô ¥'t-H4/¥,t/t/¥,¥.Ùdt/H4`¥,4.t/4-t`RKt.¥/¥/t`t`¥`4`Ù.¥`¥/¥`4,ã^◊⁄[ôõœUùYJBàûNÇà]ÿZ]\ﬁ[ò⁄[ÀùÿZ]Ÿõ‹ä›‹Ÿ]ô[ùùÿZ]
+
+K[Y[›]LJBà^Ÿ\[Y[›]\úõ‹éÇà\‹¬Çà\ﬁ[ò»Yàù[óÿZW‹Y⁄[óŸŸ[ô\ò][€äàY\‹ÿYŸNàY\‹ÿYŸKàô\]Y\›à›ãà
+ãàY]›]ZYà›àõ€ôHHõ€ôKà
+HOàõ€ôNÇà\Ÿ\ó⁄YHY\‹ÿYŸKôúõ€W›\Ÿ\ãöYàYà\Ÿ\ó⁄Y[àZWÿùZ[\ó⁄õÿúŒÇà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\ä∏£Ï»4'Ù`4-t-4bÙ-4`Ùbt.4.H4/Ù.Ù,4,Ù.4/H4-tbtdH4`t/¥-Ù-4,4dt`¥`tcÀà4%4/¥-¥-4.4`¥-t`tc4`4-t-Ù`Ù.Ùc4`¥,4`¥,àäBàô]\õÇàù[ù[YHH]ÿZ]ô\]Z\ôW‹ù[ù[YJY\‹ÿYŸK\Ÿ\ó⁄Y
+BàYàõ›ù[ù[YNÇàô]\õÇàŸ][ô‹»H]ÿZ]ãôŸ]‹Y⁄[óÿùZ[\ó‹Ÿ][ô‹ \Ÿ\ó⁄Y
+BàYàõ›Ÿ][ô‹÷»ò\W›⁄Ÿ[óŸ[ò»óH‹àõ›Ÿ][ô‹÷»õ[Ÿ[⁄YóNÇà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\äà∏ßc4(t/t,4aÙ,4.Ù,4-Ù,4-4,4.t`¥-HTKt`¥/¥.¥-t/H4.Q4/4/¥-4-t.Ù.àãàô\W€X\ö›\ZŸ^Xõÿ\ô
+÷ 	¯¶¶{Ó#»4'¥`¥.¥`4bÙ`¥c4/t,4`t`¥`4/¥.t.¥.	À	ÿZWÿùZ[\ó‹Ÿ][ô‹… WWJKà
+Bàô]\õÇàûNÇà\W›⁄Ÿ[àHŸX‹ô]ÀôX‹û\
+Ÿ][ô‹÷»ò\W›⁄Ÿ[óŸ[ò»óJBà^Ÿ\
+[ùò[Y⁄Ÿ[ãò[YQ\úõ‹äH\»^ŒÇàŸŸŸ\ãùÿ\õö[ô ¥'t-H4`4,4`tb4.4a4`4/¥,¥,4/H4`¥/¥.¥-t/HRKt.¥/¥/t`t`¥`4`Ù.¥`¥/¥`4,4-4.Ùc»	\»ã\Ÿ\ó⁄Y
+Bà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\äà∏ßc4(t/¥at`4,4/tdt/t/tbÙ.HTKt`¥/¥.¥-t/H4/t-H4`Ù-4,4.Ù/¥`tc4/Ù`4/¥aÙ.4`¥,4`¥cà4$¥,¥-t-4.4`¥-H4-t,Ù/à4-Ù,4/t/¥,¥/à4,à4/t,4`t`¥`4/¥.t.¥,4aKàÇà
+Bàô]\õÇÇà^\›[ô»H]ÿZ]ãôŸ]‹Y⁄[ä\Ÿ\ó⁄YY]›]ZY
+HYàY]›]ZY[ŸHõ€ôBàYàY]›]ZY[ô
+õ›^\›[ô»‹àõ›^\›[ô÷»òZWŸŸ[ô\ò]YóJNÇà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\ä∏ßc4(4-t-4,4.¥`¥.4`4/¥,¥,4`¥c4aÙ-t`4-t-»4&4&4/4/¥-¥/t/à4`¥/¥.Ùc4.¥/à4`t/¥-Ù-4,4/t/tbÙ.H4.4/4/Ù.Ù,4,Ù.4/KàäBàô]\õÇàXõXÿ][€àH]ÿZ]ãôŸ]ÿÿ][Ÿ◊‹Y⁄[äY]›]ZY
+HYàY]›]ZY[ŸHõ€ôBàZWÿùZ[\ó⁄õÿúÀòY
+\Ÿ\ó⁄Y
+Bà\ŸHH»õXô[éàåKÃà0≠»4(t/¥-Ù-4,4/t.4-H4.4`tat/¥-4/t.4.¥,üBà›‹Ÿ]ô[ùH\ﬁ[ò⁄[Àë]ô[ù
+
+Bà›]\◊€Y\‹ÿYŸHH]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\äàº'È%àè¥%4`Ù/4,4c∏†)èÿèó∏£ÏH4'Ù`4/¥b4.Ù/éàèå4`t-t.ãèÿèóåKÃà0≠»4(t/¥-Ù-4,4/t.4-H4.4`tat/¥-4/t.4.¥,Çà
+Bà[Y\ó›\⁄»H\ﬁ[ò⁄[Àò‹ôX]W›\⁄ àZWŸŸ[ô\ò][€ó›[Y\ä›]\◊€Y\‹ÿYŸK\ŸK›‹Ÿ]ô[ù
+Bà
+BàûNÇàÿ›[Y[ù][€àH]ÿZ]\ﬁ[ò⁄[Àù◊›ôXY
+àQ“Só—–’SQSïUS”ó‘UúôXY›^[ò€Ÿ[ôœHù]ãNÇà
+BàùZ[\àH[ùõ‹X‘Y⁄[êùZ[\äà\W›⁄Ÿ[ãà›äŸ][ô‹÷»ò\Wÿò\ŸW›\õóH‹àRW–ïRSTó—QêUS–TW–êT—W’Tì
+Kà›äŸ][ô‹÷»õ[Ÿ[⁄YóJKà
+BàYà^\›[ôŒÇàòYùH]ÿZ]ùZ[\ãôY]ŸòYù
+àô\]Y\›àÿ›[Y[ù][€ãà›ä^\›[ô÷»ú€›\òŸHóJKà›ä^\›[ô÷»ù]ZYóJKà
+Bà[ŸNÇàòYùH]ÿZ]ùZ[\ãò‹ôX]WŸòYù
+ô\]Y\›ÿ›[Y[ù][€äBÇà\ŸV»õXô[óHHåãÃà0≠»4'Ù`4/¥,¥-t`4.¥,4`t.4/t`¥,4.¥`t.4`t,4.4-4/¥.¥`Ù/4-t/t`¥,4a¥.4.Çà^X›Y›]ZYH›ä^\›[ô÷»ù]ZYóJHYà^\›[ô»[ŸHõ€ôBàô]öY]ŸYH]ÿZ]ùZ[\ãúô]öY]◊ŸòYù
+àô\]Y\›àÿ›[Y[ù][€ãàòYùà^X›Y›]ZYY^X›Y›]ZYà
+BàY]Y]HH[ú‹X›ŸŸ[ô\ò]Y‹€›\òŸJàô]öY]ŸYú€›\òŸK^X›Y›]ZYY^X›Y›]ZYà
+Bàö[[ò[YHH
+à›ä^\›[ô÷»ôö[[ò[YHóJBàYà^\›[ô¬à[ŸHŸ[ô\ò]YŸö[[ò[YJ›äY]Y]V»ìêSQHóJK›äY]Y]V»ïURQóJJBà
+BàY⁄[àH]ÿZ]X[òYŸ\ãúY⁄[úÀö[ú›[
+à\Ÿ\ó⁄Yàö[[ò[YKàô]öY]ŸYú€›\òŸKàù[ù[YKà
+Bà]ÿZ]ãõX\ö◊‹Y⁄[óÿZWŸŸ[ô\ò]Y
+à\Ÿ\ó⁄YàY⁄[ãù]ZYàô\]Y\›àô]öY]ŸYú›[[X\ûKà
+Bàÿ][Ÿ◊›\]YHò[ŸBàYà
+àXõXÿ][€Çà[ôXõXÿ][€ñ»õ›€ô\ó›[Y‹ò[W⁄YóHOH\Ÿ\ó⁄Yà[ôõ›XõXÿ][€ñ»ö\◊€ŸôöX⁄X[óBà
+NÇàÿ][Ÿ◊›\]YH]ÿZ]ãúXõ\⁄ÿÿ][Ÿ◊‹Y⁄[äà\Ÿ\ó⁄YàY⁄[ãù]ZYà›äXõXÿ][€ñ»úXõ\⁄\ó€ò[YHóJKà›äXõXÿ][€ñ»ô\ÿ‹ö\[€àóJKà
+Bà^Ÿ\
+RTY⁄[êùZ[\ë\úõ‹ãY⁄[ïò[Y][€ë\úõ‹ãò[YQ\úõ‹äH\»^ŒÇàŸŸŸ\ãùÿ\õö[ô êRKt.¥/¥/t`t`¥`4`Ù.¥`¥/¥`4/¥`¥.¥.Ù/¥/t.4.»4`4-t-Ù`Ù.Ùc4`¥,4`à4-4.Ùc»	\Œà	\»ã\Ÿ\ó⁄Y^ Bà]ÿZ]›]\◊€Y\‹ÿYŸKôY]›^
+à∏ßcè¥'Ù.Ù,4,Ù.4/H4/t-H4`t/¥-Ù-4,4/OÿèóóàÇààû⁄[ô\ÿÿ\J€\Y
+^ÀLå
+J_WóàÇà¥&4`t/Ù`4,4,¥c4`¥-H4/¥/Ù.4`t,4/t.4-H4.4.Ù.4/t,4`t`¥`4/¥.t.¥.4/4/¥-4-t.Ù.4.4/Ù/¥/Ù`4/¥,t`Ù.t`¥-H4-tbtdH4`4,4-Ààãàô\W€X\ö›\ZŸ^Xõÿ\ô
+÷ 	¯´!{Ó#»RKt.¥/¥/t`t`¥`4`Ù.¥`¥/¥`	À	ÿZWÿùZ[\â WWJKà
+Bàô]\õÇà^Ÿ\^Ÿ\[€à\»^ŒÇàŸŸŸ\ãô^Ÿ\[€ä¥'¥b4.4,t.¥,RKt.¥/¥/t`t`¥`4`Ù.¥`¥/¥`4,4-4.Ùc»	\»ã\Ÿ\ó⁄Y
+Bà]ÿZ]›]\◊€Y\‹ÿYŸKôY]›^
+à∏ßcè¥(t/¥-Ù-4,4/t.4-H4-Ù,4,¥-t`4b4.4.Ù/¥`tc4/¥b4.4,t.¥/¥.OÿèóóàÇààû⁄[ô\ÿÿ\J€\Y
+^ÀLå
+J_Hãàô\W€X\ö›\ZŸ^Xõÿ\ô
+÷ 	¯´!{Ó#»RKt.¥/¥/t`t`¥`4`Ù.¥`¥/¥`	À	ÿZWÿùZ[\â WWJKà
+Bàô]\õÇàö[ò[NÇà›‹Ÿ]ô[ùúŸ]
+
+Bà]ÿZ][Y\ó›\⁄¬àZWÿùZ[\ó⁄õÿúÀô\ÿÿ\ô
+\Ÿ\ó⁄Y
+BÇàX›[€àH¥/¥,t/t/¥,¥.Ùdt/HàYà^\›[ô»[ŸH¥`t/¥-Ù-4,4/H4.4`Ù`t`¥,4/t/¥,¥.Ù-t/HÇàÿ][Ÿ◊€õ›HHóº'„$4'¥/Ù`Ù,t.Ù.4.¥/¥,¥,4/t/t,4c»4,¥-t`4`t.4c»4`¥,4.¥-¥-H4/¥,t/t/¥,¥.Ù-t/t,ààYàÿ][Ÿ◊›\]Y[ŸHàÇà]ÿZ]›]\◊€Y\‹ÿYŸKôY]›^
+àà∏ß!Hè¥'Ù.Ù,4,Ù.4/HÿX›[€üOÿèóóàÇààº'È%àè¥(t$Ù%t't%t(4&4(4'¥$¥$4't'à4&4&ÿèóàÇààèèû⁄[ô\ÿÿ\JY⁄[ãõò[YJ_Oÿèàû⁄[ô\ÿÿ\JY⁄[ãùô\ú⁄[€ä_WóàÇààû⁄[ô\ÿÿ\J€\Y
+ô]öY]ŸYú›[[X\ûKåå
+J_HÇààûÿÿ][Ÿ◊€õ›_Hãàô\W€X\ö›\ZŸ^Xõÿ\ô
+¬à º'ÈÍH4'¥`¥.¥`4bÙ`¥c4/Ù.Ù,4,Ù.4/HãàúY⁄[ó⁄[ôõŒû‹Y⁄[ãù]ZYHäWKà ∏ß*4(4-t-4,4.¥`¥.4`4/¥,¥,4`¥c4aÙ-t`4-t-»4&4&ãàòZWÿùZ[\óŸY]û‹Y⁄[ãù]ZYHäWKà ∏´!{Ó#»4'4/¥.4/Ù.Ù,4,Ù.4/tb»ãõ^W‹Y⁄[ú»äWKàJKà
+BÇà\ﬁ[ò»Yà⁄›◊‹Y⁄[ú \ôŸ]àY\‹ÿYŸK\Ÿ\ó⁄Yà[ù
+HOàõ€ôNÇàù[ù[YHH]ÿZ]ô\]Z\ôW‹ù[ù[YJ\ôŸ]\Ÿ\ó⁄Y
+BàYàõ›ù[ù[YNÇàô]\õÇàY⁄[ó‹ù[ù[YHHX[òYŸ\ãúY⁄[úÀúù[ù[Y\ÀôŸ]
+\Ÿ\ó⁄Y
+BàY⁄[ú»H\›
+Y⁄[ó‹ù[ù[YKúY⁄[úÀùò[Y\ 
+JHYàY⁄[ó‹ù[ù[YH[ŸH◊Bàõ›‹»H¬à º'ÈÎH4&¥,4`¥,4.Ù/¥,»4/Ù.Ù,4,Ù.4/t/¥,àãúY⁄[óÿÿ][ŸŒåäWKà àº'ÈÍH4'4/¥.4/Ù.Ù,4,Ù.4/tb»
+€[äY⁄[ú _JHãõ^W‹Y⁄[ú»äWKà ∏ß*4(t/¥-Ù-4,4`¥c4/Ù.Ù,4,Ù.4/HãòZWÿùZ[\àäWKà ∏ß•H4%Ù,4,Ù`4`Ù-Ù.4`¥c4/Ù.Ù,4,Ù.4/HãúY⁄[ó›\ÿY›ÿ\õö[ô»äWKà º'‰Êà4%4/¥.¥`Ù/4-t/t`¥,4a¥.4c»ãúY⁄[óŸÿ‹»äWKà ∏´!{Ó#»4'4-t/tcàãõY[ùHäWKàBà]ÿZ]\ôŸ]ò[ú›Ÿ\äàº'ÈÍHè¥'Ù.Ù,4,Ù.4/tb»ù[î^Pÿ\ô[ò[ÿèóàÇàà¥(Ù`t`¥,4/t/¥,¥.Ù-t/t/éàèû€[äY⁄[ú _OÿèóóàÇà¥'¥`¥.¥`4/¥.t`¥-H4/¥,tbt.4.H4.¥,4`¥,4.Ù/¥,À4`t/¥-Ù-4,4.t`¥-H4`4,4`tb4.4`4-t/t.4-H4aÙ-t`4-t-»4&4&4.4.Ù.4-Ù,4,Ù`4`Ù-Ù.4`¥-HÇà¥`t/¥,t`t`¥,¥-t/t/tbÙ.H4/¥-4/t/¥a4,4.t.Ù/¥,¥bÙ.HúKt/Ù.Ù,4,Ù.4/Kàãàô\W€X\ö›\ZŸ^Xõÿ\ô
+õ›‹ Kà
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]HOHúY⁄[ú»äBà\ﬁ[ò»YàY⁄[ú ÿ[òX⁄Œàÿ[òX⁄‘]Y\ûJHOàõ€ôNÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä
+Bà]ÿZ]⁄›◊‹Y⁄[ú ÿ[òX⁄ÀõY\‹ÿYŸKÿ[òX⁄Àôúõ€W›\Ÿ\ãöY
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]HOHòZWÿùZ[\àäBà\ﬁ[ò»YàZWÿùZ[\ó€Y[ùJÿ[òX⁄Œàÿ[òX⁄‘]Y\ûK›]Nàî”P€€ù^
+HOàõ€ôNÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä
+Bà]ÿZ]›]Kò€X\ä
+Bà]ÿZ]⁄›◊ÿZW‹Y⁄[óÿùZ[\äÿ[òX⁄ÀõY\‹ÿYŸKÿ[òX⁄Àôúõ€W›\Ÿ\ãöY
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]HOHòZWÿùZ[\ó‹Ÿ][ô‹»äBà\ﬁ[ò»YàZWÿùZ[\ó‹Ÿ][ô‹ ÿ[òX⁄Œàÿ[òX⁄‘]Y\ûK›]Nàî”P€€ù^
+HOàõ€ôNÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä
+Bà]ÿZ]›]Kò€X\ä
+Bà]ÿZ]⁄›◊ÿZW‹Y⁄[óÿùZ[\ó‹Ÿ][ô‹ ÿ[òX⁄ÀõY\‹ÿYŸKÿ[òX⁄Àôúõ€W›\Ÿ\ãöY
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]Kú›\ù›⁄]
+òZWÿùZ[\ó‹Ÿ]àäJBà\ﬁ[ò»YàZWÿùZ[\ó‹Ÿ][ô◊‹›\ù
+àÿ[òX⁄Œàÿ[òX⁄‘]Y\ûK›]Nàî”P€€ù^à
+HOàõ€ôNÇàöY[Hÿ[òX⁄Àô]Kú‹]
+éàãJVÃWBàõ€\»H¬àòò\ŸHéà
+àRTY⁄[êùZ[\î›]Kò\Wÿò\ŸW›\õà¥'¥`¥/Ù`4,4,¥c4`¥-H»ò\ŸHTì[ùõ‹X»TH4.4.Ù.4`t/¥,¥/4-t`t`¥.4/4/¥,Ù/à4`t-t`4,¥.4`t,óàÇàà¥'¥a4.4a¥.4,4.Ùc4/tbÙ.H4,4-4`4-t`Nà€ŸOû–RW–ïRSTó—QêUS–TW–êT—W’TìOÿ€ŸOàãà
+Kàù⁄Ÿ[àéà
+àRTY⁄[êùZ[\î›]Kò\W›⁄Ÿ[ãà¥'¥`¥/Ù`4,4,¥c4`¥-HTKt`¥/¥.¥-t/H4/¥-4/t.4/4`t/¥/¥,tbt-t/t.4-t/à4(t/¥/¥,tbt-t/t.4-H4,t`Ù-4-t`à4`Ù-4,4.Ù-t/t/ã4,4`¥/¥.¥-t/H4`t/¥at`4,4/tdt/H4-Ù,4b4.4a4`4/¥,¥,4/t/tbÙ/àãà
+Kàõ[Ÿ[éà
+àRTY⁄[êùZ[\î›]Kõ[Ÿ[⁄Yà¥'¥`¥/Ù`4,4,¥c4`¥-H4`¥/¥aÙ/tbÙ.HQ4/4/¥-4-t.Ù.4-4/¥`t`¥`Ù/Ù/t/¥.H4`»4,¥,4b4-t,Ù/àTKt/Ù`4/¥,¥,4.t-4-t`4,àãà
+KàBàõ€\Hõ€\ÀôŸ]
+öY[
+BàYàõ›õ€\Çà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä¥'t-t.4-Ù,¥-t`t`¥/t,4c»4/t,4`t`¥`4/¥.t.¥,ã⁄›◊ÿ[\ùUùYJBàô]\õÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä
+Bà]ÿZ]›]Kò€X\ä
+Bà]ÿZ]›]KúŸ]‹›]Jõ€\ÃJBà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\äàû‹õ€\ÃW_Wó¥%4.Ùc»4/¥`¥/4-t/tbŒàÿÿ[òŸ[äBÇàõ›]\ãõY\‹ÿYŸJRTY⁄[êùZ[\î›]Kò\Wÿò\ŸW›\õãù^
+Bà\ﬁ[ò»YàZWÿùZ[\óÿò\ŸW›\õ›ò[YJY\‹ÿYŸNàY\‹ÿYŸK›]Nàî”P€€ù^
+HOàõ€ôNÇàûNÇàò[YHHò[Y]WÿZWÿùZ[\óÿ\Wÿò\ŸW›\õ
+Y\‹ÿYŸKù^‹ààäBà^Ÿ\ò[YQ\úõ‹à\»^ŒÇà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\äà∏ßc⁄[ô\ÿÿ\J›ä^ J_HäBàô]\õÇà]ÿZ]ãúŸ]‹Y⁄[óÿùZ[\ó‹Ÿ][ô Y\‹ÿYŸKôúõ€W›\Ÿ\ãöYò\Wÿò\ŸW›\õãò[YJBà]ÿZ]›]Kò€X\ä
+Bà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\ä∏ß!Hò\ŸHTì4`t/¥at`4,4/tdt/KàäBà]ÿZ]⁄›◊ÿZW‹Y⁄[óÿùZ[\ó‹Ÿ][ô‹ Y\‹ÿYŸKY\‹ÿYŸKôúõ€W›\Ÿ\ãöY
+BÇàõ›]\ãõY\‹ÿYŸJRTY⁄[êùZ[\î›]Kò\W›⁄Ÿ[ããù^
+Bà\ﬁ[ò»YàZWÿùZ[\óÿ\W›⁄Ÿ[ó›ò[YJY\‹ÿYŸNàY\‹ÿYŸK›]Nàî”P€€ù^
+HOàõ€ôNÇà⁄Ÿ[àH
+Y\‹ÿYŸKù^‹ààäKú›ö\
+
+BàûNÇà]ÿZ]Y\‹ÿYŸKô[]J
+Bà^Ÿ\^Ÿ\[€éÇàŸŸŸ\ãùÿ\õö[ô ¥'t-H4`Ù-4,4.Ù/¥`tc4`Ù-4,4.Ù.4`¥c4`t/¥/¥,tbt-t/t.4-H4`HTKt`¥/¥.¥-t/t/¥/ã^◊⁄[ôõœUùYJBàYàõ›H[ä⁄Ÿ[äHHLÇà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\ä∏ßcTKt`¥/¥.¥-t/H4-4/¥.Ù-¥-t/H4`t/¥-4-t`4-¥,4`¥c4/¥`à4-4/àL4`t.4/4,¥/¥.Ù/¥,ãàäBàô]\õÇà]ÿZ]ãúŸ]‹Y⁄[óÿùZ[\ó‹Ÿ][ô àY\‹ÿYŸKôúõ€W›\Ÿ\ãöYò\W›⁄Ÿ[óŸ[ò»ãŸX‹ô]Àô[ò‹û\
+⁄Ÿ[äBà
+Bà]ÿZ]›]Kò€X\ä
+Bà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\ä∏ß!HTKt`¥/¥.¥-t/H4`t/¥at`4,4/tdt/H4,à4-Ù,4b4.4a4`4/¥,¥,4/t/t/¥/4,¥.4-4-KàäBà]ÿZ]⁄›◊ÿZW‹Y⁄[óÿùZ[\ó‹Ÿ][ô‹ Y\‹ÿYŸKY\‹ÿYŸKôúõ€W›\Ÿ\ãöY
+BÇàõ›]\ãõY\‹ÿYŸJRTY⁄[êùZ[\î›]Kõ[Ÿ[⁄Yãù^
+Bà\ﬁ[ò»YàZWÿùZ[\ó€[Ÿ[›ò[YJY\‹ÿYŸNàY\‹ÿYŸK›]Nàî”P€€ù^
+HOàõ€ôNÇàûNÇàò[YHHò[Y]WÿZWÿùZ[\ó€[Ÿ[⁄Y
+Y\‹ÿYŸKù^‹ààäBà^Ÿ\ò[YQ\úõ‹à\»^ŒÇà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\äà∏ßc⁄[ô\ÿÿ\J›ä^ J_HäBàô]\õÇà]ÿZ]ãúŸ]‹Y⁄[óÿùZ[\ó‹Ÿ][ô Y\‹ÿYŸKôúõ€W›\Ÿ\ãöYõ[Ÿ[⁄Yãò[YJBà]ÿZ]›]Kò€X\ä
+Bà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\ä∏ß!HQ4/4/¥-4-t.Ù.4`t/¥at`4,4/tdt/KàäBà]ÿZ]⁄›◊ÿZW‹Y⁄[óÿùZ[\ó‹Ÿ][ô‹ Y\‹ÿYŸKY\‹ÿYŸKôúõ€W›\Ÿ\ãöY
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]HOHòZWÿùZ[\óÿ‹ôX]HäBà\ﬁ[ò»YàZWÿùZ[\óÿ‹ôX]Jÿ[òX⁄Œàÿ[òX⁄‘]Y\ûK›]Nàî”P€€ù^
+HOàõ€ôNÇàYàÿ[òX⁄Àôúõ€W›\Ÿ\ãöY[àZWÿùZ[\ó⁄õÿúŒÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä¥'Ù`4-t-4bÙ-4`Ùbt,4c»4-Ù,4-4,4aÙ,4-tbtdH4,¥bÙ/Ù/¥.Ù/tcÙ-t`¥`tc»ã⁄›◊ÿ[\ùUùYJBàô]\õÇàŸ][ô‹»H]ÿZ]ãôŸ]‹Y⁄[óÿùZ[\ó‹Ÿ][ô‹ ÿ[òX⁄Àôúõ€W›\Ÿ\ãöY
+BàYàõ›Ÿ][ô‹÷»ò\W›⁄Ÿ[óŸ[ò»óH‹àõ›Ÿ][ô‹÷»õ[Ÿ[⁄YóNÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä¥(t/t,4aÙ,4.Ù,4-Ù,4/Ù/¥.Ù/t.4`¥-H4/t,4`t`¥`4/¥.t.¥.THã⁄›◊ÿ[\ùUùYJBà]ÿZ]⁄›◊ÿZW‹Y⁄[óÿùZ[\ó‹Ÿ][ô‹ ÿ[òX⁄ÀõY\‹ÿYŸKÿ[òX⁄Àôúõ€W›\Ÿ\ãöY
+Bàô]\õÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä
+Bà]ÿZ]›]Kò€X\ä
+Bà]ÿZ]›]KúŸ]‹›]JRTY⁄[êùZ[\î›]Kúô\]Y\›
+Bà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\äà∏ß*è¥'t/¥,¥bÙ.HRKt/Ù.Ù,4,Ù.4/OÿèóóàÇà¥'Ù/¥-4`4/¥,t/t/à4/¥/Ù.4b4.4`¥-K4aÙ`¥/à4/¥/H4-4/¥.Ù-¥-t/H4-4-t.Ù,4`¥cà4`t/¥,tbÙ`¥.4c»ù[î^K4.¥/¥/4,4/t-4bÀ4/t,4`t`¥`4/¥.t.¥.4,¥/t-tb4/t.4-HTKÇà¥`t/¥/¥,tbt-t/t.4c»4/Ù/¥.¥`Ù/Ù,4`¥-t.Ùcà4.4/Ù/¥,¥-t-4-t/t.4-H4/Ù`4.4/¥b4.4,t.¥,4aKà4'Ù/¥`t.Ù-H4/¥`¥/Ù`4,4,¥.¥.4/t,4aÙ/t`Ù`¥`tc»4-4,¥,4ct`¥,4/Ù,4`t/¥-Ù-4,4/t.4cÀóóàÇà¥%4.Ùc»4/¥`¥/4-t/tbŒàÿÿ[òŸ[Çà
+BÇàõ›]\ãõY\‹ÿYŸJRTY⁄[êùZ[\î›]Kúô\]Y\›ãù^
+Bà\ﬁ[ò»YàZWÿùZ[\óÿ‹ôX]W‹ô\]Y\›
+Y\‹ÿYŸNàY\‹ÿYŸK›]Nàî”P€€ù^
+HOàõ€ôNÇàûNÇàô\]Y\›Hò[Y]W‹Y⁄[ó‹ô\]Y\›
+Y\‹ÿYŸKù^‹ààäBà^Ÿ\ò[YQ\úõ‹à\»^ŒÇà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\äà∏ßc⁄[ô\ÿÿ\J›ä^ J_HäBàô]\õÇà]ÿZ]›]Kò€X\ä
+Bà]ÿZ]ù[óÿZW‹Y⁄[óŸŸ[ô\ò][€äY\‹ÿYŸKô\]Y\›
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]Kú›\ù›⁄]
+òZWÿùZ[\óŸY]àäJBà\ﬁ[ò»YàZWÿùZ[\óŸY]
+ÿ[òX⁄Œàÿ[òX⁄‘]Y\ûK›]Nàî”P€€ù^
+HOàõ€ôNÇà]ZYHÿ[òX⁄Àô]Kú‹]
+éàãJVÃWBàõ›»H]ÿZ]ãôŸ]‹Y⁄[äÿ[òX⁄Àôúõ€W›\Ÿ\ãöY]ZY
+BàYàõ›õ›»‹àõ›õ›÷»òZWŸŸ[ô\ò]YóNÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä¥+t`¥/à4/t-HRKt/Ù.Ù,4,Ù.4/Hã⁄›◊ÿ[\ùUùYJBàô]\õÇàYàÿ[òX⁄Àôúõ€W›\Ÿ\ãöY[àZWÿùZ[\ó⁄õÿúŒÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä¥'Ù`4-t-4bÙ-4`Ùbt,4c»4-Ù,4-4,4aÙ,4-tbtdH4,¥bÙ/Ù/¥.Ù/tcÙ-t`¥`tc»ã⁄›◊ÿ[\ùUùYJBàô]\õÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä
+Bà]ÿZ]›]Kò€X\ä
+Bà]ÿZ]›]KúŸ]‹›]JRTY⁄[êùZ[\î›]KôY]‹ô\]Y\›
+Bà]ÿZ]›]Kù\]WŸ]JZWÿùZ[\óŸY]›]ZY]]ZY
+Bà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\äàà∏ß*è¥(4-t-4,4.¥`¥.4`4/¥,¥,4/t.4-H⁄[ô\ÿÿ\Jõ›÷…€ò[YI◊J_OÿèóóàÇà¥'¥/Ù.4b4.4`¥-K4aÙ`¥/à4.4`t/Ù`4,4,¥.4`¥c4.4.Ù.4-4/¥,t,4,¥.4`¥cà4'4/¥-4-t.Ùc4/Ù/¥.Ù`ÙaÙ.4`à4`¥-t.¥`Ùbt.4.H4.4`tat/¥-4/t.4.à4.4-4/¥.¥`Ù/4-t/t`¥,4a¥.4cãÇà¥`t/¥at`4,4/t.4`àURQ4`Ù,¥-t.Ù.4aÙ.4`à4,¥-t`4`t.4cà4.4/Ù/¥`t.Ù-H4/Ù`4/¥,¥-t`4.¥.4-Ù,4/4-t/t.4`à4`Ù`t`¥,4/t/¥,¥.Ù-t/t/tbÙ.H4/Ù.Ù,4,Ù.4/KàÇà¥(4-t-4,4.¥`¥.4`4/¥,¥,4`¥c4/4/¥-¥/t/à4/t-t/¥,Ù`4,4/t.4aÙ-t/t/t/¥-H4aÙ.4`t.Ù/à4`4,4-ÀóóàÇà¥%4.Ùc»4/¥`¥/4-t/tbŒàÿÿ[òŸ[Çà
+BÇàõ›]\ãõY\‹ÿYŸJRTY⁄[êùZ[\î›]KôY]‹ô\]Y\›ãù^
+Bà\ﬁ[ò»YàZWÿùZ[\óŸY]‹ô\]Y\›
+Y\‹ÿYŸNàY\‹ÿYŸK›]Nàî”P€€ù^
+HOàõ€ôNÇàûNÇàô\]Y\›Hò[Y]W‹Y⁄[ó‹ô\]Y\›
+Y\‹ÿYŸKù^‹ààäBà^Ÿ\ò[YQ\úõ‹à\»^ŒÇà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\äà∏ßc⁄[ô\ÿÿ\J›ä^ J_HäBàô]\õÇà]ZYH
+]ÿZ]›]KôŸ]Ÿ]J
+JKôŸ]
+òZWÿùZ[\óŸY]›]ZYäBà]ÿZ]›]Kò€X\ä
+BàYàõ›]ZYÇà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\ä∏ßc4(t-t`t`t.4c»4`4-t-4,4.¥`¥.4`4/¥,¥,4/t.4c»4.4`t`¥-t.¥.Ù,àäBàô]\õÇà]ÿZ]ù[óÿZW‹Y⁄[óŸŸ[ô\ò][€äY\‹ÿYŸKô\]Y\›Y]›]ZY\›ä]ZY
+JBÇà\ﬁ[ò»Yà⁄›◊€^W‹Y⁄[ú \ôŸ]àY\‹ÿYŸK\Ÿ\ó⁄Yà[ù
+HOàõ€ôNÇàYàõ›]ÿZ]ô\]Z\ôW‹ù[ù[YJ\ôŸ]\Ÿ\ó⁄Y
+NÇàô]\õÇàY⁄[ó‹ù[ù[YHHX[òYŸ\ãúY⁄[úÀúù[ù[Y\ÀôŸ]
+\Ÿ\ó⁄Y
+BàY⁄[ú»H\›
+Y⁄[ó‹ù[ù[YKúY⁄[úÀùò[Y\ 
+JHYàY⁄[ó‹ù[ù[YH[ŸH◊Bà›‹ôY‹Y⁄[ú»H¬à›äõ›÷»ù]ZYóJNàõ›»õ‹àõ›»[à]ÿZ]ãõ\›‹Y⁄[ú \Ÿ\ó⁄Y
+BàBàõ›‹»H¬à ààû…¯ß!I»YàY⁄[ãô[òXõY[ŸH	¯ßc	ﬂHÇààû…¸'È%à	»Yà›‹ôY‹Y⁄[úÀôŸ]
+Y⁄[ãù]ZY
+H[ô›‹ôY‹Y⁄[ú÷‹Y⁄[ãù]ZYV…ÿZWŸŸ[ô\ò]Y	◊H[ŸH	…ﬂHÇààûÿ€\Y
+Y⁄[ãõò[YKçJ_Hûÿ€\Y
+Y⁄[ãùô\ú⁄[€ãL
+_HãààúY⁄[ó⁄[ôõŒû‹Y⁄[ãù]ZYHãà
+WBàõ‹àY⁄[à[àY⁄[ú¬àBàõ›‹Àò\[ô
+ ∏´!{Ó#»4'Ù.Ù,4,Ù.4/tb»ãúY⁄[ú»äWJBà^H
+àº'ÈÍHè¥'4/¥.4/Ù.Ù,4,Ù.4/tbœÿèóóàÇà¥'t,4-¥/4.4`¥-H4/t,4/Ù.Ù,4,Ù.4/K4aÙ`¥/¥,tb»4/¥`¥.¥`4bÙ`¥c4/t,4`t`¥`4/¥.t.¥.4,¥bÙ.¥.Ùc¥aÙ.4`¥c4.4.Ù.4`Ù-4,4.Ù.4`¥c4-t,Ù/ãóàÇàº'È%à8†%4`t/¥-Ù-4,4/HRKt.¥/¥/t`t`¥`4`Ù.¥`¥/¥`4/¥/àÇàYàY⁄[ú¬à[ŸHº'ÈÍHè¥'4/¥.4/Ù.Ù,4,Ù.4/tbœÿèóó¥'Ù/¥.¥,4/t.4aÙ-t,Ù/à4/t-H4`Ù`t`¥,4/t/¥,¥.Ù-t/t/ãàÇà
+Bà]ÿZ]\ôŸ]ò[ú›Ÿ\ä^ô\W€X\ö›\ZŸ^Xõÿ\ô
+õ›‹ JBÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]HOHõ^W‹Y⁄[ú»äBà\ﬁ[ò»Yà^W‹Y⁄[ú ÿ[òX⁄Œàÿ[òX⁄‘]Y\ûJHOàõ€ôNÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä
+Bà]ÿZ]⁄›◊€^W‹Y⁄[ú ÿ[òX⁄ÀõY\‹ÿYŸKÿ[òX⁄Àôúõ€W›\Ÿ\ãöY
+BÇà\ﬁ[ò»Yà⁄›◊‹Y⁄[óÿÿ][Ÿ \ôŸ]àY\‹ÿYŸK\Ÿ\ó⁄Yà[ùYŸNà[ùH
+HOàõ€ôNÇàYàõ›]ÿZ]ô\]Z\ôW‹ù[ù[YJ\ôŸ]\Ÿ\ó⁄Y
+NÇàô]\õÇàYŸHHX^
+YŸJBàÿ][ŸÀ›[H]ÿZ]ãõ\›ÿÿ][Ÿ◊‹Y⁄[ú àQ“Só––US—◊‘Q—W‘“VëKàYŸH
+àQ“Só––US—◊‘Q—W‘“VëKà
+Bà›[‹YŸ\»HX^
+K
+›[
+»Q“Só––US—◊‘Q—W‘“VëHHJHÀ»Q“Só––US—◊‘Q—W‘“VëJBàYàYŸHèH›[‹YŸ\ŒÇàYŸHH›[‹YŸ\»HBàÿ][ŸÀ›[H]ÿZ]ãõ\›ÿÿ][Ÿ◊‹Y⁄[ú àQ“Só––US—◊‘Q—W‘“VëKàYŸH
+àQ“Só––US—◊‘Q—W‘“VëKà
+BàY⁄[ó‹ù[ù[YHHX[òYŸ\ãúY⁄[úÀúù[ù[Y\ÀôŸ]
+\Ÿ\ó⁄Y
+Bà[ú›[YHŸ]
+Y⁄[ó‹ù[ù[YKúY⁄[ú HYàY⁄[ó‹ù[ù[YH[ŸHŸ]
+
+Bàõ›‹»H¬à à
+ààû…¯ß!I»YàY⁄[ñ…›]ZY	◊H[à[ú›[Y[ŸH
+	¸'ÊËI»YàY⁄[ñ…⁄\◊€ŸôöX⁄X[	◊H[ŸH
+	¸'È%â»YàY⁄[ñ…ÿZWŸŸ[ô\ò]Y	◊H[ŸH	¸'ÈÍI J_HÇààûÿ€\Y
+Y⁄[ñ…€ò[YI◊Kç _Hûÿ€\Y
+Y⁄[ñ…›ô\ú⁄[€â◊K
+_HÇà
+Kààòÿ][Ÿ◊›öY]Œû‹Y⁄[ñ…›]ZY	◊_Nû‹YŸ_Hãà
+WBàõ‹àY⁄[à[àÿ][Ÿ¬àBàò]öYÿ][€àH◊BàYàYŸHàÇàò]öYÿ][€ãò\[ô
+
+∏•‡;Ó#»ãàúY⁄[óÿÿ][ŸŒû‹YŸHH_HäJBàYàYŸH
+»H›[‹YŸ\ŒÇàò]öYÿ][€ãò\[ô
+
+∏•≠ªÓ#»ãàúY⁄[óÿÿ][ŸŒû‹YŸH
+»_HäJBàYàò]öYÿ][€éÇàõ›‹Àò\[ô
+ò]öYÿ][€äBàõ›‹Àò\[ô
+ ∏´!{Ó#»4'Ù.Ù,4,Ù.4/tb»ãúY⁄[ú»äWJBà]ÿZ]\ôŸ]ò[ú›Ÿ\äàº'ÈÎHè¥&¥,4`¥,4.Ù/¥,»4/Ù.Ù,4,Ù.4/t/¥,èÿèóóàÇàà¥'¥/Ù`Ù,t.Ù.4.¥/¥,¥,4/t/éàèû››[Oÿèà0≠»4`t`¥`4,4/t.4a¥,èû‹YŸH
+»_Kﬁ››[‹YŸ\ﬂOÿèóàÇàº'ÊËH8†%4/¥a4.4a¥.4,4.Ùc4/tbÙ.H0≠»<'ÈÍH8†%4/¥`à4`t/¥/¥,tbt-t`t`¥,¥,0≠»<'È%à8†%4`t,Ù-t/t-t`4.4`4/¥,¥,4/H4&4&0≠»8ß!H8†%4`Ù-¥-H4`Ù`t`¥,4/t/¥,¥.Ù-t/KóóàÇà¥)Ù`¥/¥,tb»4/¥/Ù`Ù,t.Ù.4.¥/¥,¥,4`¥c4`t,¥/¥.H4/Ù.Ù,4,Ù.4/K4/¥`¥.¥`4/¥.t`¥-H4-t,Ù/à4,à4`4,4-Ù-4-t.Ù-H0™Ù'4/¥.4/Ù.Ù,4,Ù.4/tbÆÀàÇà∏¶®;Ó#»4&¥,4`¥,4.Ù/¥,»4/t-H4/4/¥-4-t`4.4`4`Ù-t`¥`tcŒà4.4-Ù`ÙaÙ,4.t`¥-H4/¥/Ù.4`t,4/t.4-H4.4`t.¥,4aÙ.4,¥,4.t`¥-H4.4`tat/¥-4/t.4.à4/Ù-t`4-t-4`Ù`t`¥,4/t/¥,¥.¥/¥.Kàãàô\W€X\ö›\ZŸ^Xõÿ\ô
+õ›‹ Kà
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]Kú›\ù›⁄]
+úY⁄[óÿÿ][ŸŒàäJBà\ﬁ[ò»YàY⁄[óÿÿ][Ÿ ÿ[òX⁄Œàÿ[òX⁄‘]Y\ûJHOàõ€ôNÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä
+BàûNÇàYŸHH[ù
+ÿ[òX⁄Àô]Kúú‹]
+éàãJVÃWJBà^Ÿ\ò[YQ\úõ‹éÇàYŸHHà]ÿZ]⁄›◊‹Y⁄[óÿÿ][Ÿ ÿ[òX⁄ÀõY\‹ÿYŸKÿ[òX⁄Àôúõ€W›\Ÿ\ãöYYŸJBÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]HOHúôXYW‹Y⁄[ú»äBà\ﬁ[ò»YàYÿXﬁW‹ôXYW‹Y⁄[ú ÿ[òX⁄Œàÿ[òX⁄‘]Y\ûJHOàõ€ôNÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä
+Bà]ÿZ]⁄›◊‹Y⁄[óÿÿ][Ÿ ÿ[òX⁄ÀõY\‹ÿYŸKÿ[òX⁄Àôúõ€W›\Ÿ\ãöY
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]Kú›\ù›⁄]
+òÿ][Ÿ◊›öY]ŒàäJBà\ﬁ[ò»Yàÿ][Ÿ◊‹Y⁄[óŸ]Z[ ÿ[òX⁄Œàÿ[òX⁄‘]Y\ûJHOàõ€ôNÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä
+BàÀ]ZYò]◊‹YŸHHÿ[òX⁄Àô]Kú‹]
+éàãäBà][HH]ÿZ]ãôŸ]ÿÿ][Ÿ◊‹Y⁄[ä]ZY
+BàYàõ›][NÇà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\ä¥'Ù`Ù,t.Ù.4.¥,4a¥.4c»4`Ù-4,4.Ù-t/t,4.4-»4.¥,4`¥,4.Ù/¥,Ù,àäBàô]\õÇàûNÇàYŸHHX^
+[ù
+ò]◊‹YŸJJBà^Ÿ\ò[YQ\úõ‹éÇàYŸHHà[ú›[YHõ€€
+àX[òYŸ\ãúY⁄[úÀúù[ù[Y\ÀôŸ]
+ÿ[òX⁄Àôúõ€W›\Ÿ\ãöY
+Bà[ô]ZY[àX[òYŸ\ãúY⁄[úÀúù[ù[Y\÷ÿÿ[òX⁄Àôúõ€W›\Ÿ\ãöYKúY⁄[ú¬à
+Bàõ›‹»H◊BàYà[ú›[YÇàõ›‹Àò\[ô
+ º'ÈÍH4'¥`¥.¥`4bÙ`¥c4`Ù`t`¥,4/t/¥,¥.Ù-t/t/tbÙ.HãàúY⁄[ó⁄[ôõŒû›]ZYHäWJBà[ŸNÇàõ›‹Àò\[ô
+ ∏´!˚Ó#»4(Ù`t`¥,4/t/¥,¥.4`¥cãàòÿ][Ÿ◊⁄[ú›[ÿ\⁄Œû›]ZYHäWJBàõ›‹Àò\[ô
+ º'‰ÈH4(t.¥,4aÙ,4`¥c4.4`tat/¥-4/t.4.àãàòÿ][Ÿ◊‹€›\òŸNû›]ZYHäWJBàõ›‹Àò\[ô
+ ∏´!{Ó#»4&¥,4`¥,4.Ù/¥,»ãàúY⁄[óÿÿ][ŸŒû‹YŸ_HäWJBàòYŸHH
+àº'ÊËHè¥'¥a4.4a¥.4,4.Ùc4/tbÙ.H4/Ù.Ù,4,Ù.4/OÿèàÇàYà][V»ö\◊€ŸôöX⁄X[óBà[ŸH
+àº'È%àè¥(t$Ù%t't%t(4&4(4'¥$¥$4't'à4&4&ÿèóº'ÈÍH4'Ù.Ù,4,Ù.4/H4`t/¥/¥,tbt-t`t`¥,¥,ÇàYà][V»òZWŸŸ[ô\ò]YóBà[ŸHº'ÈÍH4'Ù.Ù,4,Ù.4/H4`t/¥/¥,tbt-t`t`¥,¥,Çà
+Bà
+Bà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\äààûÿòYŸ_WàÇààèèû⁄[ô\ÿÿ\J€\Y
+][V…€ò[YI◊KL
+J_OÿèàÇààùû⁄[ô\ÿÿ\J€\Y
+][V…›ô\ú⁄[€â◊KÃ
+J_WàÇààèOû⁄[ô\ÿÿ\J€\Y
+][V…‹⁄‹ùŸ\ÿ‹ö\[€â◊KL
+J_O⁄OóóàÇààû⁄[ô\ÿÿ\J][V…Ÿ\ÿ‹ö\[€â◊J_WóàÇàà¥'¥/Ù`Ù,t.Ù.4.¥/¥,¥,4.Œàèû⁄[ô\ÿÿ\J€\Y
+][V…‹Xõ\⁄\ó€ò[YI◊KL
+J_OÿèóàÇàà¥$4,¥`¥/¥`4,à4a4,4.t.Ù-Nà⁄[ô\ÿÿ\J€\Y
+][V…ÿ‹ôY]…◊Kå
+J_WàÇàà¥(Ù`t`¥,4/t/¥,¥/¥.à4.4-»4.¥,4`¥,4.Ù/¥,Ù,àèû⁄][V…⁄[ú›[ÿ€›[ù	◊_OÿèóàÇààïURQà€ŸOû⁄][V…›]ZY	◊_Oÿ€ŸOóàÇàà¥(t/¥`t`¥/¥cÙ/t.4-Nà…¯ß!H4`Ù`t`¥,4/t/¥,¥.Ù-t/I»Yà[ú›[Y[ŸH	Ù/t-H4`Ù`t`¥,4/t/¥,¥.Ù-t/IﬂHãàô\W€X\ö›\ZŸ^Xõÿ\ô
+õ›‹ Kà
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]Kú›\ù›⁄]
+òÿ][Ÿ◊‹€›\òŸNàäJBà\ﬁ[ò»Yàÿ][Ÿ◊‹Y⁄[ó‹€›\òŸJÿ[òX⁄Œàÿ[òX⁄‘]Y\ûJHOàõ€ôNÇà]ZYHÿ[òX⁄Àô]Kú‹]
+éàãJVÃWBà][HH]ÿZ]ãôŸ]ÿÿ][Ÿ◊‹Y⁄[ä]ZY
+BàYàõ›][NÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä¥'Ù`Ù,t.Ù.4.¥,4a¥.4c»4`Ù-4,4.Ù-t/t,ã⁄›◊ÿ[\ùUùYJBàô]\õÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä¥$Ù/¥`¥/¥,¥.Ùcà4.4`tat/¥-4/t.4.∏†)àäBà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\óŸÿ›[Y[ù
+àùYôô\ôY[ú]ö[J][V»ú€›\òŸHóKô[ò€ŸJù]ãNäKö[[ò[YOZ][V»ôö[[ò[YHóJKàÿ\[€èJààº'‰·4&4`tat/¥-4/t.4.àèû⁄[ô\ÿÿ\J][V…€ò[YI◊J_Oÿèàû⁄[ô\ÿÿ\J][V…›ô\ú⁄[€â◊J_KóàÇà
+»
+º'È%àè¥(t$Ù%t't%t(4&4(4'¥$¥$4't'à4&4&ÿèóààYà][V»òZWŸŸ[ô\ò]YóH[ŸHàäBà
+»¥'Ù`4/¥,¥-t`4c4`¥-H4.¥/¥-4/Ù-t`4-t-4`Ù`t`¥,4/t/¥,¥.¥/¥.Nà4/Ù.Ù,4,Ù.4/tb»4,¥bÙ/Ù/¥.Ù/tcÙc¥`¥`tc»4`H4/Ù`4,4,¥,4/4.4/Ù`4/¥a¥-t`t`t,4,t/¥`¥,àÇà
+Kà
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]Kú›\ù›⁄]
+òÿ][Ÿ◊⁄[ú›[ÿ\⁄ŒàäJBà\ﬁ[ò»Yàÿ][Ÿ◊‹Y⁄[ó⁄[ú›[ÿ\⁄ ÿ[òX⁄Œàÿ[òX⁄‘]Y\ûJHOàõ€ôNÇà]ZYHÿ[òX⁄Àô]Kú‹]
+éàãJVÃWBà][HH]ÿZ]ãôŸ]ÿÿ][Ÿ◊‹Y⁄[ä]ZY
+BàYàõ›][NÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä¥'Ù`Ù,t.Ù.4.¥,4a¥.4c»4`Ù-4,4.Ù-t/t,ã⁄›◊ÿ[\ùUùYJBàô]\õÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä
+Bà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\äàà∏¶®;Ó#»è¥(Ù`t`¥,4/t/¥,¥.4`¥c⁄[ô\ÿÿ\J][V…€ò[YI◊J_OœÿèóóàÇà¥'Ù.Ù,4,Ù.4/H4/Ù/¥.Ù`ÙaÙ.4`à4-4/¥`t`¥`Ù/»4.àù[î^Kt,4.¥.¥,4`Ù/t`¥`À€€[ó⁄Ÿ^K4`t-t`¥.4/Ù-t`4-t/4-t/t/tbÙ/4/¥.¥`4`Ù-¥-t/t.4c»Çà¥.4,¥/¥-Ù/4/¥-¥/t/¥`t`¥cÙ/4/Ù`4/¥a¥-t`t`t,4,t/¥`¥,à4'Ù/¥`t.Ù-H4/¥`¥-4-t.Ùc4/t/¥.H4,4,¥`¥/¥`4.4-Ù,4a¥.4.[]€ãt/Ù.Ù,4,Ù.4/H4`t/4/¥-¥-t`àÇà¥/Ù/¥.Ù/t/¥`t`¥c4cà4`Ù/Ù`4,4,¥.ÙcÙ`¥c4/Ù/¥-4.¥.Ùc¥aÙdt/t/tbÙ/[Y‹ò[Kt,4.¥.¥,4`Ù/t`¥/¥/à4&¥,4`¥,4.Ù/¥,»4/t-H4,Ù,4`4,4/t`¥.4`4`Ù-t`à4,t-t-Ù/¥/Ù,4`t/t/¥`t`¥c4.¥/¥-4,àãàô\W€X\ö›\ZŸ^Xõÿ\ô
+¬à º'‰ÈH4(t.¥,4aÙ,4`¥c4.4/Ù`4/¥,¥-t`4.4`¥cãàòÿ][Ÿ◊‹€›\òŸNû›]ZYHäWKà ¥+»4-4/¥,¥-t`4cÙcà8†%4`Ù`t`¥,4/t/¥,¥.4`¥cãàòÿ][Ÿ◊⁄[ú›[ŸŒû›]ZYHäWKà ¥'¥`¥/4-t/t,ãàòÿ][Ÿ◊›öY]Œû›]ZYNåäWKàJKà
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]Kú›\ù›⁄]
+òÿ][Ÿ◊⁄[ú›[ŸŒàäJBà\ﬁ[ò»Yàÿ][Ÿ◊‹Y⁄[ó⁄[ú›[
+ÿ[òX⁄Œàÿ[òX⁄‘]Y\ûJHOàõ€ôNÇà]ZYHÿ[òX⁄Àô]Kú‹]
+éàãJVÃWBà][HH]ÿZ]ãôŸ]ÿÿ][Ÿ◊‹Y⁄[ä]ZY
+Bàù[ù[YHH]ÿZ]ô\]Z\ôW‹ù[ù[YJÿ[òX⁄ÀõY\‹ÿYŸKÿ[òX⁄Àôúõ€W›\Ÿ\ãöY
+BàYàõ›][H‹àõ›ù[ù[YNÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä¥'Ù.Ù,4,Ù.4/H4/t-t-4/¥`t`¥`Ù/Ù-t/Hã⁄›◊ÿ[\ùUùYJBàô]\õÇàYàX[òYŸ\ãúY⁄[úÀúù[ù[Y\ÀôŸ]
+ÿ[òX⁄Àôúõ€W›\Ÿ\ãöY
+H[ô]ZY[àX[òYŸ\ãúY⁄[úÀúù[ù[Y\÷¬àÿ[òX⁄Àôúõ€W›\Ÿ\ãöYàKúY⁄[úŒÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä¥'Ù.Ù,4,Ù.4/H4`Ù-¥-H4`Ù`t`¥,4/t/¥,¥.Ù-t/Hã⁄›◊ÿ[\ùUùYJBàô]\õÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä¥(Ù`t`¥,4/t,4,¥.Ù.4,¥,4c∏†)àäBàûNÇà[ú›[Y‹Y⁄[àH]ÿZ]X[òYŸ\ãúY⁄[úÀö[ú›[
+àÿ[òX⁄Àôúõ€W›\Ÿ\ãöYà][V»ôö[[ò[YHóKà][V»ú€›\òŸHóKàù[ù[YKà
+BàYà][V»òZWŸŸ[ô\ò]YóNÇà]ÿZ]ãõX\ö◊‹Y⁄[óÿZWŸŸ[ô\ò]Y
+àÿ[òX⁄Àôúõ€W›\Ÿ\ãöYà[ú›[Y‹Y⁄[ãù]ZYà¥(Ù`t`¥,4/t/¥,¥.Ù-t/H4.4-»4/¥,tbt-t,Ù/à4.¥,4`¥,4.Ù/¥,Ù,ãàà¥&¥/¥/Ù.4c»RKt/Ù.Ù,4,Ù.4/t,4,4,¥`¥/¥`4,⁄][V…‹Xõ\⁄\ó€ò[YI◊_Hãà
+Bà^Ÿ\^Ÿ\[€à\»^ŒÇàŸŸŸ\ãô^Ÿ\[€ä¥'t-H4`Ù-4,4.Ù/¥`tc4`Ù`t`¥,4/t/¥,¥.4`¥c4/Ù.Ù,4,Ù.4/H4.4-»4.¥,4`¥,4.Ù/¥,Ù,	\»ã]ZY
+Bà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\äàà∏ßc4(Ù`t`¥,4/t/¥,¥.¥,4/t-H4,¥bÙ/Ù/¥.Ù/t-t/t,à⁄[ô\ÿÿ\J€\Y
+^Àå
+J_HÇà
+Bàô]\õÇà]ÿZ]ãö[ò‹ô[Y[ùÿÿ][Ÿ◊⁄[ú›[
+]ZY
+Bà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\äàà∏ß!Hèû⁄[ô\ÿÿ\J][V…€ò[YI◊J_Oÿèà4`Ù`t`¥,4/t/¥,¥.Ù-t/H4.4-»4.¥,4`¥,4.Ù/¥,Ù,àãàô\W€X\ö›\ZŸ^Xõÿ\ô
+¬à º'ÈÍH4'¥`¥.¥`4bÙ`¥c4/Ù.Ù,4,Ù.4/HãàúY⁄[ó⁄[ôõŒû›]ZYHäWKà ∏´!{Ó#»4&¥,4`¥,4.Ù/¥,»ãúY⁄[óÿÿ][ŸŒåäWKàJKà
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]HOHúY⁄[óŸÿ‹»äBà\ﬁ[ò»YàY⁄[óŸÿ‹ ÿ[òX⁄Œàÿ[òX⁄‘]Y\ûJHOàõ€ôNÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä
+Bà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\äàº'‰Êàè¥%4/¥.¥`Ù/4-t/t`¥,4a¥.4c»4/Ù/à4/Ù.Ù,4,Ù.4/t,4/ÿèóóàÇà¥%Ù-4-t`tc4/¥/Ù.4`t,4/tb»4`Ù`t`¥,4/t/¥,¥.¥,4/Ù/¥.Ù/tbÙ.H4.¥/¥/t`¥`4,4.¥`à4a4,4.t.Ù,4`t/¥,tbÙ`¥.4cÀ[Y‹ò[Kt.4/t`¥-t`4a4-t.t`H4.4/¥,Ù`4,4/t.4aÙ-t/t.4cÀàÇà¥'t,4aÙ/t.4`¥-H4`H4`4,4-Ù-4-t.Ù,0™Ù$tbÙ`t`¥`4bÙ.H4`t`¥,4`4`∞ÆÀ4-t`t.Ù.4`t/¥-Ù-4,4dt`¥-H4/Ù-t`4,¥bÙ.H4/Ù.Ù,4,Ù.4/Kàãàô\W€X\ö›\R[õ[ôRŸ^Xõÿ\ôX\ö›\
+[õ[ôW⁄Ÿ^Xõÿ\ôV¬à¬à[õ[ôRŸ^Xõÿ\ôù]€ä^Hº'Ê†4$tbÙ`t`¥`4bÙ.H4`t`¥,4`4`àãÿ[òX⁄◊Ÿ]OHúY⁄[óŸÿ‹Œú›\ùäKà[õ[ôRŸ^Xõÿ\ôù]€ä^Hº'ÈÏH4(t`¥`4`Ù.¥`¥`Ù`4,ãÿ[òX⁄◊Ÿ]OHúY⁄[óŸÿ‹Œú›ùX›\ôHäKàKà“[õ[ôRŸ^Xõÿ\ôù]€ä^H∏ß*RKt.¥/¥/t`t`¥`4`Ù.¥`¥/¥`ãÿ[òX⁄◊Ÿ]OHúY⁄[óŸÿ‹ŒòùZ[\àäWKà¬à[õ[ôRŸ^Xõÿ\ôù]€ä^H∏¶®H4)t`Ù.¥.ãÿ[òX⁄◊Ÿ]OHúY⁄[óŸÿ‹Œö€⁄‹»äKà[õ[ôRŸ^Xõÿ\ôù]€ä^Hº'È%à[Y‹ò[HTHãÿ[òX⁄◊Ÿ]OHúY⁄[óŸÿ‹Œù[Y‹ò[HäKàKà“[õ[ôRŸ^Xõÿ\ôù]€ä^Hº'‰ÏH[]€à\Ÿ\ãXXÿ€›[ùãÿ[òX⁄◊Ÿ]OHúY⁄[óŸÿ‹Œù[]€àäWKà“[õ[ôRŸ^Xõÿ\ôù]€ä^Hº'ÈÎH4'Ù`Ù,t.Ù.4.¥,4a¥.4c»4,à4.¥,4`¥,4.Ù/¥,Ù-Hãÿ[òX⁄◊Ÿ]OHúY⁄[óŸÿ‹Œòÿ][Ÿ»äWKà“[õ[ôRŸ^Xõÿ\ôù]€ä^Hº'‰ÈH4(t.¥,4aÙ,4`¥c4/Ù/¥.Ù/t`Ùcà4-4/¥.¥`Ù/4-t/t`¥,4a¥.4càãÿ[òX⁄◊Ÿ]OHúY⁄[óŸÿ‹◊Ÿ›€õÿYäWKà“[õ[ôRŸ^Xõÿ\ôù]€ä^Hº'ÊËH4(t/¥,¥/4-t`t`¥.4/4/¥`t`¥c4.4,t-t-Ù/¥/Ù,4`t/t/¥`t`¥cãÿ[òX⁄◊Ÿ]OHúY⁄[óŸÿ‹ŒúÿYô]HäWKà“[õ[ôRŸ^Xõÿ\ôù]€ä^Hº'„$4&4`tat/¥-4/tbÙ.Hù[î^Pÿ\ô[ò[ã\õHöŒãÀŸ⁄]Xãò€€K‹⁄Y‹åLLã—ù[î^Pÿ\ô[ò[äWKà“[õ[ôRŸ^Xõÿ\ôù]€ä^H∏´!{Ó#»4'Ù.Ù,4,Ù.4/tb»ãÿ[òX⁄◊Ÿ]OHúY⁄[ú»äWKàJKà\ÿXõW›ŸXó‹YŸW‹ô]öY]œUùYKà
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]HOHúY⁄[óŸÿ‹◊Ÿ›€õÿYäBà\ﬁ[ò»YàY⁄[óŸÿ‹◊Ÿ›€õÿY
+ÿ[òX⁄Œàÿ[òX⁄‘]Y\ûJHOàõ€ôNÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä¥$Ù/¥`¥/¥,¥.Ùcà4a4,4.t.¯†)àäBàYàõ›Q“Só—–’SQSïUS”ó‘Uö\◊Ÿö[J
+NÇà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\äà∏ßc4)4,4.t.»4-4/¥.¥`Ù/4-t/t`¥,4a¥.4.4/¥`¥`t`Ù`¥`t`¥,¥`Ù-t`à4,à4`¥-t.¥`Ùbt-t.H4`t,t/¥`4.¥-KàÇà
+Bàô]\õÇà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\óŸÿ›[Y[ù
+àÿ›[Y[ùQî“[ú]ö[JàQ“Só—–’SQSïUS”ó‘Uàö[[ò[YOHîQ“Só—UëS‘QSïõYãà
+Kàÿ\[€èJàº'‰Êà4'Ù/¥.Ù/tbÙ.H4.¥/¥/t`¥`4,4.¥`à4/Ù.Ù,4,Ù.4/t/¥,à€ŸOòZ[Ÿ‹ò[KX€€\]LOÿ€ŸOãàÇà¥)4,4.t.»4/4/¥-¥/t/à4/Ù-t`4-t-4,4`¥c4/t-t.t`4/¥`t-t`¥.4,¥/4-t`t`¥-H4`H4/¥/Ù.4`t,4/t.4-t/4/t`Ù-¥/t/¥,Ù/à4/Ù.Ù,4,Ù.4/t,àÇà
+Kà
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]Kú›\ù›⁄]
+úY⁄[óŸÿ‹ŒàäJBà\ﬁ[ò»YàY⁄[óŸÿ‹◊‹YŸJÿ[òX⁄Œàÿ[òX⁄‘]Y\ûJHOàõ€ôNÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä
+BàYŸHHÿ[òX⁄Àô]Kú‹]
+éàãJVÃWBà€ŸWŸ^[\HH[ô\ÿÿ\Jàààôúõ€H[Xõ›ù\\»[\‹ù[õ[ôRŸ^Xõÿ\ôù]€ã[õ[ôRŸ^Xõÿ\ôX\ö›\ÇìêSQHHì^HY⁄[àÇïëTî“S”àHåKååÇëT–‘íTS”àH¥'¥/Ù.4`t,4/t.4-HÇê‘ëQU»H¥$4,¥`¥/¥`Çî—USë‘◊‘Q—HHò[ŸBïSU”àHò[ŸBïURQH¥`t/¥-Ù-4,4.t`¥-HURQ4,¥-t`4`t.4.ÇêíSë’◊—SUHHõ€ôBÇôYà€ó€Y\‹ÿYŸJÿ\ô[ò[]ô[ù
+NÇàY\‹ÿYŸHH]ô[ùõY\‹ÿYŸBàYà›äY\‹ÿYŸJKú›ö\
+
+HOHà⁄[»éÇàÿ\ô[ò[òXÿ€›[ùúŸ[ô€Y\‹ÿYŸJàY\‹ÿYŸKò⁄]⁄Y¥'Ù`4.4,¥-t`àHãY\‹ÿYŸKò⁄]€ò[YBà
+BÇêíSë’◊”ëU◊”QT‘–Q—HH€€ó€Y\‹ÿYŸWBàààÇà
+BàYŸ\»H¬àú›\ùéà
+àº'Ê†è¥$tbÙ`t`¥`4bÙ.H4`t`¥,4`4`èÿèóóàÇàåKà4(t/¥-Ù-4,4.t`¥-H4/¥-4.4/HUãN4a4,4.t.»4`H4`4,4`tb4.4`4-t/t.4-t/€ŸOãúOÿ€ŸOãóàÇàåãà4%4/¥,t,4,¥c4`¥-H4/¥,tcÙ-Ù,4`¥-t.Ùc4/tbÙ-H4/4-t`¥,4-4,4/t/tbÙ-H4.URQóàÇàåÀà4(t/¥-Ù-4,4.t`¥-H4a4`Ù/t.¥a¥.4.t/¥,t`4,4,t/¥`¥aÙ.4.¥.4.4/Ù/¥/4-t`t`¥.4`¥-H4.4aH4,à4/t`Ù-¥/tbÙ-H4`t/Ù.4`t.¥.íSë’◊ ãóàÇàçà4'¥`¥.¥`4/¥.t`¥-H0™Ù'Ù.Ù,4,Ù.4/tb»8°§à4%Ù,4,Ù`4`Ù-Ù.4`¥c4/Ù.Ù,4,Ù.4/pÆÀ4/Ù/¥-4`¥,¥-t`4-4.4`¥-H4`4.4`t.à4.4/¥`¥/Ù`4,4,¥c4`¥-H4a4,4.t.»4-4/¥.¥`Ù/4-t/t`¥/¥/óàÇàçKà4'Ù/¥`t.Ù-H4/Ù`4/¥,¥-t`4.¥.4/Ù.Ù,4,Ù.4/H4/Ù/¥cÙ,¥.4`¥`tc»4,à0™Ù'4/¥.4/Ù.Ù,4,Ù.4/tbÆÀà4%t,Ù/à4/4/¥-¥/t/à4,¥bÙ.¥.Ùc¥aÙ.4`¥c4,t-t-»4`Ù-4,4.Ù-t/t.4cÀóóàÇà¥'Ù`4.4/Ù-t`4-t-Ù,4/Ù`Ù`t.¥-H4.4`tat/¥-4/t.4.à4,¥/¥`t`t`¥,4/t,4,¥.Ù.4,¥,4-t`¥`tc»4.4-»‹›‹ôT‘S4,4,¥`¥/¥/4,4`¥.4aÙ-t`t.¥.à4'4,4.¥`t.4/4,4.Ùc4/tbÙ.H4`4,4-Ù/4-t`8†%LLà4&¥$KàÇà
+Kàú›ùX›\ôHéà
+àº'ÈÏHè¥'4.4/t.4/4,4.Ùc4/t,4c»4`t`¥`4`Ù.¥`¥`Ù`4,4/Ù.Ù,4,Ù.4/t,ÿèóóàÇààèôOûÿ€ŸWŸ^[\_O‹ôOóàÇàèè¥'¥,tcÙ-Ù,4`¥-t.Ùc4/tbÙ-H4/Ù/¥.ÙcŒèÿèàêSQKëTî“S”ãT–‘íTS”à4.‘ëQU»8†%4`t`¥`4/¥.¥.»Çàî—USë‘◊‘Q—H8†%õ€€4`t/¥-Ù-4,4c¥bt.4.H4/Ù/¥`t`¥/¥cÙ/t/t`Ùcà4.¥/t/¥/Ù.¥`»4/t,4`t`¥`4/¥-t.é»URQ8†%4.¥,4/t/¥/t.4aÙ-t`t.¥.4.HURQ»ÇàêíSë’◊—SUH8†%4a4`Ù/t.¥a¥.4c»4.4.Ù.õ€ôKàÇà¥'t-t.4`t/Ù/¥.Ùc4-Ù`Ù-t/4bÙ-HíSë’◊ à4/4/¥-¥/t/à4/t-H4/¥,tb¥cÙ,¥.ÙcÙ`¥cà4-Ù,4,Ù`4`Ù-ÙaÙ.4.à4`taÙ.4`¥,4-t`à4.4aH4/Ù`Ù`t`¥bÙ/4.4`t/Ù.4`t.¥,4/4.àÇà
+KàòùZ[\àéà
+à∏ß*èêRKt.¥/¥/t`t`¥`4`Ù.¥`¥/¥`4/Ù.Ù,4,Ù.4/t/¥,èÿèóóàÇàåKà4'¥`¥.¥`4/¥.t`¥-H0™Ù'Ù.Ù,4,Ù.4/tb»8°§à4(t/¥-Ù-4,4`¥c4/Ù.Ù,4,Ù.4/H8°§à4't,4`t`¥`4/¥.t.¥.0Æ»4.4-Ù,4-4,4.t`¥-H»ò\ŸHTìÇàêTKt`¥/¥.¥-t/H4.Q4/4/¥-4-t.Ù.[ùõ‹XÀóàÇàåãà4't,4-¥/4.4`¥-H0™Ù'Ù-t`4-t.t`¥.4.à4`t/¥-Ù-4,4/t.4c∞Æ»4.4/Ù/¥-4`4/¥,t/t/à4/¥/Ù.4b4.4`¥-H4/Ù/¥,¥-t-4-t/t.4-H4/Ù.Ù,4,Ù.4/t,óàÇàåÀà4't,4/Ù-t`4,¥/¥/4ct`¥,4/Ù-H4/4/¥-4-t.Ùc4/Ù/¥.Ù`ÙaÙ,4-t`à4-Ù,4/Ù`4/¥`H4.4/Ù/¥.Ù/tbÙ.HQ“Só—UëS‘QSïõY»4/t,4,¥`¥/¥`4/¥/Çà¥/Ù`4/¥,¥-t`4cÙ-t`à4aÙ-t`4/t/¥,¥.4.à4/Ù/à4-4/¥.¥`Ù/4-t/t`¥,4a¥.4.4.4.4`t/Ù`4,4,¥.ÙcÙ-t`à4`t.4/t`¥,4.¥`t.4`KóàÇàçà4'Ù/¥`t.Ù-H4.Ù/¥.¥,4.Ùc4/t/¥.H4/Ù`4/¥,¥-t`4.¥.4/Ù.Ù,4,Ù.4/H4`Ù`t`¥,4/t,4,¥.Ù.4,¥,4-t`¥`tc»4,4,¥`¥/¥/4,4`¥.4aÙ-t`t.¥.óóàÇà¥$à4.¥,4`4`¥/¥aÙ.¥-HRKt/Ù.Ù,4,Ù.4/t,4-t`t`¥c4/t-t/¥,Ù`4,4/t.4aÙ-t/t/t/¥-H4`4-t-4,4.¥`¥.4`4/¥,¥,4/t.4-H4/t/¥,¥bÙ/4-Ù,4/Ù`4/¥`t/¥/àURQ4`t/¥at`4,4/tcÙ-t`¥`tcÀÇà¥,¥-t`4`t.4c»4`Ù,¥-t.Ù.4aÙ.4,¥,4-t`¥`tcÀà4$à4.¥,4`¥,4.Ù/¥,Ù-H4.4.4`tat/¥-4/t.4.¥-H4,¥`t-t,Ù-4,4/Ù/¥.¥,4-ÙbÙ,¥,4-t`¥`tc»0™Ù(t$Ù%t't%t(4&4(4'¥$¥$4't'à4&4&0ÆÀàÇàêTKt`¥/¥.¥-t/H4at`4,4/t.4`¥`tc»4-Ù,4b4.4a4`4/¥,¥,4/t/tbÙ/à4'Ù`4/¥,¥-t`4cÙ.t`¥-H4.¥/¥-àRKt/Ù/¥/4-t`¥.¥,4/t-H4,Ù,4`4,4/t`¥.4`4`Ù-t`à4,t-t-Ù/¥/Ù,4`t/t/¥`t`¥càÇà
+Kàö€⁄‹»éà
+à∏¶®Hè¥'Ù/¥-4-4-t`4-¥.4,¥,4-t/4bÙ-H4at`Ù.¥.ÿèóóàÇàèè¥%¥.4-Ù/t-t/t/tbÙ.H4a¥.4.¥.ŒèÿèàëW“SíU‘’“SíUëW‘’Tï‘’‘’TïëW‘’‘‘’‘’‘óàÇàèè¥(t/¥/¥,tbt-t/t.4cŒèÿèàSíU”QT‘–Q—KQT‘–Q—T◊”T’–“Së—QT’–“U”QT‘–Q—W–“Së—QëU◊”QT‘–Q—KóàÇàèè¥%Ù,4.¥,4-ÙbŒèÿèàSíU”‘ëTãëU◊”‘ëTã‘ëTî◊”T’–“Së—Q‘ëTó‘’UT◊–“Së—QóàÇàèè¥'¥/Ù-t`4,4a¥.4.èÿèàëW—SUëTñK‘’—SUëTñKëW”’◊‘êRT—K‘’”’◊‘êRT—KóóàÇàèèï[]€éèÿèàSU”ó‘ëPQKSU”ó—T–””ìëP’QóóàÇà¥'Ù-t`4-t-4.¥,4-¥-4bÙ/4/t,4-Ù,¥,4/t.4-t/4-4/¥,t,4,¥.ÙcÙ-t`¥`tc»€ŸOêíSë’◊œÿ€ŸOãà4(t/¥,tbÙ`¥.4.t/tbÙ.H4/¥,t`4,4,t/¥`¥aÙ.4.à4/Ù/¥.Ù`ÙaÙ,4-t`àÇàè€ŸOäÿ\ô[ò[]ô[ù
+Oÿ€ŸOé»4/¥,t`4,4,t/¥`¥aÙ.4.¥.4-¥.4-Ù/t-t/t/t/¥,Ù/à4a¥.4.¥.Ù,8†%4/¥,tb¥-t.¥`àÿ\ô[ò[»4/¥,t`4,4,t/¥`¥aÙ.4.à4`Ù-4,4.Ù-t/t.4c»8†%Çàè€ŸOäÿ\ô[ò[ÿ[òX⁄ Oÿ€ŸOãà4'¥b4.4,t.¥,4/¥-4/t/¥,Ù/à4/¥,t`4,4,t/¥`¥aÙ.4.¥,4-Ù,4/Ù.4`tbÙ,¥,4-t`¥`tc»4,à4.Ù/¥,»4.4/t-H4/¥`t`¥,4/t,4,¥.Ù.4,¥,4-t`à4/¥`t`¥,4.Ùc4/tbÙ-H4/Ù.Ù,4,Ù.4/tbÀàÇà
+Kàù[Y‹ò[Héà
+àº'È%àèï[Y‹ò[HTH4/Ù.Ù,4,Ù.4/t,ÿèóóàÇà¥)Ù-t`4-t-»€ŸOòÿ\ô[ò[ù[Y‹ò[Kòõ›ÿ€ŸOà4-4/¥`t`¥`Ù/Ù/tbŒàŸ[ô€Y\‹ÿYŸKY]€Y\‹ÿYŸW›^ÇàôY]€Y\‹ÿYŸW‹ô\W€X\ö›\[ú›Ÿ\óÿÿ[òX⁄◊‹]Y\ûK[]W€Y\‹ÿYŸKY\‹ÿYŸW⁄[ô\ãÇàòÿ[òX⁄◊‹]Y\ûW⁄[ô\à4.4/4-t`¥/¥-4b»ôY⁄\›\ó ó⁄[ô\ãóóàÇà¥'Ù/¥-4-4-t`4-¥,4/tb»4/¥,tbÙaÙ/tbÙ-H4a4.4.Ùc4`¥`4b»€ŸOò€€[X[ôœÿ€ŸOã€ŸOò€€ù[ù›\\œÿ€ŸOà4.€ŸOôù[òœÿ€ŸOãÇà¥,4`¥,4.¥-¥-H[õ[ôRŸ^Xõÿ\ôù]€ã“[õ[ôRŸ^Xõÿ\ôX\ö›\4.4-»€ŸOù[Xõ›ù\\œÿ€ŸOãàÇàï[Y‹ò[Kt/¥,t`4,4,t/¥`¥aÙ.4.¥.4,4,¥`¥/¥/4,4`¥.4aÙ-t`t.¥.4/Ù-t`4-t`t`¥,4c¥`à4,¥bÙ/Ù/¥.Ù/tcÙ`¥c4`tc»4/Ù`4.4,¥bÙ.¥.Ùc¥aÙ-t/t.4.4.4.Ù.4`Ù-4,4.Ù-t/t.4.4/Ù.Ù,4,Ù.4/t,óóàÇà¥'Ù`4.—USë‘◊‘Q—OUùYH4.¥,4`4`¥/¥aÙ.¥,4/Ù.Ù,4,Ù.4/t,4/Ù/¥.¥,4-ÙbÙ,¥,4-t`à4.¥/t/¥/Ù.¥`»0™Ù't,4`t`¥`4/¥.t.¥.0Æ»4`Hÿ[òX⁄»Çàè€ŸOçŒïURQåÿ€ŸOãà4%Ù,4`4-t,Ù.4`t`¥`4.4`4`Ù.t`¥-H4-4.Ùc»4/t-tdHÿ[òX⁄ÀZ[ô\é»4/Ù`4-ta4.4.¥`H4`¥,4.¥-¥-H4-4/¥`t`¥`Ù/Ù-t/HÇà¥.¥,4.à€ŸOê–ïîQ“Só‘—USë‘œÿ€ŸOà4aÙ-t`4-t-»€ŸOôúõ€H◊ÿõ›[\‹ù–ïÿ€ŸOãóóàÇàëù[î^H4-4/¥`t`¥`Ù/Ù-t/H4aÙ-t`4-t-»€ŸOòÿ\ô[ò[òXÿ€›[ùÿ€ŸOãù[õô\à8†%4aÙ-t`4-t-»€ŸOòÿ\ô[ò[úù[õô\èÿ€ŸOãàÇà
+Kàù[]€àéà
+àº'‰ÏHèï[]€à\Ÿ\ãXXÿ€›[ùÿèóóàÇà¥%4/¥,t,4,¥c4`¥-H€ŸOïSU”àHùYOÿ€ŸOãà4$à4.¥,4`4`¥/¥aÙ.¥-H4/Ù.Ù,4,Ù.4/t,4/Ù/¥cÙ,¥.4`¥`tc»4,¥`t`¥`4/¥-t/t/t,4c»Çà¥/t,4`t`¥`4/¥.t.¥,à4/t/¥/4-t`8°§à4.¥/¥-[Y‹ò[H8°§à4/Ù,4`4/¥.ÙcëêK4-t`t.Ù.4/¥/H4,¥.¥.Ùc¥aÙdt/Kà4'Ù.Ù,4,Ù.4/H4/t-H4-4/¥.Ù-¥-t/HÇà¥`t,4/4`t/¥,t.4`4,4`¥c4ct`¥.4-Ù/t,4aÙ-t/t.4cÀà4&¥/¥-4/t-H4`t/¥at`4,4/tcÙ-t`¥`tcŒ»4/t/¥/4-t`›ö[ô‘Ÿ\‹⁄[€à4.ëêHÇà¥b4.4a4`4`Ùc¥`¥`tc»4aÙ-t`4-t-»T‘—P‘ëU4/¥`¥-4-t.Ùc4/t/à4-4.Ùc»4/Ù/¥.Ùc4-Ù/¥,¥,4`¥-t.Ùc»4.URQ4/Ù.Ù,4,Ù.4/t,óóàÇà¥'Ù/¥`t.Ù-H4,¥at/¥-4,4at`Ù.à€ŸOêíSë’◊’SU”ó‘ëPQOÿ€ŸOà4/Ù/¥.Ù`ÙaÙ,4-t`àÇàè€ŸOäÿ\ô[ò[€Y[ù
+Oÿ€ŸOã4,Ù-4-H€Y[ù8†%4/t,4`t`¥/¥cÙbt.4.HÇàè€ŸOù[]€ãï[Y‹ò[P€Y[ùÿ€ŸOãà4&4-»4`t.4/tat`4/¥/t/t/¥,Ù/à4at`Ù.¥,4,¥bÙ-ÙbÙ,¥,4.t`¥-H\ﬁ[ò»TH4`¥,4.éàÇàè€ŸOòÿ\ô[ò[ù[]€ãúù[ä€Y[ùúŸ[ô€Y\‹ÿYŸJ	€YIÀ	›\›	 JOÿ€ŸOãóóàÇà¥$4-4/4.4/t.4`t`¥`4,4`¥/¥`4-4/¥.Ù-¥-t/H4-Ù,4-4,4`¥cSU”ó–TW“Q4.SU”ó–TW“T“4/¥`à^Kù[Y‹ò[Kõ‹ôÀàÇà¥'Ù/¥.Ù/tbÙ-H4/Ù`4.4/4-t`4b»4`t/¥,tbÙ`¥.4.H4.YôXﬁX€H4-t`t`¥c4,à4`t.¥,4aÙ.4,¥,4-t/4/¥/Q“Só—UëS‘QSïõYàÇà
+KàúÿYô]Héà
+àº'ÊËHè¥(t/¥,¥/4-t`t`¥.4/4/¥`t`¥c4.4,t-t-Ù/¥/Ù,4`t/t/¥`t`¥cÿèóóàÇà¥'Ù/¥-4-4-t`4-¥.4,¥,4-t`¥`tc»4/¥-4/t/¥a4,4.t.Ù/¥,¥bÙ.H4.¥/¥/t`¥`4,4.¥`ãN4at`Ù.¥/¥,àù[î^Pÿ\ô[ò[4-4,¥,[]€ãtat`Ù.¥,Çà¥.4/4/Ù/¥`4`¥b»€ŸOòÿ\ô[ò[ÿ€ŸOã€ŸOëù[î^PTOÿ€ŸOã4/¥a4.4a¥.4,4.Ùc4/tbÙ.H€ŸOù[]€èÿ€ŸOãÇàè€ŸOù◊ÿõ›ê–ïÿ€ŸOà4.4,t,4-Ù/¥,¥bÙ.H4`t.Ù/¥.H€ŸOù[Xõ›ù\\œÿ€ŸOãàÇà¥'Ù.Ù,4,Ù.4/K4.¥/¥`¥/¥`4bÙ.H4.4/4/Ù/¥`4`¥.4`4`Ù-t`à4-4/¥/Ù/¥.Ù/t.4`¥-t.Ùc4/tbÙ-HÇà¥/Ù,4.¥-t`¥b»4.4.Ù.4,¥/t`Ù`¥`4-t/t/t.4-H4/4/¥-4`Ù.Ù.4.¥/¥/t.¥`4-t`¥/t/¥.H4`t,t/¥`4.¥.ÿ\ô[ò[4/Ù/¥`¥`4-t,t`Ù-t`à4-4/¥,t,4,¥.4`¥c4.4aH4,àÿ⁄Ÿ\ãt/¥,t`4,4-ÀóóàÇà∏¶®;Ó#»]€ãt/Ù.Ù,4,Ù.4/H4,¥bÙ/Ù/¥.Ù/tcÙ-t`¥`tc»4,¥/t`Ù`¥`4.4/Ù`4/¥a¥-t`t`t,4,t/¥`¥,à4'¥/H4/4/¥-¥-t`à4/Ù`4/¥aÙ.4`¥,4`¥cì’’“—SãUPêT—W’TìÇàô€€[ó⁄Ÿ^K4/¥,t`4,4bt,4`¥c4`tc»4.à4`t-t`¥.4.4`Ù/Ù`4,4,¥.ÙcÙ`¥c4,4.¥.¥,4`Ù/t`¥/¥/à4'Ù`4/¥,¥-t`4cÙ.t`¥-H4.4`tat/¥-4/tbÙ.H4.¥/¥-URQ4.4,4,¥`¥/¥`4,àÇà¥$¥bÙ.¥.Ùc¥aÙ-t/t.4-H4/¥`t`¥,4/t,4,¥.Ù.4,¥,4-t`à4at`Ù.¥.4/t/à4-4.Ùc»4/Ù/¥.Ù/t/¥,Ù/à4`Ù-4,4.Ù-t/t.4c»4/t-t-4/¥,¥-t`4-t/t/t/¥,Ù/à4.¥/¥-4,4.4`t/Ù/¥.Ùc4-Ù`Ù.t`¥-H4.¥/t/¥/Ù.¥`»0™Ù(Ù-4,4.Ù.4`¥c0ÆÀàÇà
+Kàòÿ][Ÿ»éà
+àº'ÈÎHè¥'Ù`Ù,t.Ù.4.¥,4a¥.4c»4,à4.¥,4`¥,4.Ù/¥,Ù-OÿèóóàÇàåKà4(t/t,4aÙ,4.Ù,4`Ù`t`¥,4/t/¥,¥.4`¥-H4.4/Ù`4/¥,¥-t`4c4`¥-H4`t/¥,t`t`¥,¥-t/t/tbÙ.HúKt/Ù.Ù,4,Ù.4/KóàÇàåãà4'¥`¥.¥`4/¥.t`¥-H0™Ù'4/¥.4/Ù.Ù,4,Ù.4/tb»8°§à4/Ù.Ù,4,Ù.4/H8°§à4'¥/Ù`Ù,t.Ù.4.¥/¥,¥,4`¥c4,à4.¥,4`¥,4.Ù/¥,Ù-pÆÀóàÇàåÀà4't,4/Ù.4b4.4`¥-H4/Ù/¥-4`4/¥,t/t/¥-H4/¥/Ù.4`t,4/t.4-H4-4.Ù.4/t/¥.H8†$Ãå4`t.4/4,¥/¥.Ù/¥,éà4/t,4-Ù/t,4aÙ-t/t.4-K4.¥/¥/4,4/t-4bÀÇà¥/t,4`t`¥`4/¥.t.¥,4-Ù,4,¥.4`t.4/4/¥`t`¥.4`4,4-Ù`4-tb4-t/t.4c»4.4/¥,Ù`4,4/t.4aÙ-t/t.4cÀóàÇàçà4'Ù`4/¥,¥-t`4c4`¥-H4.¥,4`4`¥/¥aÙ.¥`»4.4/Ù/¥-4`¥,¥-t`4-4.4`¥-H4/Ù`Ù,t.Ù.4.¥,4a¥.4cãóóàÇà¥'Ù`4.4/¥,t/t/¥,¥.Ù-t/t.4.4,t/¥`à4-Ù,4/t/¥,¥/à4.¥/¥/Ù.4`4`Ù-t`à4/4-t`¥,4-4,4/t/tbÙ-H4.4.4`tat/¥-4/t.4.à4`¥-t.¥`Ùbt-t.H4`Ù`t`¥,4/t/¥,¥.Ù-t/t/t/¥.H4,¥-t`4`t.4.àÇà¥)Ù`Ù-¥/¥.H4.4.Ù.4/¥a4.4a¥.4,4.Ùc4/tbÙ.HURQ4/Ù-t`4-t-Ù,4/Ù.4`t,4`¥c4/t-t.Ùc4-ÙcÀà4'Ù`Ù,t.Ù.4.¥,4a¥.4cà4/4/¥-¥/t/à4`Ù,t`4,4`¥c»4`Ù-¥-H4`Ù`t`¥,4/t/¥,¥.Ù-t/t/tbÙ-HÇà¥.¥/¥/Ù.4.4`»4-4`4`Ù,Ù.4aH4/Ù/¥.Ùc4-Ù/¥,¥,4`¥-t.Ù-t.H4`t/¥at`4,4/tcÙ`¥`tcÀà4&¥,4`¥,4.Ù/¥,»4`t/¥/¥,tbt-t`t`¥,¥,4/t-H4/4/¥-4-t`4.4`4`Ù-t`¥`tcÀ4/Ù/¥ct`¥/¥/4`»Çà¥/Ù-t`4-t-4`Ù`t`¥,4/t/¥,¥.¥/¥.H4`t.¥,4aÙ.4,¥,4.t`¥-H4.4/Ù`4/¥,¥-t`4cÙ.t`¥-H4.4`tat/¥-4/tbÙ.H4a4,4.t.Àà4(t/¥-Ù-4,4/t/tbÙ-H4,¥`t`¥`4/¥-t/t/tbÙ/Çà¥.¥/¥/t`t`¥`4`Ù.¥`¥/¥`4/¥/4`4,4`tb4.4`4-t/t.4c»4,¥`t-t,Ù-4,4/Ù`Ù,t.Ù.4.¥`Ùc¥`¥`tc»4`H4/Ù/¥/4-t`¥.¥/¥.H0™Ù(t$Ù%t't%t(4&4(4'¥$¥$4't'à4&4&0ÆÀàÇà
+KàBà^HYŸ\ÀôŸ]
+YŸJBàYàõ›^Çà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\ä¥(4,4-Ù-4-t.»4-4/¥.¥`Ù/4-t/t`¥,4a¥.4.4/t-H4/t,4.t-4-t/KàäBàô]\õÇà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\äà^àô\W€X\ö›\ZŸ^Xõÿ\ô
+÷ ∏´!{Ó#»4%4/¥.¥`Ù/4-t/t`¥,4a¥.4c»ãúY⁄[óŸÿ‹»äWWJKà\ÿXõW›ŸXó‹YŸW‹ô]öY]œUùYKà
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]HOHúY⁄[ó›\ÿY›ÿ\õö[ô»äBà\ﬁ[ò»YàY⁄[ó›\ÿY›ÿ\õö[ô ÿ[òX⁄Œàÿ[òX⁄‘]Y\ûJHOàõ€ôNÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä
+Bà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\äà∏¶®;Ó#»è¥$¥/t.4/4,4/t.4-OÿèóàÇà¥'Ù.Ù,4,Ù.4/H4,¥bÙ/Ù/¥.Ù/tcÙ-t`¥`tc»4`H4`¥-t/4.4-¥-H4/Ù`4,4,¥,4/4.4aÙ`¥/à4.4,t/¥`ãà4'¥/H4/4/¥-¥-t`à4/Ù`4/¥aÙ.4`¥,4`¥c4/Ù-t`4-t/4-t/t/tbÙ-H4/¥.¥`4`Ù-¥-t/t.4cÀÇà¥/Ù/¥.Ù`ÙaÙ.4`¥c4-4/¥`t`¥`Ù/»4.àù[î^Kt,4.¥.¥,4`Ù/t`¥`»4.4,t,4-Ù-H4-4,4/t/tbÙaKà4'Ù/¥`t.Ù-H4/¥`¥-4-t.Ùc4/t/¥.H4,4,¥`¥/¥`4.4-Ù,4a¥.4.[]€ãt/Ù.Ù,4,Ù.4/HÇà¥`t/4/¥-¥-t`à4/Ù/¥.Ù/t/¥`t`¥c4cà4`Ù/Ù`4,4,¥.ÙcÙ`¥c4/Ù/¥-4.¥.Ùc¥aÙdt/t/tbÙ/[Y‹ò[Kt,4.¥.¥,4`Ù/t`¥/¥/à4'Ù`4/¥-4/¥.Ù-¥,4.t`¥-H4`¥/¥.Ùc4.¥/à4-t`t.Ù.4-4/¥,¥-t`4cÙ-t`¥-H4,4,¥`¥/¥`4`Ààãàô\W€X\ö›\ZŸ^Xõÿ\ô
+¬à ¥+»4/Ù/¥/t.4/4,4cà4`4.4`t.àãúY⁄[ó›\ÿYÿ€€ôö\õHäWKà ¥'¥`¥/4-t/t,ãúY⁄[ú»äWKàJKà
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]HOHúY⁄[ó›\ÿYÿ€€ôö\õHäBà\ﬁ[ò»YàY⁄[ó›\ÿYÿ€€ôö\õJÿ[òX⁄Œàÿ[òX⁄‘]Y\ûK›]Nàî”P€€ù^
+HOàõ€ôNÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä
+BàYàõ›]ÿZ]ô\]Z\ôW‹ù[ù[YJÿ[òX⁄ÀõY\‹ÿYŸKÿ[òX⁄Àôúõ€W›\Ÿ\ãöY
+NÇàô]\õÇà]ÿZ]›]Kò€X\ä
+Bà]ÿZ]›]KúŸ]‹›]JY⁄[î›]Kôö[JBà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\äà¥'¥`¥/Ù`4,4,¥c4`¥-H4/¥-4.4/t/¥aÙ/tbÙ.H4a4,4.t.»4/Ù.Ù,4,Ù.4/t,€ŸOãúOÿ€ŸOà4-4/àLLà4&¥$Kà4%4.Ùc»4/¥`¥/4-t/tbŒàÿÿ[òŸ[Çà
+BÇàõ›]\ãõY\‹ÿYŸJY⁄[î›]Kôö[JBà\ﬁ[ò»YàY⁄[ó›\ÿYŸö[JY\‹ÿYŸNàY\‹ÿYŸK›]Nàî”P€€ù^
+HOàõ€ôNÇàÿ›[Y[ùHY\‹ÿYŸKôÿ›[Y[ùàYàõ›ÿ›[Y[ù‹àõ›
+ÿ›[Y[ùôö[W€ò[YH‹ààäKõ›Ÿ\ä
+Kô[ô›⁄]
+ãúHäNÇà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\ä∏ßc4'¥`¥/Ù`4,4,¥c4`¥-H4-4/¥.¥`Ù/4-t/t`à4`H4`4,4`tb4.4`4-t/t.4-t/úKàäBàô]\õÇàYàÿ›[Y[ùôö[W‹⁄^ôH[ôÿ›[Y[ùôö[W‹⁄^ôHàLLà
+àLçÇà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\ä∏ßc4(4,4-Ù/4-t`4/Ù.Ù,4,Ù.4/t,4/t-H4-4/¥.Ù-¥-t/H4/Ù`4-t,¥bÙb4,4`¥cLLà4&¥$KàäBàô]\õÇàù[ù[YHH]ÿZ]ô\]Z\ôW‹ù[ù[YJY\‹ÿYŸKY\‹ÿYŸKôúõ€W›\Ÿ\ãöY
+BàYàõ›ù[ù[YNÇà]ÿZ]›]Kò€X\ä
+Bàô]\õÇàùYôô\àHû]\“S 
+Bà]ÿZ]Y\‹ÿYŸKòõ›ô›€õÿY
+ÿ›[Y[ù\›[ò][€èXùYôô\äBàûNÇà€›\òŸHHùYôô\ãôŸ]ò[YJ
+KôX€ŸJù]ãN\⁄Y»äBà^Ÿ\[öX€ŸQX€ŸQ\úõ‹éÇà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\ä∏ßc4)4,4.t.»4-4/¥.Ù-¥-t/H4,tbÙ`¥c4`¥-t.¥`t`¥/¥,¥bÙ/UãN]€ãt/4/¥-4`Ù.Ù-t/àäBàô]\õÇàûNÇàY⁄[àH]ÿZ]X[òYŸ\ãúY⁄[úÀö[ú›[
+àY\‹ÿYŸKôúõ€W›\Ÿ\ãöYàÿ›[Y[ùôö[W€ò[YKà€›\òŸKàù[ù[YKà
+Bà^Ÿ\Y⁄[ïò[Y][€ë\úõ‹à\»^ŒÇà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\äà∏ßc4'Ù.Ù,4,Ù.4/H4/¥`¥.¥.Ù/¥/tdt/Nà⁄[ô\ÿÿ\J›ä^ J_HäBàô]\õÇà^Ÿ\^Ÿ\[€à\»^ŒÇàŸŸŸ\ãô^Ÿ\[€ä¥'t-H4`Ù-4,4.Ù/¥`tc4`Ù`t`¥,4/t/¥,¥.4`¥c4/Ù.Ù,4,Ù.4/HäBà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\äàà∏ßc4'¥b4.4,t.¥,4`Ù`t`¥,4/t/¥,¥.¥.à⁄[ô\ÿÿ\J€\Y
+^Àå
+J_HÇà
+Bàô]\õÇà]ÿZ]›]Kò€X\ä
+Bà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\äàà∏ß!H4'Ù.Ù,4,Ù.4/Hèû⁄[ô\ÿÿ\JY⁄[ãõò[YJ_Oÿèàû⁄[ô\ÿÿ\JY⁄[ãùô\ú⁄[€ä_H4`Ù`t`¥,4/t/¥,¥.Ù-t/KàÇà
+Bà]ÿZ]⁄›◊‹Y⁄[ú Y\‹ÿYŸKY\‹ÿYŸKôúõ€W›\Ÿ\ãöY
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]Kú›\ù›⁄]
+úY⁄[ó⁄[ôõŒàäJBà\ﬁ[ò»YàY⁄[ó⁄[ôõ ÿ[òX⁄Œàÿ[òX⁄‘]Y\ûK›]Nàî”P€€ù^
+HOàõ€ôNÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä
+Bà]ÿZ]›]Kò€X\ä
+Bà]ZYHÿ[òX⁄Àô]Kú‹]
+éàãJVÃWBàY⁄[ó‹ù[ù[YHHX[òYŸ\ãúY⁄[úÀúù[ù[Y\ÀôŸ]
+ÿ[òX⁄Àôúõ€W›\Ÿ\ãöY
+BàY⁄[àHY⁄[ó‹ù[ù[YKúY⁄[úÀôŸ]
+]ZY
+HYàY⁄[ó‹ù[ù[YH[ŸHõ€ôBàYàõ›Y⁄[éÇà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\ä¥'Ù.Ù,4,Ù.4/H4/t-H4/t,4.t-4-t/KàäBàô]\õÇà›‹ôY‹Y⁄[àH]ÿZ]ãôŸ]‹Y⁄[äÿ[òX⁄Àôúõ€W›\Ÿ\ãöY]ZY
+BàZWŸŸ[ô\ò]YHõ€€
+›‹ôY‹Y⁄[à[ô›‹ôY‹Y⁄[ñ»òZWŸŸ[ô\ò]YóJBà€⁄‹◊ÿ€›[ùH›[J[äò[YJHõ‹àò[YH[àY⁄[ãö€⁄‹Àùò[Y\ 
+JBàXõXÿ][€àH]ÿZ]ãôŸ]ÿÿ][Ÿ◊‹Y⁄[ä]ZY
+Bàõ›‹»H◊BàŸ][ô‹◊ÿÿ[òX⁄»HY⁄[ó‹Ÿ][ô‹◊ÿÿ[òX⁄◊Ÿ]JY⁄[äBàYàŸ][ô‹◊ÿÿ[òX⁄ŒÇàõ›‹Àò\[ô
+ ∏¶¶{Ó#»4't,4`t`¥`4/¥.t.¥.ãŸ][ô‹◊ÿÿ[òX⁄ WJBàYàZWŸŸ[ô\ò]YÇàõ›‹Àò\[ô
+ ∏ß*4(4-t-4,4.¥`¥.4`4/¥,¥,4`¥c4aÙ-t`4-t-»4&4&ãàòZWÿùZ[\óŸY]û›]ZYHäWJBà[]€ó‹›]\»H¥/t-H4.4`t/Ù/¥.Ùc4-Ù`Ù-t`¥`tc»ÇàYàY⁄[ãù[]€óŸ[òXõYÇà[]€ó‹õ›»H]ÿZ]ãôŸ]‹Y⁄[ó›[]€ó‹Ÿ\‹⁄[€äàÿ[òX⁄Àôúõ€W›\Ÿ\ãöY]ZYà
+Bà[]€ó‹›]\»H¥/Ù/¥-4.¥.Ùc¥aÙdt/HàYà[]€ó‹õ›»[ŸH¥/t-H4,4,¥`¥/¥`4.4-Ù/¥,¥,4/HÇàõ›‹Àò\[ô
+ º'‰ÏH[Y‹ò[H»[]€àãàúY⁄[ó›[]€éû›]ZYHäWJBàXõXÿ][€ó‹›]\»H¥'t-H4/¥/Ù`Ù,t.Ù.4.¥/¥,¥,4/HÇàYàXõXÿ][€éÇàYàXõXÿ][€ñ»ö\◊€ŸôöX⁄X[óNÇàXõXÿ][€ó‹›]\»Hº'ÊËH4/¥a4.4a¥.4,4.Ùc4/t,4c»4/Ù`Ù,t.Ù.4.¥,4a¥.4c»Çàõ›‹Àò\[ô
+ º'ÈÎH4'¥`¥.¥`4bÙ`¥c4,à4.¥,4`¥,4.Ù/¥,Ù-Hãàòÿ][Ÿ◊›öY]Œû›]ZYNåäWJBà[YàXõXÿ][€ñ»õ›€ô\ó›[Y‹ò[W⁄YóHOHÿ[òX⁄Àôúõ€W›\Ÿ\ãöYÇàXõXÿ][€ó‹›]\»H∏ß!H4/¥/Ù`Ù,t.Ù.4.¥/¥,¥,4/H4,¥,4/4.Çàõ›‹Àò\[ô
+ º'‰ÁH4'¥,t/t/¥,¥.4`¥c4/Ù`Ù,t.Ù.4.¥,4a¥.4càãàòÿ][Ÿ◊‹Xõ\⁄‹›\ùû›]ZYHäWJBàõ›‹Àò\[ô
+ ¥(Ù,t`4,4`¥c4.4-»4.¥,4`¥,4.Ù/¥,Ù,ãàòÿ][Ÿ◊›[úXõ\⁄ÿ\⁄Œû›]ZYHäWJBà[ŸNÇàXõXÿ][€ó‹›]\»H¥'¥/Ù`Ù,t.Ù.4.¥/¥,¥,4/H4-4`4`Ù,Ù.4/4/Ù/¥.Ùc4-Ù/¥,¥,4`¥-t.Ù-t/Çàõ›‹Àò\[ô
+ º'ÈÎH4'¥`¥.¥`4bÙ`¥c4,à4.¥,4`¥,4.Ù/¥,Ù-Hãàòÿ][Ÿ◊›öY]Œû›]ZYNåäWJBà[Yà]ZYõ›[àëPQW‘Q“Só–ñW’URQÇàõ›‹Àò\[ô
+ º'„$4'¥/Ù`Ù,t.Ù.4.¥/¥,¥,4`¥c4,à4.¥,4`¥,4.Ù/¥,Ù-Hãàòÿ][Ÿ◊‹Xõ\⁄‹›\ùû›]ZYHäWJBàõ›‹Àô^[ô
+¬à ¥$¥bÙ.¥.Ùc¥aÙ.4`¥càYàY⁄[ãô[òXõY[ŸH¥$¥.¥.Ùc¥aÙ.4`¥cãàúY⁄[ó›ŸŸ€Nû›]ZYHäWKà º'Â‰H4(Ù-4,4.Ù.4`¥cãàúY⁄[óŸ[]Wÿ\⁄Œû›]ZYHäWKà ∏´!{Ó#»4'4/¥.4/Ù.Ù,4,Ù.4/tb»ãõ^W‹Y⁄[ú»äWKàJBà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\äà
+º'È%àè¥(t$Ù%t't%t(4&4(4'¥$¥$4't'à4&4&ÿèóààYàZWŸŸ[ô\ò]Y[ŸHàäBà
+»àº'ÈÍHèû⁄[ô\ÿÿ\JY⁄[ãõò[YJ_Oÿèàû⁄[ô\ÿÿ\JY⁄[ãùô\ú⁄[€ä_WàÇààû⁄[ô\ÿÿ\JY⁄[ãô\ÿ‹ö\[€ä_WóàÇàà¥$4,¥`¥/¥`à⁄[ô\ÿÿ\JY⁄[ãò‹ôY] _WàÇààïURQà€ŸOû‹Y⁄[ãù]ZYOÿ€ŸOóàÇàà¥)t`Ù.¥/¥,éàèû⁄€⁄‹◊ÿ€›[ùOÿèóàÇàà¥(t`¥`4,4/t.4a¥,4/t,4`t`¥`4/¥-t.àÿ\ô[ò[àÿõ€€⁄X€€äY⁄[ãúŸ][ô‹◊‹YŸJ_WàÇààï[]€éàèû⁄[ô\ÿÿ\J[]€ó‹›]\ _OÿèóàÇàà¥&¥,4`¥,4.Ù/¥,Œà⁄[ô\ÿÿ\JXõXÿ][€ó‹›]\ _WàÇàà¥(t/¥`t`¥/¥cÙ/t.4-Nàÿõ€€⁄X€€äY⁄[ãô[òXõY
+_Hãàô\W€X\ö›\ZŸ^Xõÿ\ô
+õ›‹ Kà
+BÇàYàŸ]›[]€ó‹Y⁄[ä\Ÿ\ó⁄Yà[ù]ZYà›äHOàY⁄[ë]Hõ€ôNÇàY⁄[ó‹ù[ù[YHHX[òYŸ\ãúY⁄[úÀúù[ù[Y\ÀôŸ]
+\Ÿ\ó⁄Y
+BàY⁄[àHY⁄[ó‹ù[ù[YKúY⁄[úÀôŸ]
+]ZY
+HYàY⁄[ó‹ù[ù[YH[ŸHõ€ôBàô]\õàY⁄[àYàY⁄[à[ôY⁄[ãù[]€óŸ[òXõY[ŸHõ€ôBÇà\ﬁ[ò»Yà⁄›◊‹Y⁄[ó›[]€ä\ôŸ]àY\‹ÿYŸK\Ÿ\ó⁄Yà[ù]ZYà›äHOàõ€ôNÇàY⁄[àHŸ]›[]€ó‹Y⁄[ä\Ÿ\ó⁄Y]ZY
+BàYàõ›Y⁄[éÇà]ÿZ]\ôŸ]ò[ú›Ÿ\äï[]€à4-4.Ùc»4ct`¥/¥,Ù/à4/Ù.Ù,4,Ù.4/t,4/t-H4/¥,tb¥cÙ,¥.Ù-t/KàäBàô]\õÇàŸ\‹⁄[€ú»H]ÿZ]ãôŸ]‹Y⁄[ó›[]€ó‹Ÿ\‹⁄[€ú \Ÿ\ó⁄Y]ZY
+BàYàŸ\‹⁄[€úŒÇà^€[ô\»H¬ààº'‰ÏHèï[]€à0≠»⁄[ô\ÿÿ\JY⁄[ãõò[YJ_Oÿèàãààãàà¥'Ù/¥-4.¥.Ùc¥aÙ-t/t/à4,4.¥.¥,4`Ù/t`¥/¥,éàèû€[äŸ\‹⁄[€ú _OÿèàãàBàõ›‹»H◊Bàõ‹à[ô^õ›»[à[ù[Y\ò]JŸ\‹⁄[€úÀ›\ùLJNÇàûNÇà€ôHHX\⁄ŸY‹€ôJŸX‹ô]ÀôX‹û\
+õ›÷»ú€ôWŸ[ò»óJJBà^Ÿ\
+[ùò[Y⁄Ÿ[ãò[YQ\úõ‹ã\Q\úõ‹äNÇà€ôHH¥`t.¥`4bÙ`àÇà\Ÿ\õò[YHH
+ààê‹õ›÷…›[Y‹ò[W›\Ÿ\õò[YI◊_HÇàYàõ›÷»ù[Y‹ò[W›\Ÿ\õò[YHóBà[ŸHàíQ‹õ›÷…›[Y‹ò[W›\Ÿ\ó⁄Y	◊_HÇà
+Bà€Y[ùHX[òYŸ\ãù[]€ãôŸ]ÿ€Y[ùÿûW‹Ÿ\‹⁄[€äà\Ÿ\ó⁄Y]ZY[ù
+õ›÷»öYóJBà
+Bà›]\»Hº'ÁËààYà€Y[ù[ô€Y[ùö\◊ÿ€€õôX›Y
+
+H[ŸHº'ÁËHÇà\‹›€‹ô‹›]\»HåëêH4`t/¥at`4,4/tdt/HàYàõ›÷»ú\‹›€‹ôŸ[ò»óH[ŸH¥,t-t-»ëêHÇà^€[ô\Àô^[ô
+¬ààãààû‹›]\ﬂHèû⁄[ô^Kà⁄[ô\ÿÿ\J\Ÿ\õò[YJ_Oÿèàãàà¥(¥-t.Ù-ta4/¥/Nà€ŸOû⁄[ô\ÿÿ\J€ôJ_Oÿ€ŸOà0≠»‹\‹›€‹ô‹›]\ﬂHãàJBàõ›‹Àò\[ô
+ ààº'Ê™à4'¥`¥.¥.Ùc¥aÙ.4`¥c›\Ÿ\õò[Y_Hãààû‘Q“Só’SU”ó—T–””ìëP’–T“◊‘ëQíV^‹õ›÷…⁄Y	◊_Hãà
+WJBà^€[ô\Àô^[ô
+¬ààãà¥$¥`t-H4`t-t`t`t.4.4.4/Ù,4`4/¥.Ù.ëêH4at`4,4/tcÙ`¥`tc»4-Ù,4b4.4a4`4/¥,¥,4/t/t/é»4.¥/¥-4b»4,¥at/¥-4,4/t-H4`t/¥at`4,4/tcÙc¥`¥`tcÀàãàJBà^Hóàãöõ⁄[ä^€[ô\ Bàõ›‹Àö[úŸ\ù
+ ∏ß•H4%4/¥,t,4,¥.4`¥c[Y‹ò[Kt,4.¥.¥,4`Ù/t`àãàúY⁄[ó›[]€ó‹›\ùû›]ZYHäWJBàõ›‹Àò\[ô
+ ∏´!{Ó#»4&à4/Ù.Ù,4,Ù.4/t`»ãàúY⁄[ó⁄[ôõŒû›]ZYHäWJBà[ŸNÇà€€ôöY›\ôYHX[òYŸ\ãù[]€ãò€€ôöY›\ôYà^H
+ààº'‰ÏHèï[]€à0≠»⁄[ô\ÿÿ\JY⁄[ãõò[YJ_OÿèóóàÇàï[Y‹ò[Kt,4.¥.¥,4`Ù/t`à4/t-H4,4,¥`¥/¥`4.4-Ù/¥,¥,4/Kà4'4,4`t`¥-t`4-Ù,4/Ù`4/¥`t.4`à4/t/¥/4-t`4`¥-t.Ù-ta4/¥/t,Çà¥.¥/¥-4,¥at/¥-4,4.4-t`t.Ù.4,¥.¥.Ùc¥aÙ-t/t/ã4/Ù,4`4/¥.ÙcëêKóóàÇà¥&¥/¥-4.4/Ù,4`4/¥.Ùc4`Ù-4,4.ÙcÙc¥`¥`tc»4.4-»4aÙ,4`¥,à4'Ù/¥`t.Ù-H4,¥at/¥-4,4`t-t`t`t.4c»4.4/Ù,4`4/¥.ÙcëêHÇà¥`t/¥at`4,4/tcÙc¥`¥`tc»4`¥/¥.Ùc4.¥/à4,à4-Ù,4b4.4a4`4/¥,¥,4/t/t/¥/4,¥.4-4-KàÇà
+BàYàõ›€€ôöY›\ôYÇà^
+œH
+àóó∏¶®;Ó#»4$4-4/4.4/t.4`t`¥`4,4`¥/¥`4-tbtdH4/t-H4-Ù,4-4,4.»4/Ù-t`4-t/4-t/t/tbÙ-HÇàè€ŸOïSU”ó–TW“Qÿ€ŸOà4.€ŸOïSU”ó–TW“T“ÿ€ŸOãàÇà
+Bàõ›‹»H◊BàYà€€ôöY›\ôY[ôY⁄[ãô[òXõYÇàõ›‹Àò\[ô
+ º'‰Ïà4't,4aÙ,4`¥c4,4,¥`¥/¥`4.4-Ù,4a¥.4càãàúY⁄[ó›[]€ó‹›\ùû›]ZYHäWJBà[Yà€€ôöY›\ôYÇà^
+œHóó¥)Ù`¥/¥,tb»4/t,4aÙ,4`¥c4,4,¥`¥/¥`4.4-Ù,4a¥.4cã4`t/t,4aÙ,4.Ù,4,¥.¥.Ùc¥aÙ.4`¥-H4/Ù.Ù,4,Ù.4/KàÇàõ›‹Àò\[ô
+ ∏´!{Ó#»4&à4/Ù.Ù,4,Ù.4/t`»ãàúY⁄[ó⁄[ôõŒû›]ZYHäWJBà]ÿZ]\ôŸ]ò[ú›Ÿ\ä^ô\W€X\ö›\ZŸ^Xõÿ\ô
+õ›‹ JBÇà\ﬁ[ò»Yà[]W‹Ÿ[ú⁄]]ôW€Y\‹ÿYŸJY\‹ÿYŸNàY\‹ÿYŸJHOàõ€ôNÇàûNÇà]ÿZ]Y\‹ÿYŸKô[]J
+Bà^Ÿ\[Y‹ò[PòYô\]Y\›Çà\‹¬Çà\ﬁ[ò»Yàö[ö\⁄›[]€óÿ]]
+àY\‹ÿYŸNàY\‹ÿYŸKà›]Nàî”P€€ù^à]ZYà›ãà€ôNà›ãà€Y[ùà[ûKà\‹›€‹ôà›àõ€ôHHõ€ôKà
+HOàõ€ôNÇàûNÇàYHH]ÿZ]X[òYŸ\ãù[]€ãòX›]ò]JàY\‹ÿYŸKôúõ€W›\Ÿ\ãöY]ZY€ôK€Y[ù\‹›€‹ô\\‹›€‹ôà
+Bà^Ÿ\^Ÿ\[€éÇà]ÿZ]€Y[ùô\ÿ€€õôX›
+
+BàŸŸŸ\ãô^Ÿ\[€ä¥'t-H4`Ù-4,4.Ù/¥`tc4`t/¥at`4,4/t.4`¥c4,4,¥`¥/¥`4.4-Ù/¥,¥,4/t/t`Ùcà[]€ãt`t-t`t`t.4càäBà]ÿZ]›]Kò€X\ä
+Bà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\ä∏ßc4$¥at/¥-4,¥bÙ/Ù/¥.Ù/t-t/K4/t/à4`t/¥at`4,4/t.4`¥c[]€ãt`t-t`t`t.4cà4/t-H4`Ù-4,4.Ù/¥`tcàäBàô]\õÇà]ÿZ]›]Kò€X\ä
+BàY[ù]HHàê€YKù\Ÿ\õò[Y_HàYàŸ]]äYKù\Ÿ\õò[YHãõ€ôJH[ŸHàíQ€YKöYHÇà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\äàà∏ß!H[Y‹ò[Kt,4.¥.¥,4`Ù/t`àèû⁄[ô\ÿÿ\JY[ù]J_Oÿèà4/Ù/¥-4.¥.Ùc¥aÙdt/H4.à4/Ù.Ù,4,Ù.4/t`ÀàÇà
+BàY⁄[ó‹ù[ù[YHHX[òYŸ\ãúY⁄[úÀúù[ù[Y\ÀôŸ]
+Y\‹ÿYŸKôúõ€W›\Ÿ\ãöY
+BàY⁄[àHŸ]›[]€ó‹Y⁄[äY\‹ÿYŸKôúõ€W›\Ÿ\ãöY]ZY
+BàYàY⁄[ó‹ù[ù[YH[ôY⁄[à[ôY⁄[ãô[òXõYÇà]ÿZ]X[òYŸ\ãúY⁄[úÀô\‹]⁄
+àY\‹ÿYŸKôúõ€W›\Ÿ\ãöYàêíSë’◊’SU”ó‘ëPQHãàY⁄[ó‹ù[ù[YKòY\\ãà€Y[ùà€õO]]ZYà
+Bà[ŸNÇà]ÿZ]X[òYŸ\ãù[]€ãú›‹‹Y⁄[äY\‹ÿYŸKôúõ€W›\Ÿ\ãöY]ZY
+Bà]ÿZ]⁄›◊‹Y⁄[ó›[]€äY\‹ÿYŸKY\‹ÿYŸKôúõ€W›\Ÿ\ãöY]ZY
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]Kú›\ù›⁄]
+úY⁄[ó›[]€éàäJBà\ﬁ[ò»YàY⁄[ó›[]€äÿ[òX⁄Œàÿ[òX⁄‘]Y\ûK›]Nàî”P€€ù^
+HOàõ€ôNÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä
+Bà]ÿZ]›]Kò€X\ä
+Bà]ÿZ]⁄›◊‹Y⁄[ó›[]€äàÿ[òX⁄ÀõY\‹ÿYŸKÿ[òX⁄Àôúõ€W›\Ÿ\ãöYÿ[òX⁄Àô]Kú‹]
+éàãJVÃWBà
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]Kú›\ù›⁄]
+úY⁄[ó›[]€ó‹›\ùàäJBà\ﬁ[ò»YàY⁄[ó›[]€ó‹›\ù
+ÿ[òX⁄Œàÿ[òX⁄‘]Y\ûK›]Nàî”P€€ù^
+HOàõ€ôNÇà]ZYHÿ[òX⁄Àô]Kú‹]
+éàãJVÃWBàY⁄[àHŸ]›[]€ó‹Y⁄[äÿ[òX⁄Àôúõ€W›\Ÿ\ãöY]ZY
+BàYàõ›Y⁄[éÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\äï[]€ãt/Ù.Ù,4,Ù.4/H4/t-H4/t,4.t-4-t/Hã⁄›◊ÿ[\ùUùYJBàô]\õÇàYàõ›Y⁄[ãô[òXõYÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä¥(t/t,4aÙ,4.Ù,4,¥.¥.Ùc¥aÙ.4`¥-H4/Ù.Ù,4,Ù.4/Hã⁄›◊ÿ[\ùUùYJBàô]\õÇàûNÇàX[òYŸ\ãù[]€ãúô\]Z\ôWÿ€€ôöY›\ôY
+
+Bà^Ÿ\[]€ê€€ôöY›\ò][€ë\úõ‹à\»^ŒÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä›ä^ K⁄›◊ÿ[\ùUùYJBàô]\õÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä
+Bà]ÿZ]›]Kò€X\ä
+Bà]ÿZ]›]Kù\]WŸ]J[]€ó‹Y⁄[ó›]ZY]]ZY
+Bà]ÿZ]›]KúŸ]‹›]JY⁄[ï[]€î›]Kú€ôJBà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\äàº'‰ÏHè¥*4,4,»KÃ»0≠»4't/¥/4-t`4`¥-t.Ù-ta4/¥/t,ÿèóóàÇà¥'¥`¥/Ù`4,4,¥c4`¥-H4/t/¥/4-t`[Y‹ò[H4,à4/4-t-¥-4`Ù/t,4`4/¥-4/t/¥/4a4/¥`4/4,4`¥-K4/t,4/Ù`4.4/4-t`Çàè€ŸOäÕŒNNLLåÕMçœÿ€ŸOãà4(t/¥/¥,tbt-t/t.4-H4,t`Ù-4-t`à4`Ù-4,4.Ù-t/t/ãà4%4.Ùc»4/¥`¥/4-t/tbŒàÿÿ[òŸ[Çà
+BÇàõ›]\ãõY\‹ÿYŸJY⁄[ï[]€î›]Kú€ôKãù^
+Bà\ﬁ[ò»YàY⁄[ó›[]€ó‹€ôJY\‹ÿYŸNàY\‹ÿYŸK›]Nàî”P€€ù^
+HOàõ€ôNÇà€ôHHôKú›Xäàñ◊ 
+WWHãàãY\‹ÿYŸKù^ú›ö\
+
+JBà]ÿZ][]W‹Ÿ[ú⁄]]ôW€Y\‹ÿYŸJY\‹ÿYŸJBàYàõ›ôKôù[X]⁄
+àó
+◊ÕÀM_Hã€ôJNÇà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\ä∏ßc4't`Ù-¥-t/H4/t/¥/4-t`4,¥.4-4,€ŸOäÕŒNNLLåÕMçœÿ€ŸOãàäBàô]\õÇà]HH]ÿZ]›]KôŸ]Ÿ]J
+Bà]ZYH›ä]KôŸ]
+ù[]€ó‹Y⁄[ó›]ZYäH‹ààäBàYàõ›Ÿ]›[]€ó‹Y⁄[äY\‹ÿYŸKôúõ€W›\Ÿ\ãöY]ZY
+NÇà]ÿZ]›]Kò€X\ä
+Bà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\ä∏ßc4'Ù.Ù,4,Ù.4/H4,t/¥.Ùc4b4-H4/t-H4-4/¥`t`¥`Ù/Ù-t/KàäBàô]\õÇàÿZ]€Y\‹ÿYŸHH]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\ä∏£Ï»4'¥`¥/Ù`4,4,¥.ÙcÙcà4.¥/¥-4,¥at/¥-4,4aÙ-t`4-t-»[Y‹ò[x†)àäBà€Y[ùHõ€ôBàûNÇà€Y[ùHX[òYŸ\ãù[]€ãò‹ôX]Wÿ€Y[ù
+
+Bà]ÿZ]\ﬁ[ò⁄[ÀùÿZ]Ÿõ‹ä€Y[ùò€€õôX›
+
+K[Y[›]LÃ
+BàŸ[ùH]ÿZ]\ﬁ[ò⁄[ÀùÿZ]Ÿõ‹ä€Y[ùúŸ[ôÿ€ŸW‹ô\]Y\›
+€ôJK[Y[›]MJBà[ô[ô◊‹Ÿ\‹⁄[€àH€Y[ùúŸ\‹⁄[€ãúÿ]ôJ
+Bà^Ÿ\€ôSù[Xô\í[ùò[Y\úõ‹éÇà]ÿZ]ÿZ]€Y\‹ÿYŸKôY]›^
+∏ßc[Y‹ò[H4/t-H4/Ù`4.4/tcÙ.»4ct`¥/¥`à4/t/¥/4-t`à4'¥`¥/Ù`4,4,¥c4`¥-H4-4`4`Ù,Ù/¥.H4/t/¥/4-t`àäBàô]\õÇà^Ÿ\õ€ŸÿZ]\úõ‹à\»^ŒÇà]ÿZ]ÿZ]€Y\‹ÿYŸKôY]›^
+àà∏ßc[Y‹ò[H4/¥,Ù`4,4/t.4aÙ.4.»4/Ù/¥,¥`¥/¥`4/tbÙ-H4/Ù/¥/ÙbÙ`¥.¥.à4'Ù/¥-4/¥-¥-4.4`¥-HŸ^ÀúŸX€€ôﬂH4`t-t.ãàÇà
+Bàô]\õÇà^Ÿ\^Ÿ\[€éÇàŸŸŸ\ãô^Ÿ\[€ä¥'t-H4`Ù-4,4.Ù/¥`tc4-Ù,4/Ù`4/¥`t.4`¥c[]€ãt.¥/¥-äBà]ÿZ]ÿZ]€Y\‹ÿYŸKôY]›^
+∏ßc4't-H4`Ù-4,4.Ù/¥`tc4/¥`¥/Ù`4,4,¥.4`¥c4.¥/¥-4,¥at/¥-4,à4'Ù/¥/Ù`4/¥,t`Ù.t`¥-H4/Ù/¥-Ù-¥-KàäBàô]\õÇàö[ò[NÇàYà€Y[ùÇà]ÿZ]€Y[ùô\ÿ€€õôX›
+
+Bà]ÿZ]›]Kù\]WŸ]Jà[]€ó‹€ôWŸ[òœ\ŸX‹ô]Àô[ò‹û\
+€ôJKà[]€ó‹[ô[ô◊‹Ÿ\‹⁄[€óŸ[òœ\ŸX‹ô]Àô[ò‹û\
+[ô[ô◊‹Ÿ\‹⁄[€äKà[]€ó‹€ôWÿ€ŸW⁄\⁄\Ÿ[ùú€ôWÿ€ŸW⁄\⁄à
+Bà]ÿZ]›]KúŸ]‹›]JY⁄[ï[]€î›]Kò€ŸJBà]ÿZ]ÿZ]€Y\‹ÿYŸKôY]›^
+àº'‰ÍHè¥*4,4,»ãÃ»0≠»4&¥/¥-4,¥at/¥-4,ÿèóóàÇà¥'¥`¥/Ù`4,4,¥c4`¥-H4.¥/¥-4/Ù/¥.Ù`ÙaÙ-t/t/tbÙ.H4/¥`à[Y‹ò[Kà4'4/¥-¥/t/à4/Ù.4`t,4`¥c4`H4/Ù`4/¥,t-t.Ù,4/4.àÇà¥(t/¥/¥,tbt-t/t.4-H4,t`Ù-4-t`à4`Ù-4,4.Ù-t/t/ãàÇà
+BÇàõ›]\ãõY\‹ÿYŸJY⁄[ï[]€î›]Kò€ŸKãù^
+Bà\ﬁ[ò»YàY⁄[ó›[]€óÿ€ŸJY\‹ÿYŸNàY\‹ÿYŸK›]Nàî”P€€ù^
+HOàõ€ôNÇà€ŸHHôKú›XäàóãàãY\‹ÿYŸKù^
+Bà]ÿZ][]W‹Ÿ[ú⁄]]ôW€Y\‹ÿYŸJY\‹ÿYŸJBàYàõ›H[ä€ŸJHHÇà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\ä∏ßc4&¥/¥-4,¥bÙ,Ù.ÙcÙ-4.4`à4/t-t.¥/¥`4`4-t.¥`¥/t/ãà4'¥`¥/Ù`4,4,¥c4`¥-H4-t,Ù/à4-tbtdH4`4,4-ÀàäBàô]\õÇà]HH]ÿZ]›]KôŸ]Ÿ]J
+Bà]ZYH›ä]KôŸ]
+ù[]€ó‹Y⁄[ó›]ZYäH‹ààäBàûNÇà€ôHHŸX‹ô]ÀôX‹û\
+]V»ù[]€ó‹€ôWŸ[ò»óJBà[ô[ô◊‹Ÿ\‹⁄[€àHŸX‹ô]ÀôX‹û\
+]V»ù[]€ó‹[ô[ô◊‹Ÿ\‹⁄[€óŸ[ò»óJBà€ôWÿ€ŸW⁄\⁄H›ä]V»ù[]€ó‹€ôWÿ€ŸW⁄\⁄óJBà^Ÿ\
+Ÿ^Q\úõ‹ã[ùò[Y⁄Ÿ[ã\Q\úõ‹äNÇà]ÿZ]›]Kò€X\ä
+Bà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\ä∏ßc4(t-t`t`t.4c»4,4,¥`¥/¥`4.4-Ù,4a¥.4.4.4`t`¥-t.¥.Ù,à4't,4aÙ/t.4`¥-H4-Ù,4/t/¥,¥/ãàäBàô]\õÇàûNÇà€Y[ùHX[òYŸ\ãù[]€ãò‹ôX]Wÿ€Y[ù
+[ô[ô◊‹Ÿ\‹⁄[€äBà^Ÿ\[]€ê€€ôöY›\ò][€ë\úõ‹à\»^ŒÇà]ÿZ]›]Kò€X\ä
+Bà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\äà∏ßc⁄[ô\ÿÿ\J›ä^ J_HäBàô]\õÇàûNÇà]ÿZ]\ﬁ[ò⁄[ÀùÿZ]Ÿõ‹ä€Y[ùò€€õôX›
+
+K[Y[›]LÃ
+Bà]ÿZ]\ﬁ[ò⁄[ÀùÿZ]Ÿõ‹äà€Y[ùú⁄Y€ó⁄[äà€ôO\€ôKà€ŸOX€ŸKà€ôWÿ€ŸW⁄\⁄\€ôWÿ€ŸW⁄\⁄à
+Kà[Y[›]MKà
+Bà^Ÿ\Ÿ\‹⁄[€î\‹›€‹ôôYYY\úõ‹éÇà]ÿZ]›]Kù\]WŸ]Jà[]€ó‹[ô[ô◊‹Ÿ\‹⁄[€óŸ[òœ\ŸX‹ô]Àô[ò‹û\
+€Y[ùúŸ\‹⁄[€ãúÿ]ôJ
+JBà
+Bà]ÿZ]€Y[ùô\ÿ€€õôX›
+
+Bà]ÿZ]›]KúŸ]‹›]JY⁄[ï[]€î›]Kú\‹›€‹ô
+Bà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\äàº'Â$è¥*4,4,»ÀÃ»0≠»4'Ù,4`4/¥.ÙcëêOÿèóóàÇà¥'t,4,4.¥.¥,4`Ù/t`¥-H4,¥.¥.Ùc¥aÙ-t/t,4-4,¥`Ùatct`¥,4/Ù/t,4c»4,4`Ù`¥-t/t`¥.4a4.4.¥,4a¥.4cÀà4'¥`¥/Ù`4,4,¥c4`¥-H4/Ù,4`4/¥.ÙcëêKàÇà¥(t/¥/¥,tbt-t/t.4-H4,t`Ù-4-t`à4`Ù-4,4.Ù-t/t/ã4,4/Ù,4`4/¥.Ùc4`t/¥at`4,4/t.4`¥`tc»4-Ù,4b4.4a4`4/¥,¥,4/t/t/à4-4.Ùc»4,4,¥`¥/¥/4,4`¥.4aÙ-t`t.¥.4aHÇà¥/¥/Ù-t`4,4a¥.4.H4/Ù.Ù,4,Ù.4/t,àÇà
+Bàô]\õÇà^Ÿ\€ôP€ŸR[ùò[Y\úõ‹éÇà]ÿZ]€Y[ùô\ÿ€€õôX›
+
+Bà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\ä∏ßc4't-t,¥-t`4/tbÙ.H4.¥/¥-à4'¥`¥/Ù`4,4,¥c4`¥-H4.¥/¥-4-tbtdH4`4,4-ÀàäBàô]\õÇà^Ÿ\€ôP€ŸQ^\ôY\úõ‹éÇà]ÿZ]€Y[ùô\ÿ€€õôX›
+
+Bà]ÿZ]›]Kò€X\ä
+Bà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\ä∏ßc4&¥/¥-4.4`t`¥dt.ãà4'¥`¥.¥`4/¥.t`¥-H4/t,4`t`¥`4/¥.t.¥.4/Ù.Ù,4,Ù.4/t,4.4/t,4aÙ/t.4`¥-H4-Ù,4/t/¥,¥/ãàäBàô]\õÇà^Ÿ\^Ÿ\[€éÇà]ÿZ]€Y[ùô\ÿ€€õôX›
+
+BàŸŸŸ\ãô^Ÿ\[€äï[]€ãt,¥at/¥-4/Ù/à4.¥/¥-4`»4/t-H4,¥bÙ/Ù/¥.Ù/t-t/HäBà]ÿZ]›]Kò€X\ä
+Bà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\ä∏ßc4$¥/¥.t`¥.4/Ù/à4.¥/¥-4`»4/t-H4`Ù-4,4.Ù/¥`tcà4't,4aÙ/t.4`¥-H4,4,¥`¥/¥`4.4-Ù,4a¥.4cà4-Ù,4/t/¥,¥/ãàäBàô]\õÇà]ÿZ]ö[ö\⁄›[]€óÿ]]
+Y\‹ÿYŸK›]K]ZY€ôK€Y[ù
+BÇàõ›]\ãõY\‹ÿYŸJY⁄[ï[]€î›]Kú\‹›€‹ôãù^
+Bà\ﬁ[ò»YàY⁄[ó›[]€ó‹\‹›€‹ô
+Y\‹ÿYŸNàY\‹ÿYŸK›]Nàî”P€€ù^
+HOàõ€ôNÇà\‹›€‹ôHY\‹ÿYŸKù^à]ÿZ][]W‹Ÿ[ú⁄]]ôW€Y\‹ÿYŸJY\‹ÿYŸJBà]HH]ÿZ]›]KôŸ]Ÿ]J
+Bà]ZYH›ä]KôŸ]
+ù[]€ó‹Y⁄[ó›]ZYäH‹ààäBàûNÇà€ôHHŸX‹ô]ÀôX‹û\
+]V»ù[]€ó‹€ôWŸ[ò»óJBà[ô[ô◊‹Ÿ\‹⁄[€àHŸX‹ô]ÀôX‹û\
+]V»ù[]€ó‹[ô[ô◊‹Ÿ\‹⁄[€óŸ[ò»óJBà^Ÿ\
+Ÿ^Q\úõ‹ã[ùò[Y⁄Ÿ[ã\Q\úõ‹äNÇà]ÿZ]›]Kò€X\ä
+Bà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\ä∏ßc4(t-t`t`t.4c»4,4,¥`¥/¥`4.4-Ù,4a¥.4.4.4`t`¥-t.¥.Ù,à4't,4aÙ/t.4`¥-H4-Ù,4/t/¥,¥/ãàäBàô]\õÇàûNÇà€Y[ùHX[òYŸ\ãù[]€ãò‹ôX]Wÿ€Y[ù
+[ô[ô◊‹Ÿ\‹⁄[€äBà^Ÿ\[]€ê€€ôöY›\ò][€ë\úõ‹à\»^ŒÇà]ÿZ]›]Kò€X\ä
+Bà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\äà∏ßc⁄[ô\ÿÿ\J›ä^ J_HäBàô]\õÇàûNÇà]ÿZ]\ﬁ[ò⁄[ÀùÿZ]Ÿõ‹ä€Y[ùò€€õôX›
+
+K[Y[›]LÃ
+Bà]ÿZ]\ﬁ[ò⁄[ÀùÿZ]Ÿõ‹ä€Y[ùú⁄Y€ó⁄[ä\‹›€‹ô\\‹›€‹ô
+K[Y[›]MJBà^Ÿ\\‹›€‹ô\⁄[ùò[Y\úõ‹éÇà]ÿZ]€Y[ùô\ÿ€€õôX›
+
+Bà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\ä∏ßc4't-t,¥-t`4/tbÙ.H4/Ù,4`4/¥.ÙcëêKà4'Ù/¥/Ù`4/¥,t`Ù.t`¥-H4-tbtdH4`4,4-»4.4.Ù.ÿÿ[òŸ[àäBàô]\õÇà^Ÿ\^Ÿ\[€éÇà]ÿZ]€Y[ùô\ÿ€€õôX›
+
+BàŸŸŸ\ãô^Ÿ\[€äï[]€ãt,¥at/¥-4`HëêH4/t-H4,¥bÙ/Ù/¥.Ù/t-t/HäBà]ÿZ]›]Kò€X\ä
+Bà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\ä∏ßc4$¥at/¥-4`HëêH4/t-H4,¥bÙ/Ù/¥.Ù/t-t/Kà4't,4aÙ/t.4`¥-H4,4,¥`¥/¥`4.4-Ù,4a¥.4cà4-Ù,4/t/¥,¥/ãàäBàô]\õÇà]ÿZ]ö[ö\⁄›[]€óÿ]]
+àY\‹ÿYŸK›]K]ZY€ôK€Y[ù\‹›€‹ô\\‹›€‹ôà
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJàãô]Kú›\ù›⁄]
+Q“Só’SU”ó—T–””ìëP’–T“◊‘ëQíV
+Bà
+Bà\ﬁ[ò»YàY⁄[ó›[]€óŸ\ÿ€€õôX›ÿ\⁄ ÿ[òX⁄Œàÿ[òX⁄‘]Y\ûJHOàõ€ôNÇàŸ\‹⁄[€ó⁄YH[ù
+ÿ[òX⁄Àô]Kú‹]
+éàãJVÃWJBàõ›»H]ÿZ]ãôŸ]‹Y⁄[ó›[]€ó‹Ÿ\‹⁄[€óÿûW⁄Y
+àÿ[òX⁄Àôúõ€W›\Ÿ\ãöYŸ\‹⁄[€ó⁄Yà
+BàYàõ›õ›ŒÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä¥(t-t`t`t.4c»4`Ù-¥-H4`Ù-4,4.Ù-t/t,ã⁄›◊ÿ[\ùUùYJBàô]\õÇà]ZYH›äõ›÷»úY⁄[ó›]ZYóJBà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä
+Bà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\äà¥(Ù-4,4.Ù.4`¥c4-Ù,4b4.4a4`4/¥,¥,4/t/t`Ùcà[]€ãt`t-t`t`t.4cà4ct`¥/¥,Ù/à4/Ù.Ù,4,Ù.4/t,»Çà¥%4.Ùc»4/Ù/¥,¥`¥/¥`4/t/¥.H4`4,4,t/¥`¥b»4/Ù/¥/t,4-4/¥,t.4`¥`tc»4/t/¥,¥bÙ.H4.¥/¥-4,¥at/¥-4,àãàô\W€X\ö›\ZŸ^Xõÿ\ô
+¬à à¥%4,4/¥`¥.¥.Ùc¥aÙ.4`¥cãààû‘Q“Só’SU”ó—T–””ìëP’—◊‘ëQíV^‹Ÿ\‹⁄[€ó⁄YHãà
+WKà ¥'¥`¥/4-t/t,ãàúY⁄[ó›[]€éû›]ZYHäWKàJKà
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJàãô]Kú›\ù›⁄]
+Q“Só’SU”ó—T–””ìëP’—◊‘ëQíV
+Bà
+Bà\ﬁ[ò»YàY⁄[ó›[]€óŸ\ÿ€€õôX›Ÿ ÿ[òX⁄Œàÿ[òX⁄‘]Y\ûJHOàõ€ôNÇàŸ\‹⁄[€ó⁄YH[ù
+ÿ[òX⁄Àô]Kú‹]
+éàãJVÃWJBàõ›»H]ÿZ]ãôŸ]‹Y⁄[ó›[]€ó‹Ÿ\‹⁄[€óÿûW⁄Y
+àÿ[òX⁄Àôúõ€W›\Ÿ\ãöYŸ\‹⁄[€ó⁄Yà
+BàYàõ›õ›ŒÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä¥(t-t`t`t.4c»4`Ù-¥-H4`Ù-4,4.Ù-t/t,ã⁄›◊ÿ[\ùUùYJBàô]\õÇà]ZYH›äõ›÷»úY⁄[ó›]ZYóJBàY⁄[ó‹ù[ù[YHHX[òYŸ\ãúY⁄[úÀúù[ù[Y\ÀôŸ]
+ÿ[òX⁄Àôúõ€W›\Ÿ\ãöY
+Bà€Y[ùHX[òYŸ\ãù[]€ãôŸ]ÿ€Y[ùÿûW‹Ÿ\‹⁄[€äàÿ[òX⁄Àôúõ€W›\Ÿ\ãöY]ZYŸ\‹⁄[€ó⁄Yà
+BàYàY⁄[ó‹ù[ù[YH[ô€Y[ùÇà]ÿZ]X[òYŸ\ãúY⁄[úÀô\‹]⁄
+àÿ[òX⁄Àôúõ€W›\Ÿ\ãöYàêíSë’◊’SU”ó—T–””ìëP’QãàY⁄[ó‹ù[ù[YKòY\\ãà€Y[ùà€õO]]ZYà
+Bà]ÿZ]X[òYŸ\ãù[]€ãú›‹‹Y⁄[äàÿ[òX⁄Àôúõ€W›\Ÿ\ãöY]ZY[]W‹Ÿ\‹⁄[€èUùYKàŸ\‹⁄[€ó⁄Y\Ÿ\‹⁄[€ó⁄Yà
+Bà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\äï[]€à4/¥`¥.¥.Ùc¥aÙdt/HäBà]ÿZ]⁄›◊‹Y⁄[ó›[]€äÿ[òX⁄ÀõY\‹ÿYŸKÿ[òX⁄Àôúõ€W›\Ÿ\ãöY]ZY
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]Kú›\ù›⁄]
+òÿ][Ÿ◊‹Xõ\⁄‹›\ùàäJBà\ﬁ[ò»Yàÿ][Ÿ◊‹Xõ\⁄‹›\ù
+ÿ[òX⁄Œàÿ[òX⁄‘]Y\ûK›]Nàî”P€€ù^
+HOàõ€ôNÇà]ZYHÿ[òX⁄Àô]Kú‹]
+éàãJVÃWBàY⁄[àH]ÿZ]ãôŸ]‹Y⁄[äÿ[òX⁄Àôúõ€W›\Ÿ\ãöY]ZY
+BàXõXÿ][€àH]ÿZ]ãôŸ]ÿÿ][Ÿ◊‹Y⁄[ä]ZY
+BàYàõ›Y⁄[éÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä¥(Ù`t`¥,4/t/¥,¥.Ù-t/t/tbÙ.H4/Ù.Ù,4,Ù.4/H4/t-H4/t,4.t-4-t/Hã⁄›◊ÿ[\ùUùYJBàô]\õÇàYàXõXÿ][€à[ô
+àXõXÿ][€ñ»ö\◊€ŸôöX⁄X[óBà‹àXõXÿ][€ñ»õ›€ô\ó›[Y‹ò[W⁄YóHOHÿ[òX⁄Àôúõ€W›\Ÿ\ãöYà
+NÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä¥+t`¥/¥`àURQ4`Ù-¥-H4/¥/Ù`Ù,t.Ù.4.¥/¥,¥,4/H4-4`4`Ù,Ù.4/4,4,¥`¥/¥`4/¥/ã⁄›◊ÿ[\ùUùYJBàô]\õÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä
+Bà]ÿZ]›]Kò€X\ä
+Bà]ÿZ]›]KúŸ]‹›]Jÿ][Ÿ‘Xõ\⁄›]Kô\ÿ‹ö\[€äBà]ÿZ]›]Kù\]WŸ]Jÿ][Ÿ◊›]ZY]]ZY
+Bà›\úô[ùH
+ààóó¥(¥-t.¥`Ùbt-t-H4/¥/Ù.4`t,4/t.4-NóèOû⁄[ô\ÿÿ\JXõXÿ][€ñ…Ÿ\ÿ‹ö\[€â◊J_O⁄OàÇàYàXõXÿ][€Çà[ŸHàÇà
+Bà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\äàº'„$è¥'Ù`Ù,t.Ù.4.¥,4a¥.4c»4/Ù.Ù,4,Ù.4/t,ÿèóóàÇà¥'¥`¥/Ù`4,4,¥c4`¥-H4/Ù/¥-4`4/¥,t/t/¥-H4/¥/Ù.4`t,4/t.4-Nà4aÙ`¥/à4-4-t.Ù,4-t`à4/Ù.Ù,4,Ù.4/K4.¥,4.à4-t,Ù/à4/t,4`t`¥`4/¥.4`¥c4.¥,4.¥.4-H4.¥/¥/4,4/t-4b»Çà¥/¥/H4-4/¥,t,4,¥.ÙcÙ-t`à4.4.¥,4.¥.4-H4`4,4-Ù`4-tb4-t/t.4c»4.4.Ù.4-Ù,4,¥.4`t.4/4/¥`t`¥.4-t/4`»4/t`Ù-¥/tbÀàÇàà¥'¥`à‘Q“Só––US—◊—T–‘íTS”ó”RSüH4-4/à‘Q“Só––US—◊—T–‘íTS”ó”PVH4`t.4/4,¥/¥.Ù/¥,ãàÇààûÿ›\úô[ùWó¥%4.Ùc»4/¥`¥/4-t/tbŒàÿÿ[òŸ[Çà
+BÇàõ›]\ãõY\‹ÿYŸJÿ][Ÿ‘Xõ\⁄›]Kô\ÿ‹ö\[€äBà\ﬁ[ò»Yàÿ][Ÿ◊‹Xõ\⁄Ÿ\ÿ‹ö\[€äY\‹ÿYŸNàY\‹ÿYŸK›]Nàî”P€€ù^
+HOàõ€ôNÇàûNÇà\ÿ‹ö\[€àHò[Y]Wÿÿ][Ÿ◊Ÿ\ÿ‹ö\[€äY\‹ÿYŸKù^‹ààäBà^Ÿ\ò[YQ\úõ‹à\»^ŒÇà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\äà∏ßc⁄[ô\ÿÿ\J›ä^ J_HäBàô]\õÇà]HH]ÿZ]›]KôŸ]Ÿ]J
+Bà]ZYH]KôŸ]
+òÿ][Ÿ◊›]ZYäBàY⁄[àH]ÿZ]ãôŸ]‹Y⁄[äY\‹ÿYŸKôúõ€W›\Ÿ\ãöY]ZY
+HYà]ZY[ŸHõ€ôBàYàõ›Y⁄[éÇà]ÿZ]›]Kò€X\ä
+Bà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\ä∏ßc4'Ù.Ù,4,Ù.4/H4,t/¥.Ùc4b4-H4/t-H4`Ù`t`¥,4/t/¥,¥.Ù-t/KàäBàô]\õÇà]ÿZ]›]Kù\]WŸ]Jÿ][Ÿ◊Ÿ\ÿ‹ö\[€èY\ÿ‹ö\[€äBàZWÿòYŸHHº'È%àè¥(t$Ù%t't%t(4&4(4'¥$¥$4't'à4&4&ÿèóààYàY⁄[ñ»òZWŸŸ[ô\ò]YóH[ŸHàÇà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\äàº'Â#àè¥'Ù`4-t-4/Ù`4/¥`t/4/¥`¥`4/Ù`Ù,t.Ù.4.¥,4a¥.4.ÿèóóàÇààûÿZWÿòYŸ_HÇààèèû⁄[ô\ÿÿ\J€\Y
+Y⁄[ñ…€ò[YI◊KL
+J_OÿèàÇààùû⁄[ô\ÿÿ\J€\Y
+Y⁄[ñ…›ô\ú⁄[€â◊KÃ
+J_WàÇààèOû⁄[ô\ÿÿ\J€\Y
+Y⁄[ñ…Ÿ\ÿ‹ö\[€â◊KL
+J_O⁄OóóàÇààû⁄[ô\ÿÿ\J\ÿ‹ö\[€ä_WóàÇàà¥'Ù`Ù,t.Ù.4aÙ/tbÙ.H4,4,¥`¥/¥`àèû⁄[ô\ÿÿ\J[Y‹ò[W‹Xõ\⁄\ó€ò[YJY\‹ÿYŸKôúõ€W›\Ÿ\äJ_OÿèóàÇà¥'Ù/¥`t.Ù-H4/Ù`Ù,t.Ù.4.¥,4a¥.4.4.Ùc¥,t/¥.H4/Ù/¥.Ùc4-Ù/¥,¥,4`¥-t.Ùc4,t/¥`¥,4`t/4/¥-¥-t`à4/Ù/¥`t/4/¥`¥`4-t`¥c4.4`t.¥,4aÙ,4`¥c4.4`tat/¥-4/t.4.ãàãàô\W€X\ö›\ZŸ^Xõÿ\ô
+¬à ∏ß!H4'¥/Ù`Ù,t.Ù.4.¥/¥,¥,4`¥cãàòÿ][Ÿ◊‹Xõ\⁄ŸŒû›]ZYHäWKà ¥'¥`¥/4-t/t,ãàúY⁄[ó⁄[ôõŒû›]ZYHäWKàJKà
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]Kú›\ù›⁄]
+òÿ][Ÿ◊‹Xõ\⁄ŸŒàäJBà\ﬁ[ò»Yàÿ][Ÿ◊‹Xõ\⁄Ÿ ÿ[òX⁄Œàÿ[òX⁄‘]Y\ûK›]Nàî”P€€ù^
+HOàõ€ôNÇà]ZYHÿ[òX⁄Àô]Kú‹]
+éàãJVÃWBà]HH]ÿZ]›]KôŸ]Ÿ]J
+BàYà]KôŸ]
+òÿ][Ÿ◊›]ZYäHOH]ZY‹àõ›]KôŸ]
+òÿ][Ÿ◊Ÿ\ÿ‹ö\[€àäNÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä¥(t-t`t`t.4c»4/Ù`Ù,t.Ù.4.¥,4a¥.4.4.4`t`¥-t.¥.Ù,ã⁄›◊ÿ[\ùUùYJBàô]\õÇàXõ\⁄YH]ÿZ]ãúXõ\⁄ÿÿ][Ÿ◊‹Y⁄[äàÿ[òX⁄Àôúõ€W›\Ÿ\ãöYà]ZYà[Y‹ò[W‹Xõ\⁄\ó€ò[YJÿ[òX⁄Àôúõ€W›\Ÿ\äKà]V»òÿ][Ÿ◊Ÿ\ÿ‹ö\[€àóKà
+Bà]ÿZ]›]Kò€X\ä
+BàYàõ›Xõ\⁄YÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä¥'Ù`Ù,t.Ù.4.¥,4a¥.4c»4/t-H4,¥bÙ/Ù/¥.Ù/t-t/t,ã⁄›◊ÿ[\ùUùYJBà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\äàïURQ4`Ù-¥-H4-Ù,4/tcÙ`à4.Ù.4,t/à4`Ù`t`¥,4/t/¥,¥.Ù-t/t/tbÙ.H4/Ù.Ù,4,Ù.4/H4,tbÙ.»4`Ù-4,4.Ùdt/KàÇà
+Bàô]\õÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä¥'¥/Ù`Ù,t.Ù.4.¥/¥,¥,4/t/àäBàXõ\⁄Y‹Y⁄[àH]ÿZ]ãôŸ]‹Y⁄[äÿ[òX⁄Àôúõ€W›\Ÿ\ãöY]ZY
+Bà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\äà∏ß!H4'Ù.Ù,4,Ù.4/H4/¥/Ù`Ù,t.Ù.4.¥/¥,¥,4/H4,à4/¥,tbt-t/4.¥,4`¥,4.Ù/¥,Ù-Kà4'¥/Ù.4`t,4/t.4-H4.4.4`tat/¥-4/t.4.à4`¥-t/Ù-t`4c4,¥.4-4/tb»4-4`4`Ù,Ù.4/4/Ù/¥.Ùc4-Ù/¥,¥,4`¥-t.ÙcÙ/àÇà
+»
+àóº'È%à4$à4.¥,4`4`¥/¥aÙ.¥-H4.¥,4`¥,4.Ù/¥,Ù,4-4/¥,t,4,¥.Ù-t/t,4/¥,tcÙ-Ù,4`¥-t.Ùc4/t,4c»4/Ù/¥/4-t`¥.¥,0™Ù(t$Ù%t't%t(4&4(4'¥$¥$4't'à4&4&0ÆÀàÇàYàXõ\⁄Y‹Y⁄[à[ôXõ\⁄Y‹Y⁄[ñ»òZWŸŸ[ô\ò]YóBà[ŸHàÇà
+Kàô\W€X\ö›\ZŸ^Xõÿ\ô
+÷ 	¸'ÈÎH4'¥`¥.¥`4bÙ`¥c4/Ù`Ù,t.Ù.4.¥,4a¥.4câÀàòÿ][Ÿ◊›öY]Œû›]ZYNåäWWJKà
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]Kú›\ù›⁄]
+òÿ][Ÿ◊›[úXõ\⁄ÿ\⁄ŒàäJBà\ﬁ[ò»Yàÿ][Ÿ◊›[úXõ\⁄ÿ\⁄ ÿ[òX⁄Œàÿ[òX⁄‘]Y\ûJHOàõ€ôNÇà]ZYHÿ[òX⁄Àô]Kú‹]
+éàãJVÃWBà][HH]ÿZ]ãôŸ]ÿÿ][Ÿ◊‹Y⁄[ä]ZY
+BàYàõ›][H‹à][V»õ›€ô\ó›[Y‹ò[W⁄YóHOHÿ[òX⁄Àôúõ€W›\Ÿ\ãöY‹à][V»ö\◊€ŸôöX⁄X[óNÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä¥$¥b»4/t-H4/4/¥-¥-t`¥-H4`Ù-4,4.Ù.4`¥c4ct`¥`»4/Ù`Ù,t.Ù.4.¥,4a¥.4càã⁄›◊ÿ[\ùUùYJBàô]\õÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä
+Bà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\äàà¥(Ù,t`4,4`¥cèû⁄[ô\ÿÿ\J][V…€ò[YI◊J_Oÿèà4.4-»4/¥,tbt-t,Ù/à4.¥,4`¥,4.Ù/¥,Ù,»Çà¥(Ù-¥-H4`Ù`t`¥,4/t/¥,¥.Ù-t/t/tbÙ-H4.¥/¥/Ù.4.4`»4-4`4`Ù,Ù.4aH4/Ù/¥.Ùc4-Ù/¥,¥,4`¥-t.Ù-t.H4/¥`t`¥,4/t`Ù`¥`tcÀàãàô\W€X\ö›\ZŸ^Xõÿ\ô
+¬à ¥%4,4`Ù,t`4,4`¥cãàòÿ][Ÿ◊›[úXõ\⁄ŸŒû›]ZYHäWKà ¥'¥`¥/4-t/t,ãàúY⁄[ó⁄[ôõŒû›]ZYHäWKàJKà
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]Kú›\ù›⁄]
+òÿ][Ÿ◊›[úXõ\⁄ŸŒàäJBà\ﬁ[ò»Yàÿ][Ÿ◊›[úXõ\⁄Ÿ ÿ[òX⁄Œàÿ[òX⁄‘]Y\ûJHOàõ€ôNÇà]ZYHÿ[òX⁄Àô]Kú‹]
+éàãJVÃWBàô[[›ôYH]ÿZ]ãù[úXõ\⁄ÿÿ][Ÿ◊‹Y⁄[äÿ[òX⁄Àôúõ€W›\Ÿ\ãöY]ZY
+Bà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä¥'Ù`Ù,t.Ù.4.¥,4a¥.4c»4`Ù-4,4.Ù-t/t,àYàô[[›ôY[ŸH¥'Ù`Ù,t.Ù.4.¥,4a¥.4c»4/t-H4/t,4.t-4-t/t,äBà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\äà
+à∏ß!H4'Ù.Ù,4,Ù.4/H4`Ù,t`4,4/H4.4-»4.¥,4`¥,4.Ù/¥,Ù,à4$¥,4b4,4`Ù`t`¥,4/t/¥,¥.Ù-t/t/t,4c»4.¥/¥/Ù.4c»4/t-H4.4-Ù/4-t/t-t/t,àÇàYàô[[›ôYà[ŸH¥'Ù`Ù,t.Ù.4.¥,4a¥.4c»4`Ù-¥-H4/¥`¥`t`Ù`¥`t`¥,¥`Ù-t`à4.4.Ù.4/Ù`4.4/t,4-4.Ù-t-¥.4`à4-4`4`Ù,Ù/¥/4`»4/Ù/¥.Ùc4-Ù/¥,¥,4`¥-t.ÙcãàÇà
+Kàô\W€X\ö›\ZŸ^Xõÿ\ô
+÷ 	¯´!{Ó#»4&à4/Ù.Ù,4,Ù.4/t`…ÀàúY⁄[ó⁄[ôõŒû›]ZYHäWWJKà
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]Kú›\ù›⁄]
+úY⁄[ó›ŸŸ€NàäJBà\ﬁ[ò»YàY⁄[ó›ŸŸ€Jÿ[òX⁄Œàÿ[òX⁄‘]Y\ûJHOàõ€ôNÇà]ZYHÿ[òX⁄Àô]Kú‹]
+éàãJVÃWBàûNÇà[òXõYH]ÿZ]X[òYŸ\ãúY⁄[úÀùŸŸ€Jÿ[òX⁄Àôúõ€W›\Ÿ\ãöY]ZY
+Bà^Ÿ\Ÿ^Q\úõ‹éÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä¥'Ù.Ù,4,Ù.4/H4/t-H4/t,4.t-4-t/Hã⁄›◊ÿ[\ùUùYJBàô]\õÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä¥'Ù.Ù,4,Ù.4/H4,¥.¥.Ùc¥aÙdt/HàYà[òXõY[ŸH¥'Ù.Ù,4,Ù.4/H4,¥bÙ.¥.Ùc¥aÙ-t/HäBà]ÿZ]⁄›◊€^W‹Y⁄[ú ÿ[òX⁄ÀõY\‹ÿYŸKÿ[òX⁄Àôúõ€W›\Ÿ\ãöY
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJàãô]Kú›\ù›⁄]
+àû‘Q“Só‘—USë‘◊––SêP“◊‘ëQíVNàäBà
+Bà\ﬁ[ò»Yà^\õò[‹Y⁄[ó‹Ÿ][ô‹ ÿ[òX⁄Œàÿ[òX⁄‘]Y\ûJHOàõ€ôNÇà\ù»Hÿ[òX⁄Àô]Kú‹]
+éàãäBà]ZYH\ù÷ÃWHYà[ä\ù HOH»[ŸHàÇàY⁄[ó‹ù[ù[YHHX[òYŸ\ãúY⁄[úÀúù[ù[Y\ÀôŸ]
+ÿ[òX⁄Àôúõ€W›\Ÿ\ãöY
+BàY⁄[àHY⁄[ó‹ù[ù[YKúY⁄[úÀôŸ]
+]ZY
+HYàY⁄[ó‹ù[ù[YH[ŸHõ€ôBàYàõ›Y⁄[à‹àõ›Y⁄[ãúŸ][ô‹◊‹YŸNÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä¥(t`¥`4,4/t.4a¥,4/t,4`t`¥`4/¥-t.à4/t-H4/t,4.t-4-t/t,ã⁄›◊ÿ[\ùUùYJBàô]\õÇàYàõ›Y⁄[ãô[òXõYÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\äà¥(t/t,4aÙ,4.Ù,4,¥.¥.Ùc¥aÙ.4`¥-H4/Ù.Ù,4,Ù.4/K4-Ù,4`¥-t/4/¥`¥.¥`4/¥.t`¥-H4/t,4`t`¥`4/¥.t.¥.àãà⁄›◊ÿ[\ùUùYKà
+Bàô]\õÇàûNÇà[ôYH]ÿZ]X[òYŸ\ãúY⁄[úÀô\‹]⁄›[Y‹ò[Wÿÿ[òX⁄ àÿ[òX⁄Àôúõ€W›\Ÿ\ãöYÿ[òX⁄¬à
+Bà^Ÿ\^Ÿ\[€éÇàŸŸŸ\ãô^Ÿ\[€ä¥'¥b4.4,t.¥,4`t`¥`4,4/t.4a¥b»4/t,4`t`¥`4/¥-t.à4/Ù.Ù,4,Ù.4/t,	\»ã]ZY
+Bà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\äà¥'Ù.Ù,4,Ù.4/H4-Ù,4,¥-t`4b4.4.»4`t`¥`4,4/t.4a¥`»4/t,4`t`¥`4/¥-t.à4`H4/¥b4.4,t.¥/¥.Kà4'Ù`4/¥,¥-t`4c4`¥-H4-¥`Ù`4/t,4.Ààãà⁄›◊ÿ[\ùUùYKà
+Bàô]\õÇàYàõ›[ôYÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\äà¥$4,¥`¥/¥`4`Ù.¥,4-Ù,4.»—USë‘◊‘Q—OUùYK4/t/à4/t-H4-Ù,4`4-t,Ù.4`t`¥`4.4`4/¥,¥,4.»4/¥,t`4,4,t/¥`¥aÙ.4.à4/t,4`t`¥`4/¥-t.ãàãà⁄›◊ÿ[\ùUùYKà
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]Kú›\ù›⁄]
+úY⁄[óŸ[]Wÿ\⁄ŒàäJBà\ﬁ[ò»YàY⁄[óŸ[]Wÿ\⁄ ÿ[òX⁄Œàÿ[òX⁄‘]Y\ûJHOàõ€ôNÇà]ZYHÿ[òX⁄Àô]Kú‹]
+éàãJVÃWBà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä
+Bà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\äà¥(Ù-4,4.Ù.4`¥c4/Ù.Ù,4,Ù.4/K4-t,Ù/à4.4`tat/¥-4/t.4.à4.4`t/¥at`4,4/tdt/t/t`Ùcà4-Ù,4/Ù.4`tc»ãàô\W€X\ö›\ZŸ^Xõÿ\ô
+¬à ¥%4,4`Ù-4,4.Ù.4`¥cãàúY⁄[óŸ[]WŸŒû›]ZYHäWKà ¥'¥`¥/4-t/t,ãàúY⁄[ó⁄[ôõŒû›]ZYHäWKàJKà
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]Kú›\ù›⁄]
+úY⁄[óŸ[]WŸŒàäJBà\ﬁ[ò»YàY⁄[óŸ[]WŸ ÿ[òX⁄Œàÿ[òX⁄‘]Y\ûJHOàõ€ôNÇà]ZYHÿ[òX⁄Àô]Kú‹]
+éàãJVÃWBà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä¥(Ù-4,4.ÙcÙc∏†)àäBàûNÇà]ÿZ]X[òYŸ\ãúY⁄[úÀô[]Jÿ[òX⁄Àôúõ€W›\Ÿ\ãöY]ZYÿ[òX⁄ Bà^Ÿ\^Ÿ\[€à\»^ŒÇàŸŸŸ\ãô^Ÿ\[€ä¥'¥b4.4,t.¥,4/¥,t`4,4,t/¥`¥aÙ.4.¥,4`Ù-4,4.Ù-t/t.4c»4/Ù.Ù,4,Ù.4/t,äBà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\äàà∏ßc4'Ù.Ù,4,Ù.4/H4/t-H4`Ù-4,4.Ùdt/Nà⁄[ô\ÿÿ\J€\Y
+^ÀL
+J_HÇà
+Bàô]\õÇà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\ä∏ß!H4'Ù.Ù,4,Ù.4/H4`Ù-4,4.Ùdt/KàäBà]ÿZ]⁄›◊€^W‹Y⁄[ú ÿ[òX⁄ÀõY\‹ÿYŸKÿ[òX⁄Àôúõ€W›\Ÿ\ãöY
+BÇà\ﬁ[ò»Yàô\]Z\ôWÿùZ[[ó‹Y⁄[äà\ôŸ]àY\‹ÿYŸK\Ÿ\ó⁄Yà[ù]ZYà›Çà
+HOàXÿ€›[ùù[ù[YHõ€ôNÇàù[ù[YHH]ÿZ]ô\]Z\ôW‹ù[ù[YJ\ôŸ]\Ÿ\ó⁄Y
+BàYàõ›ù[ù[YNÇàô]\õàõ€ôBàYàõ›X[òYŸ\ãúY⁄[úÀö\◊Ÿ[òXõY
+\Ÿ\ó⁄Y]ZY
+NÇà]ÿZ]\ôŸ]ò[ú›Ÿ\äà¥'Ù.Ù,4,Ù.4/H4/t-H4`Ù`t`¥,4/t/¥,¥.Ù-t/H4.4.Ù.4,¥bÙ.¥.Ùc¥aÙ-t/Kàãàô\W€X\ö›\ZŸ^Xõÿ\ô
+÷ º'ÈÎH4&¥,4`¥,4.Ù/¥,»4/Ù.Ù,4,Ù.4/t/¥,àãúY⁄[óÿÿ][ŸŒåäWWJKà
+Bàô]\õàõ€ôBàô]\õàù[ù[YBÇà\ﬁ[ò»Yà⁄›◊ÿ]]◊€›◊‹Y⁄[ä\ôŸ]àY\‹ÿYŸK\Ÿ\ó⁄Yà[ù
+HOàõ€ôNÇàù[ù[YHH]ÿZ]ô\]Z\ôWÿùZ[[ó‹Y⁄[ä\ôŸ]\Ÿ\ó⁄YUU◊”’◊‘Q“Só’URQ
+BàYàõ›ù[ù[YNÇàô]\õÇàûNÇàÀ€€[[€ã›\úô[òﬁHH]ÿZ]\ﬁ[ò⁄[Àù◊›ôXY
+àÿY€›⁄[ùô[ù‹ûKù[ù[YKòXÿ€›[ùà
+Bà^Ÿ\^Ÿ\[€éÇàŸŸŸ\ãô^Ÿ\[€ä¥'t-H4`Ù-4,4.Ù/¥`tc4/Ù/¥.Ù`ÙaÙ.4`¥c4.Ù/¥`¥b»4-4.Ùc»]]”›‘Y⁄[àäBà]ÿZ]\ôŸ]ò[ú›Ÿ\ä∏ßcù[î^H4/t-H4/¥`¥-4,4.»4`t/Ù.4`t/¥.à4.Ù/¥`¥/¥,ãàäBàô]\õÇà[€›»H€€[[€à
+»›\úô[òﬁBàX›]ôHH›[Jõ€€
+›òX›]ôJHõ‹à›[à[€› Bà]ÿZ]\ôŸ]ò[ú›Ÿ\äàº'Â‡àèê]]”›‘Y⁄[èÿèóóàÇàà¥$¥`t-t,Ù/à4/Ù`4-t-4.Ù/¥-¥-t/t.4.Nàèû€[ä[€› _OÿèóàÇàà¥$4.¥`¥.4,¥/t/éàèûÿX›]ô_Oÿèà0≠»4,¥bÙ.¥.Ùc¥aÙ-t/t/éàèû€[ä[€› HHX›]ô_OÿèóàÇàà¥'¥,tbÙaÙ/tbÙaH4.Ù/¥`¥/¥,éàèû€[ä€€[[€ä_Oÿèà0≠»4,¥,4.Ùc¥`¥/tbÙaNàèû€[ä›\úô[òﬁJ_OÿèóóàÇà¥$4.¥`¥.4,¥,4a¥.4c»4.4-4-t,4.¥`¥.4,¥,4a¥.4c»4/Ù`4.4/4-t/tcÙc¥`¥`tc»4.à4/¥,t/¥.4/4`¥.4/Ù,4/à4'Ù`4.4/4,4`t`t/¥,¥/¥/4`Ù-4,4.Ù-t/t.4.Çà¥/¥,tbÙaÙ/tbÙ-H4.Ù/¥`¥b»4`Ù-4,4.ÙcÙc¥`¥`tcÀ4,4,¥,4.Ùc¥`¥/tbÙ-H4/Ù`4-t-4.Ù/¥-¥-t/t.4c»4-4-t,4.¥`¥.4,¥.4`4`Ùc¥`¥`tcÀ4/Ù/¥`t.¥/¥.Ùc4.¥`»ù[î^HÇà¥at`4,4/t.4`à4.4aH4,Ù`4`Ù/Ù/Ù,4/4.àãàô\W€X\ö›\ZŸ^Xõÿ\ô
+¬à ∏ß!H4$4.¥`¥.4,¥.4`4/¥,¥,4`¥c4,¥`t-HãúôXYW€›ŒòX›]ò]HäWKà ∏¶Â4%4-t,4.¥`¥.4,¥.4`4/¥,¥,4`¥c4,¥`t-HãúôXYW€›ŒôXX›]ò]HäWKà º'Â‰H4(Ù-4,4.Ù.4`¥c4,¥`t-HãúôXYW€›Œô[]Wÿ\⁄»äWKà º'Â!4'¥,t/t/¥,¥.4`¥cãàòùZ[[ó€‹[éû–UU◊”’◊‘Q“Só’URQHäWKà ∏´!{Ó#»4'4/¥.4/Ù.Ù,4,Ù.4/tb»ãõ^W‹Y⁄[ú»äWKàJKà
+BÇà\ﬁ[ò»Yà⁄›◊‹›]\◊‹Y⁄[ä\ôŸ]àY\‹ÿYŸK\Ÿ\ó⁄Yà[ù
+HOàõ€ôNÇàYàõ›]ÿZ]ô\]Z\ôWÿùZ[[ó‹Y⁄[ä\ôŸ]\Ÿ\ó⁄Y’UT◊‘Q“Só’URQ
+NÇàô]\õÇà›]\◊›^H]ÿZ]ãôŸ]‹Y⁄[ó‹Ÿ][ô à\Ÿ\ó⁄Yà’UT◊‘Q“Só’URQàú›]\◊›^ãàº'ÁËà4'Ù`4/¥-4,4,¥-taà4/t,4`t,¥cÙ-Ù.à4'4/¥-¥-t`¥-H4/¥a4/¥`4/4.ÙcÙ`¥c4-Ù,4.¥,4-Ààãà
+Bà]ÿZ]\ôŸ]ò[ú›Ÿ\äàº'‰ËHèî›]\»Y⁄[èÿèóóàÇà¥'Ù/¥.¥`Ù/Ù,4`¥-t.Ùc4-4/¥.Ù-¥-t/H4/¥`¥/Ù`4,4,¥.4`¥c4,à4.Ù.4aÙ/t/¥/4aÙ,4`¥-Hù[î^H4.¥/¥/4,4/t-4`»€ŸOà‹›]\œÿ€ŸOãàÇà¥$t/¥`à4/¥`¥,¥-t`¥.4`à4`t.Ù-t-4`Ùc¥bt.4/4`¥-t.¥`t`¥/¥/óóàÇààèõÿ⁄‹][›Oû⁄[ô\ÿÿ\J›]\◊›^
+_Oÿõÿ⁄‹][›OóàÇà¥$à4`¥-t.¥`t`¥-H4`4,4,t/¥`¥,4c¥`à4/Ù-t`4-t/4-t/t/tbÙ-H4,4,¥`¥/¥/¥`¥,¥-t`¥aÙ.4.¥,à	\Ÿ\õò[YK	⁄]€ò[YK	Xÿ€›[ù€ò[YK	]H4.	[YKàãàô\W€X\ö›\ZŸ^Xõÿ\ô
+¬à ∏ß#˚Ó#»4&4-Ù/4-t/t.4`¥c4`t`¥,4`¥`Ù`HãúôXYW‹›]\ŒôY]äWKà ∏´!{Ó#»4'4/¥.4/Ù.Ù,4,Ù.4/tb»ãõ^W‹Y⁄[ú»äWKàJKà
+BÇà\ﬁ[ò»Yà⁄›◊ÿYò[òŸY‹›]◊‹Y⁄[ä\ôŸ]àY\‹ÿYŸK\Ÿ\ó⁄Yà[ù
+HOàõ€ôNÇàYàõ›]ÿZ]ô\]Z\ôWÿùZ[[ó‹Y⁄[äà\ôŸ]\Ÿ\ó⁄YQêSê—Q‘’U◊‘Q“Só’URQà
+NÇàô]\õÇà]ÿZ]\ôŸ]ò[ú›Ÿ\äàº'‰‚èêYò[òŸYõŸö[H›]œÿèóóàÇà¥$¥bÙ,t-t`4.4`¥-H4/Ù-t`4.4/¥-à4'Ù.Ù,4,Ù.4/H4/Ù/¥`taÙ.4`¥,4-t`à4/Ù`4/¥-4,4-¥.4.4,¥bÙ`4`ÙaÙ.¥`À4-Ù,4`¥-t/4-4/¥,t,4,¥.4`à4,4.¥`¥`Ù,4.Ùc4/tbÙ.HÇà¥,t,4.Ù,4/t`K4-4/¥`t`¥`Ù/Ù/t`Ùcà4.à4,¥bÙ,¥/¥-4`»4`t`Ù/4/4`»4.4`t`4-t-4`t`¥,¥,4/t,4`Ù-4-t`4-¥,4/t.4.àãàô\W€X\ö›\ZŸ^Xõÿ\ô
+¬à åç4aÙ,4`t,ãúôXYW‹›]ŒåHäK
+ç»4-4/t-t.HãúôXYW‹›]Œç»äWKà åÃ4-4/t-t.HãúôXYW‹›]ŒåÃäK
+éL4-4/t-t.HãúôXYW‹›]ŒéLäWKà ¥$Ù/¥-ãúôXYW‹›]ŒåÕçHäK
+¥$¥`tdH4,¥`4-t/4c»ãúôXYW‹›]Œò[äWKà ∏´!{Ó#»4'4/¥.4/Ù.Ù,4,Ù.4/tb»ãõ^W‹Y⁄[ú»äWKàJKà
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]Kú›\ù›⁄]
+òùZ[[ó€‹[éàäJBà\ﬁ[ò»YàùZ[[ó‹Y⁄[ó€‹[äÿ[òX⁄Œàÿ[òX⁄‘]Y\ûJHOàõ€ôNÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä
+Bà]ZYHÿ[òX⁄Àô]Kú‹]
+éàãJVÃWBàYà]ZYOHUU◊”’◊‘Q“Só’URQÇà]ÿZ]⁄›◊ÿ]]◊€›◊‹Y⁄[äÿ[òX⁄ÀõY\‹ÿYŸKÿ[òX⁄Àôúõ€W›\Ÿ\ãöY
+Bà[Yà]ZYOHQêSê—Q‘’U◊‘Q“Só’URQÇà]ÿZ]⁄›◊ÿYò[òŸY‹›]◊‹Y⁄[äÿ[òX⁄ÀõY\‹ÿYŸKÿ[òX⁄Àôúõ€W›\Ÿ\ãöY
+Bà[Yà]ZYOH’UT◊‘Q“Só’URQÇà]ÿZ]⁄›◊‹›]\◊‹Y⁄[äÿ[òX⁄ÀõY\‹ÿYŸKÿ[òX⁄Àôúõ€W›\Ÿ\ãöY
+Bà[ŸNÇà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\ä¥%4.Ùc»4ct`¥/¥,Ù/à4/Ù.Ù,4,Ù.4/t,4/t-t`à4,¥`t`¥`4/¥-t/t/t/¥.H4`t`¥`4,4/t.4a¥b»4/t,4`t`¥`4/¥-t.ãàäBÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]Kú›\ù›⁄]
+úôXYW€›ŒàäJBà\ﬁ[ò»YàôXYW€›◊ÿX›[€äÿ[òX⁄Œàÿ[òX⁄‘]Y\ûJHOàõ€ôNÇàX›[€àHÿ[òX⁄Àô]Kú‹]
+éàãJVÃWBàù[ù[YHH]ÿZ]ô\]Z\ôWÿùZ[[ó‹Y⁄[äàÿ[òX⁄ÀõY\‹ÿYŸKÿ[òX⁄Àôúõ€W›\Ÿ\ãöYUU◊”’◊‘Q“Só’URQà
+BàYàõ›ù[ù[YNÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä
+Bàô]\õÇàYàX›[€àOHô[]Wÿ\⁄»éÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä
+Bà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\äà∏¶®;Ó#»è¥(Ù-4,4.Ù.4`¥c4,¥`t-H4/¥,tbÙaÙ/tbÙ-H4.Ù/¥`¥bœœÿèóóàÇà¥'¥/Ù-t`4,4a¥.4c»4/t-t/¥,t`4,4`¥.4/4,à4$¥,4.Ùc¥`¥/tbÙ-H4/Ù`4-t-4.Ù/¥-¥-t/t.4c»4,t`Ù-4`Ù`à4-4-t,4.¥`¥.4,¥.4`4/¥,¥,4/tbÀàÇà¥'Ù`4/¥-4/¥.Ù-¥.4`¥c»ãàô\W€X\ö›\ZŸ^Xõÿ\ô
+¬à ¥%4,4`Ù-4,4.Ù.4`¥c4,¥`t-HãúôXYW€›Œô[]HäWKà ¥'¥`¥/4-t/t,ãàòùZ[[ó€‹[éû–UU◊”’◊‘Q“Só’URQHäWKàJKà
+Bàô]\õÇàYàX›[€àõ›[à»òX›]ò]HãôXX›]ò]Hãô[]HüNÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä¥'t-t.4-Ù,¥-t`t`¥/t/¥-H4-4-t.t`t`¥,¥.4-Hã⁄›◊ÿ[\ùUùYJBàô]\õÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä¥$¥bÙ/Ù/¥.Ù/tcÙc∏†)àäBàõŸ‹ô\‹»H]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\äà∏£Ï»4'¥,t`4,4,t,4`¥bÙ,¥,4cà4.Ù/¥`¥b»4/Ù/¥`t.Ù-t-4/¥,¥,4`¥-t.Ùc4/t/ãà4+t`¥/à4/4/¥-¥-t`à4-Ù,4/tcÙ`¥c4/t-t`t.¥/¥.Ùc4.¥/à4/4.4/t`Ù`ãàÇà
+BàûNÇàô\›[H]ÿZ]\ﬁ[ò⁄[Àù◊›ôXY
+à\Wÿù[◊€›ÿX›[€ãù[ù[YKòXÿ€›[ùX›[€Çà
+Bà^Ÿ\^Ÿ\[€à\»^ŒÇàŸŸŸ\ãô^Ÿ\[€ä¥'¥b4.4,t.¥,4/4,4`t`t/¥,¥/¥,Ù/à4`Ù/Ù`4,4,¥.Ù-t/t.4c»4.Ù/¥`¥,4/4.äBà]ÿZ]õŸ‹ô\‹ÀôY]›^
+àà∏ßc4'¥/Ù-t`4,4a¥.4c»4/t-H4,¥bÙ/Ù/¥.Ù/t-t/t,à⁄[ô\ÿÿ\J€\Y
+^Àå
+J_HÇà
+Bàô]\õÇàX›[€ó€Xô[H¬àòX›]ò]Héà¥,4.¥`¥.4,¥.4`4/¥,¥,4/t/àãàôXX›]ò]Héà¥-4-t,4.¥`¥.4,¥.4`4/¥,¥,4/t/àãàô[]Héà¥`Ù-4,4.Ù-t/t/ãÙ-4-t,4.¥`¥.4,¥.4`4/¥,¥,4/t/àãàVÿX›[€óBà\úõ‹ú»Hóàãöõ⁄[äàà∏†(à⁄[ô\ÿÿ\J\úõ‹ä_Hàõ‹à\úõ‹à[àô\›[ô\úõ‹ú÷ŒåLBà
+Bà\úõ‹ó›^H
+ààóó¥'¥b4.4,t/¥.éàèû€[äô\›[ô\úõ‹ú _OÿèóûŸ\úõ‹úﬂHÇàYàô\›[ô\úõ‹ú¬à[ŸHàÇà
+Bà]ÿZ]õŸ‹ô\‹ÀôY]›^
+àà∏ß!H4%Ù,4,¥-t`4b4-t/t/éàÿX›[€ó€Xô[Hèû‹ô\›[ò⁄[ôŸYOÿèà4/Ù`4-t-4.Ù/¥-¥-t/t.4.KóàÇàà¥'t,4.t-4-t/t/à4/¥,tbÙaÙ/tbÙaNà‹ô\›[ò€€[[€ó››[K4,¥,4.Ùc¥`¥/tbÙaNà‹ô\›[ò›\úô[òﬁW››[HÇààûŸ\úõ‹ó›^Hãàô\W€X\ö›\ZŸ^Xõÿ\ô
+¬à º'Â!4'¥,t/t/¥,¥.4`¥c4`t/Ù.4`t/¥.àãàòùZ[[ó€‹[éû–UU◊”’◊‘Q“Só’URQHäWBàJKà
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]Kú›\ù›⁄]
+úôXYW‹›]ŒàäJBà\ﬁ[ò»YàôXYW‹›]◊‹\ö[Ÿ
+ÿ[òX⁄Œàÿ[òX⁄‘]Y\ûJHOàõ€ôNÇàù[ù[YHH]ÿZ]ô\]Z\ôWÿùZ[[ó‹Y⁄[äàÿ[òX⁄ÀõY\‹ÿYŸKÿ[òX⁄Àôúõ€W›\Ÿ\ãöYQêSê—Q‘’U◊‘Q“Só’URQà
+BàYàõ›ù[ù[YNÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä
+Bàô]\õÇàò]◊‹\ö[ŸHÿ[òX⁄Àô]Kú‹]
+éàãJVÃWBà^\»Hõ€ôHYàò]◊‹\ö[ŸOHò[à[ŸH[ù
+ò]◊‹\ö[Ÿ
+Bà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä¥(t/¥,t.4`4,4cà4`t`¥,4`¥.4`t`¥.4.¥`¯†)àäBàûNÇà›]»H]ÿZ]\ﬁ[ò⁄[Àù◊›ôXY
+ÿY‹ÿ[\◊‹›]Àù[ù[YKòXÿ€›[ù^\ Bà^Ÿ\^Ÿ\[€éÇàŸŸŸ\ãô^Ÿ\[€äêYò[òŸYõŸö[H›]»4/t-H4/Ù/¥.Ù`ÙaÙ.4.»4/Ù`4/¥-4,4-¥.äBà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\ä∏ßcù[î^H4/t-H4/¥`¥-4,4.»4.4`t`¥/¥`4.4cà4/Ù`4/¥-4,4-ãàäBàô]\õÇàûNÇàò[[òŸHH]ÿZ]\ﬁ[ò⁄[Àù◊›ôXY
+ÿYŸ]Z[Yÿò[[òŸKù[ù[YKòXÿ€›[ù
+Bàò[[òŸW›^H
+àóóº'‰¨»è¥(t`4-t-4`t`¥,¥,ÿèóàÇàà¥'4/¥-¥/t/à4,¥bÙ,¥-t`t`¥.àèûŸõ‹õX]€[€ô^Jò[[òŸKò]òZ[XõW‹ùXä_H8†ØH0≠»ÇààûŸõ‹õX]€[€ô^Jò[[òŸKò]òZ[XõW›\Ÿ
+_H	0≠»Ÿõ‹õX]€[€ô^Jò[[òŸKò]òZ[XõWŸ]\ä_H8†´ÿèóàÇàà¥'t,4`Ù-4-t`4-¥,4/t.4.àŸõ‹õX]€[€ô^Jò[[òŸKù›[‹ùXàHò[[òŸKò]òZ[XõW‹ùXä_H8†ØH0≠»ÇààûŸõ‹õX]€[€ô^Jò[[òŸKù›[›\ŸHò[[òŸKò]òZ[XõW›\Ÿ
+_H	0≠»ÇààûŸõ‹õX]€[€ô^Jò[[òŸKù›[Ÿ]\àHò[[òŸKò]òZ[XõWŸ]\ä_H8†´àÇàà¥$¥`t-t,Ù/éàŸõ‹õX]€[€ô^Jò[[òŸKù›[‹ùXä_H8†ØH0≠»Ÿõ‹õX]€[€ô^Jò[[òŸKù›[›\Ÿ
+_H	0≠»ÇààûŸõ‹õX]€[€ô^Jò[[òŸKù›[Ÿ]\ä_H8†´Çà
+Bà^Ÿ\^Ÿ\[€éÇàŸŸŸ\ãô^Ÿ\[€äêYò[òŸYõŸö[H›]»4/t-H4/Ù/¥.Ù`ÙaÙ.4.»4,t,4.Ù,4/t`HäBàò[[òŸW›^Hóó∏¶®;Ó#»4't-H4`Ù-4,4.Ù/¥`tc4-Ù,4,Ù`4`Ù-Ù.4`¥c4/Ù/¥-4`4/¥,t/tbÙ.H4,t,4.Ù,4/t`KàÇà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\äàõ‹õX]‹ÿ[\◊‹›] ›] H
+»ò[[òŸW›^àô\W€X\ö›\ZŸ^Xõÿ\ô
+¬à º'‰·H4%4`4`Ù,Ù/¥.H4/Ù-t`4.4/¥-ãàòùZ[[ó€‹[éû–QêSê—Q‘’U◊‘Q“Só’URQHäWBàJKà
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]HOHúôXYW‹›]\ŒôY]äBà\ﬁ[ò»YàôXYW‹›]\◊ŸY]
+ÿ[òX⁄Œàÿ[òX⁄‘]Y\ûK›]Nàî”P€€ù^
+HOàõ€ôNÇàYàõ›]ÿZ]ô\]Z\ôWÿùZ[[ó‹Y⁄[äàÿ[òX⁄ÀõY\‹ÿYŸKÿ[òX⁄Àôúõ€W›\Ÿ\ãöY’UT◊‘Q“Só’URQà
+NÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä
+Bàô]\õÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä
+Bà]ÿZ]›]Kò€X\ä
+Bà]ÿZ]›]KúŸ]‹›]J›]\‘Y⁄[î›]Kù^
+Bà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\äà¥'¥`¥/Ù`4,4,¥c4`¥-H4/t/¥,¥bÙ.H4`¥-t.¥`t`à4`t`¥,4`¥`Ù`t,à4/¥`àH4-4/àå4`t.4/4,¥/¥.Ù/¥,ãàÇà¥(4,4-Ù`4-tb4-t/tb»4/Ù-t`4-t/4-t/t/tbÙ-H4,4,¥`¥/¥/¥`¥,¥-t`¥aÙ.4.¥,à4%4.Ùc»4/¥`¥/4-t/tbŒàÿÿ[òŸ[Çà
+BÇàõ›]\ãõY\‹ÿYŸJ›]\‘Y⁄[î›]Kù^ãù^
+Bà\ﬁ[ò»YàôXYW‹›]\◊‹ÿ]ôJY\‹ÿYŸNàY\‹ÿYŸK›]Nàî”P€€ù^
+HOàõ€ôNÇàYàõ›X[òYŸ\ãúY⁄[úÀö\◊Ÿ[òXõY
+Y\‹ÿYŸKôúõ€W›\Ÿ\ãöY’UT◊‘Q“Só’URQ
+NÇà]ÿZ]›]Kò€X\ä
+Bà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\äî›]\»Y⁄[à4,¥bÙ.¥.Ùc¥aÙ-t/H4.4.Ù.4`Ù-4,4.Ùdt/KàäBàô]\õÇàò[YHHY\‹ÿYŸKù^ú›ö\
+
+BàYàõ›HH[äò[YJHHåÇà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\ä¥(¥-t.¥`t`à4-4/¥.Ù-¥-t/H4`t/¥-4-t`4-¥,4`¥c4/¥`àH4-4/àå4`t.4/4,¥/¥.Ù/¥,ãàäBàô]\õÇà]ÿZ]ãúŸ]‹Y⁄[ó‹Ÿ][ô àY\‹ÿYŸKôúõ€W›\Ÿ\ãöY’UT◊‘Q“Só’URQú›]\◊›^ãò[YBà
+Bà]ÿZ]›]Kò€X\ä
+Bà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\ä∏ß!H4(t`¥,4`¥`Ù`H4`t/¥at`4,4/tdt/KàäBà]ÿZ]⁄›◊‹›]\◊‹Y⁄[äY\‹ÿYŸKY\‹ÿYŸKôúõ€W›\Ÿ\ãöY
+BÇà\ﬁ[ò»Yà⁄›◊ÿ⁄]ÿÿ\õ›\Ÿ[
+\ôŸ]àY\‹ÿYŸK\Ÿ\ó⁄Yà[ù[ô^à[ù
+HOàõ€ôNÇàù[ù[YHH]ÿZ]ô\]Z\ôW‹ù[ù[YJ\ôŸ]\Ÿ\ó⁄Y
+BàYàõ›ù[ù[YNÇàô]\õÇàûNÇà⁄]◊€X\H]ÿZ]\ﬁ[ò⁄[Àù◊›ôXY
+ù[ù[YKòXÿ€›[ùôŸ]ÿ⁄]ÀùYJBà^Ÿ\^Ÿ\[€éÇàŸŸŸ\ãô^Ÿ\[€ä¥'t-H4`Ù-4,4.Ù/¥`tc4/Ù/¥.Ù`ÙaÙ.4`¥c4aÙ,4`¥b»äBà]ÿZ]\ôŸ]ò[ú›Ÿ\ä∏ßc4't-H4`Ù-4,4.Ù/¥`tc4/Ù/¥.Ù`ÙaÙ.4`¥c4`t/Ù.4`t/¥.à4aÙ,4`¥/¥,ãàäBàô]\õÇà⁄]◊€\›H\›
+⁄]◊€X\ùò[Y\ 
+JBàYàõ›⁄]◊€\›Çà]ÿZ]\ôŸ]ò[ú›Ÿ\ä¥)Ù,4`¥/¥,à4/Ù/¥.¥,4/t-t`ãàãô\W€X\ö›\ZŸ^Xõÿ\ô
+÷ ∏´!{Ó#»4'4-t/tcàãõY[ùHäWWJJBàô]\õÇà[ô^	OH[ä⁄]◊€\›
+Bà⁄]H⁄]◊€\›⁄[ô^Bàô]ö[›\◊⁄[ô^H
+[ô^HJH	H[ä⁄]◊€\›
+Bàô^⁄[ô^H
+[ô^
+»JH	H[ä⁄]◊€\›
+Bà[úôXYHº'ÁË4-t`t`¥c4/t-t/Ù`4/¥aÙ.4`¥,4/t/tbÙ-HàYà⁄]ù[úôXY[ŸH∏¶™à4/Ù`4/¥aÙ.4`¥,4/HÇà^H
+ààº'‰´èû⁄[ô\ÿÿ\J⁄]õò[YH‹à	¯†%	 _OÿèóàÇàà¥)Ù,4`éà€ŸOûÿ⁄]öYOÿ€ŸOà0≠»›[úôXYWàÇàà¥'Ù/¥-Ù.4a¥.4cŒàèû⁄[ô^
+»_Kﬁ€[ä⁄]◊€\›
+_OÿèóóàÇààèôOû⁄[ô\ÿÿ\J€\Y
+⁄]õ\›€Y\‹ÿYŸW›^‹à	÷Ù.4-Ù/¥,t`4,4-¥-t/t.4-WIÀN
+J_O‹ôOàÇà
+BàX\ö›\H[õ[ôRŸ^Xõÿ\ôX\ö›\
+[õ[ôW⁄Ÿ^Xõÿ\ôV¬à¬à[õ[ôRŸ^Xõÿ\ôù]€ä^H∏´!{Ó#»ãÿ[òX⁄◊Ÿ]OYàò⁄]›öY]Œû‹ô]ö[›\◊⁄[ô^HäKà[õ[ôRŸ^Xõÿ\ôù]€ä^Yàû⁄[ô^
+»_Kﬁ€[ä⁄]◊€\›
+_Hãÿ[òX⁄◊Ÿ]OHõõ€‹äKà[õ[ôRŸ^Xõÿ\ôù]€ä^H∏ß®{Ó#»ãÿ[òX⁄◊Ÿ]OYàò⁄]›öY]Œû€ô^⁄[ô^HäKàKà“[õ[ôRŸ^Xõÿ\ôù]€ä^Hº'‰Âà4$¥-t`tc4.¥`4,4`t.4,¥bÙ.H4aÙ,4`àãÿ[òX⁄◊Ÿ]OYàò⁄]Ÿù[ûÿ⁄]öYNû⁄[ô^HäWKà¬à[õ[ôRŸ^Xõÿ\ôù]€ä^H∏°™{Ó#»4'¥`¥,¥-t`¥.4`¥cãÿ[òX⁄◊Ÿ]OYàúô\Nûÿ⁄]öYHäKà[õ[ôRŸ^Xõÿ\ôù]€ä^Hº'‰Ì»4)4/¥`¥/àãÿ[òX⁄◊Ÿ]OYàö[XYŸWÿ⁄]ûÿ⁄]öYHäKàKà¬à[õ[ôRŸ^Xõÿ\ôù]€ä^Hº'„$ù[î^Hã\õYàöŒãÀŸù[ú^Kò€€Kÿ⁄]œ€õŸO^ÿ⁄]öYHäKà[õ[ôRŸ^Xõÿ\ôù]€ä^H∏´!{Ó#»4'4-t/tcàãÿ[òX⁄◊Ÿ]OHõY[ùHäKàKàJBàûNÇà]ÿZ]\ôŸ]ôY]›^
+^ô\W€X\ö›\[X\ö›\
+Bà^Ÿ\[Y‹ò[PòYô\]Y\›Çà]ÿZ]\ôŸ]ò[ú›Ÿ\ä^ô\W€X\ö›\[X\ö›\
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]HOHò⁄]»äBà\ﬁ[ò»Yà⁄] ÿ[òX⁄Œàÿ[òX⁄‘]Y\ûJHOàõ€ôNÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä¥%Ù,4,Ù`4`Ù-¥,4c∏†)àäBà]ÿZ]⁄›◊ÿ⁄]ÿÿ\õ›\Ÿ[
+ÿ[òX⁄ÀõY\‹ÿYŸKÿ[òX⁄Àôúõ€W›\Ÿ\ãöY
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]Kú›\ù›⁄]
+ò⁄]›öY]ŒàäJBà\ﬁ[ò»Yà⁄]›öY] ÿ[òX⁄Œàÿ[òX⁄‘]Y\ûJHOàõ€ôNÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä
+Bà]ÿZ]⁄›◊ÿ⁄]ÿÿ\õ›\Ÿ[
+ÿ[òX⁄ÀõY\‹ÿYŸKÿ[òX⁄Àôúõ€W›\Ÿ\ãöY[ù
+ÿ[òX⁄Àô]Kú‹]
+éàäVÃWJJBÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]Kú›\ù›⁄]
+ò⁄]Ÿù[àäJBà\ﬁ[ò»Yà⁄]Ÿù[
+ÿ[òX⁄Œàÿ[òX⁄‘]Y\ûJHOàõ€ôNÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä¥%Ù,4,Ù`4`Ù-¥,4cà4.4`t`¥/¥`4.4c∏†)àäBàÀò]◊ÿ⁄]⁄Yò]◊⁄[ô^Hÿ[òX⁄Àô]Kú‹]
+éàãäBàù[ù[YHH]ÿZ]ô\]Z\ôW‹ù[ù[YJÿ[òX⁄ÀõY\‹ÿYŸKÿ[òX⁄Àôúõ€W›\Ÿ\ãöY
+BàYàõ›ù[ù[YNÇàô]\õÇàûNÇà⁄]ù[òÿ]YH]ÿZ]\ﬁ[ò⁄[Àù◊›ôXY
+àÿYŸù[ÿ⁄]ù[ù[YKòXÿ€›[ù[ù
+ò]◊ÿ⁄]⁄Y
+Bà
+Bà⁄[ö‹»Hõ‹õX]ÿ⁄]⁄\›‹ûJ⁄]ù[ù[YKòXÿ€›[ùöY
+Bà^Ÿ\^Ÿ\[€éÇàŸŸŸ\ãô^Ÿ\[€ä¥'t-H4`Ù-4,4.Ù/¥`tc4/Ù/¥.Ù`ÙaÙ.4`¥c4/Ù/¥.Ù/t`Ùcà4.4`t`¥/¥`4.4cà4aÙ,4`¥,	\»ãò]◊ÿ⁄]⁄Y
+Bà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\ä∏ßcù[î^H4/t-H4/¥`¥-4,4.»4.4`t`¥/¥`4.4cà4ct`¥/¥,Ù/à4aÙ,4`¥,àäBàô]\õÇàYàù[òÿ]YÇà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\äà∏°.{Ó#»4'Ù/¥.¥,4-Ù,4/tb»4/Ù/¥`t.Ù-t-4/t.4-Hå4`t/¥/¥,tbt-t/t.4.Nà4ct`¥/à4-Ù,4bt.4`¥/tbÙ.H4.Ù.4/4.4`à4-4.Ùc»4/¥aÙ-t/tc4-4.Ù.4/t/tbÙaH4aÙ,4`¥/¥,ãàÇà
+Bàõ‹à[ô^⁄[ö»[à[ù[Y\ò]J⁄[ö‹ NÇàX\ö›\Hõ€ôBàYà[ô^OH[ä⁄[ö‹ HHNÇàX\ö›\HŸ^Xõÿ\ô
+¬à ∏°™{Ó#»4'¥`¥,¥-t`¥.4`¥cãàúô\Nû‹ò]◊ÿ⁄]⁄YHäK
+º'‰Ì»4)4/¥`¥/àãàö[XYŸWÿ⁄]û‹ò]◊ÿ⁄]⁄YHäWKà ∏°™{Ó#»4&à4.¥,4`4`¥/¥aÙ.¥-H4aÙ,4`¥,ãàò⁄]›öY]Œû‹ò]◊⁄[ô^HäWKàJBà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\ä⁄[öÀô\W€X\ö›\[X\ö›\\ÿXõW›ŸXó‹YŸW‹ô]öY]œUùYJBÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]Kú›\ù›⁄]
+úô\NàäJBà\ﬁ[ò»Yàô\WŸúõ€W€õ›YöXÿ][€äÿ[òX⁄Œàÿ[òX⁄‘]Y\ûK›]Nàî”P€€ù^
+HOàõ€ôNÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä
+Bà⁄]⁄YHÿ[òX⁄Àô]Kú‹]
+éàãJVÃWBàYàõ›⁄]⁄Yö\ŸY⁄]
+
+H‹àõ›]ÿZ]ô\]Z\ôW‹ù[ù[YJÿ[òX⁄ÀõY\‹ÿYŸKÿ[òX⁄Àôúõ€W›\Ÿ\ãöY
+NÇàô]\õÇà]ÿZ]›]Kò€X\ä
+Bà]ÿZ]›]KúŸ]‹›]JŸ[ôY\‹ÿYŸT›]Kù^
+Bà]ÿZ]›]Kù\]WŸ]J⁄]⁄YZ[ù
+⁄]⁄Y
+JBà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\äà¥$¥,¥-t-4.4`¥-H4/¥`¥,¥-t`à4/Ù/¥.¥`Ù/Ù,4`¥-t.Ùcãà4'4/¥-¥/t/à4.4`t/Ù/¥.Ùc4-Ù/¥,¥,4`¥c4/Ù-t`4-t/4-t/t/tbÙ-H4.4-»4`4,4-Ù-4-t.Ù,4,4,¥`¥/¥/¥`¥,¥-t`¥aÙ.4.¥,4.4.Ù.ÿÿ[òŸ[àÇà
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]HOHúŸ[ô€Y\‹ÿYŸHäBà\ﬁ[ò»YàŸ[ô€Y\‹ÿYŸWÿôY⁄[äÿ[òX⁄Œàÿ[òX⁄‘]Y\ûK›]Nàî”P€€ù^
+HOàõ€ôNÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä
+BàYàõ›]ÿZ]ô\]Z\ôW‹ù[ù[YJÿ[òX⁄ÀõY\‹ÿYŸKÿ[òX⁄Àôúõ€W›\Ÿ\ãöY
+NÇàô]\õÇà]ÿZ]›]Kò€X\ä
+Bà]ÿZ]›]KúŸ]‹›]JŸ[ôY\‹ÿYŸT›]Kò⁄]⁄Y
+Bà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\ä¥$¥,¥-t-4.4`¥-H4aÙ.4`t.Ù/¥,¥/¥.HQ4aÙ,4`¥,4.4-»4`4,4-Ù-4-t.Ù,0™Ù'Ù/¥`t.Ù-t-4/t.4-H4aÙ,4`¥bÆ»4.4.Ù.ÿÿ[òŸ[àäBÇàõ›]\ãõY\‹ÿYŸJŸ[ôY\‹ÿYŸT›]Kò⁄]⁄Yãù^
+Bà\ﬁ[ò»YàŸ[ô€Y\‹ÿYŸWÿ⁄]
+Y\‹ÿYŸNàY\‹ÿYŸK›]Nàî”P€€ù^
+HOàõ€ôNÇàò[YHHY\‹ÿYŸKù^ú›ö\
+
+BàYàõ›ò[YKö\ŸY⁄]
+
+NÇà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\äíQ4aÙ,4`¥,4-4/¥.Ù-¥-t/H4`t/¥`t`¥/¥cÙ`¥c4.4-»4a¥.4a4`àäBàô]\õÇà]ÿZ]›]Kù\]WŸ]J⁄]⁄YZ[ù
+ò[YJJBà]ÿZ]›]KúŸ]‹›]JŸ[ôY\‹ÿYŸT›]Kù^
+Bà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\ä¥(¥-t/Ù-t`4c4/¥`¥/Ù`4,4,¥c4`¥-H4`¥-t.¥`t`à4`t/¥/¥,tbt-t/t.4c»
+4-4/à4`t.4/4,¥/¥.Ù/¥,äKàäBÇàõ›]\ãõY\‹ÿYŸJŸ[ôY\‹ÿYŸT›]Kù^ãù^
+Bà\ﬁ[ò»YàŸ[ô€Y\‹ÿYŸW›^
+Y\‹ÿYŸNàY\‹ÿYŸK›]Nàî”P€€ù^
+HOàõ€ôNÇàò[YHHY\‹ÿYŸKù^ú›ö\
+
+BàYàõ›ò[YH‹à[äò[YJHàÇà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\ä¥(¥-t.¥`t`à4-4/¥.Ù-¥-t/H4`t/¥-4-t`4-¥,4`¥c4/¥`àH4-4/à4`t.4/4,¥/¥.Ù/¥,ãàäBàô]\õÇàù[ù[YHH]ÿZ]ô\]Z\ôW‹ù[ù[YJY\‹ÿYŸKY\‹ÿYŸKôúõ€W›\Ÿ\ãöY
+BàYàõ›ù[ù[YNÇà]ÿZ]›]Kò€X\ä
+Bàô]\õÇà]HH]ÿZ]›]KôŸ]Ÿ]J
+Bà⁄]Hù[ù[YKòXÿ€›[ùôŸ]ÿ⁄]ÿûW⁄Y
+]V»ò⁄]⁄YóJBà‹ô\àHõ€ôBàYà]KôŸ]
+õ‹ô\ó⁄YäNÇàûNÇà‹ô\àH]ÿZ]\ﬁ[ò⁄[Àù◊›ôXY
+ù[ù[YKòXÿ€›[ùôŸ]€‹ô\ã]V»õ‹ô\ó⁄YóJBà^Ÿ\^Ÿ\[€éÇàŸŸŸ\ãùÿ\õö[ô à¥'t-H4`Ù-4,4.Ù/¥`tc4-Ù,4,Ù`4`Ù-Ù.4`¥c4-Ù,4.¥,4-»	\»4-4.Ùc»4/Ù-t`4-t/4-t/t/tbÙaH4`t/¥/¥,tbt-t/t.4c»ãà]V»õ‹ô\ó⁄YóKà^◊⁄[ôõœUùYKà
+Bàô[ô\ôYHô[ô\ó›[\]Jàò[YKàXÿ€›[ù\ù[ù[YKòXÿ€›[ùà⁄]⁄YY]V»ò⁄]⁄YóKà⁄]€ò[YOX⁄]õò[YHYà⁄][ŸHõ€ôKà‹ô\è[‹ô\ãà
+BàûNÇà]ÿZ]\ﬁ[ò⁄[Àù◊›ôXY
+àù[ù[YKòXÿ€›[ùúŸ[ô€Y\‹ÿYŸKà]V»ò⁄]⁄YóKàô[ô\ôYà⁄]õò[YHYà⁄][ŸHõ€ôKà
+Bà^Ÿ\^Ÿ\[€à\»^ŒÇàŸŸŸ\ãô^Ÿ\[€ä¥(4`ÙaÙ/t/¥-H4`t/¥/¥,tbt-t/t.4-H4/t-H4/¥`¥/Ù`4,4,¥.Ù-t/t/àäBà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\äà∏ßcù[î^H4/t-H4/¥`¥/Ù`4,4,¥.4.»4`t/¥/¥,tbt-t/t.4-Nà⁄[ô\ÿÿ\J€\Y
+^ÀÃ
+J_HäBàô]\õÇà⁄]⁄YH]V»ò⁄]⁄YóBà]ÿZ]›]Kò€X\ä
+Bà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\äà∏ß!H4(t/¥/¥,tbt-t/t.4-H4/¥`¥/Ù`4,4,¥.Ù-t/t/ãà4'4/¥-¥/t/à4/Ù`4/¥-4/¥.Ù-¥.4`¥c4/Ù-t`4-t/Ù.4`t.¥`»4.4.Ù.4/¥`¥.¥`4bÙ`¥c4,¥-t`tc4-4.4,4.Ù/¥,Ààãàô\W€X\ö›\X€€ùô\úÿ][€óÿX›[€ú◊⁄Ÿ^Xõÿ\ô
+⁄]⁄Y
+Kà
+BÇà\ﬁ[ò»Yà\⁄◊Ÿõ‹ó⁄[XYŸJ\ôŸ]àY\‹ÿYŸK›]Nàî”P€€ù^›]W›ò[YNà›]K\›[ò][€éà›äHOàõ€ôNÇà]ÿZ]›]KúŸ]‹›]J›]W›ò[YJBà]ÿZ]\ôŸ]ò[ú›Ÿ\äàà¥'¥`¥/Ù`4,4,¥c4`¥-H4.4-Ù/¥,t`4,4-¥-t/t.4-H4-4.Ùc»Ÿ\›[ò][€üH4.¥,4.à4a4/¥`¥/à4.4.Ù.4,Ù`4,4a4.4aÙ-t`t.¥.4.H4a4,4.t.»4-4/àå4'4$Kà4%4.Ùc»4/¥`¥/4-t/tbŒàÿÿ[òŸ[Çà
+BÇà\ﬁ[ò»Yà›€õÿY›[Y‹ò[W⁄[XYŸJY\‹ÿYŸNàY\‹ÿYŸJHOàû]\»õ€ôNÇàö[W€ÿöàHY\‹ÿYŸKú›÷ÀLWHYàY\‹ÿYŸKú›»[ŸHY\‹ÿYŸKôÿ›[Y[ùàYàõ›ö[W€ÿöéÇà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\ä∏ßc4'¥`¥/Ù`4,4,¥c4`¥-H4a4/¥`¥/à4.4.Ù.4a4,4.t.»4.4-Ù/¥,t`4,4-¥-t/t.4cÀàäBàô]\õàõ€ôBàYàY\‹ÿYŸKôÿ›[Y[ù[ôõ›
+Y\‹ÿYŸKôÿ›[Y[ùõZ[YW›\H‹ààäKú›\ù›⁄]
+ö[XYŸK»äNÇà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\ä∏ßc4%4/¥.¥`Ù/4-t/t`à4-4/¥.Ù-¥-t/H4,tbÙ`¥c4.4-Ù/¥,t`4,4-¥-t/t.4-t/ëÀîÀ—Pî4.4.Ù.“QãàäBàô]\õàõ€ôBàYàö[W€ÿöãôö[W‹⁄^ôH[ôö[W€ÿöãôö[W‹⁄^ôHèHå
+àLç
+àLçÇà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\ä∏ßc4(4,4-Ù/4-t`4.4-Ù/¥,t`4,4-¥-t/t.4c»4-4/¥.Ù-¥-t/H4,tbÙ`¥c4/4-t/tc4b4-Hå4'4$KàäBàô]\õàõ€ôBàùYôô\àHû]\“S 
+Bà]ÿZ]Y\‹ÿYŸKòõ›ô›€õÿY
+ö[W€ÿöã\›[ò][€èXùYôô\äBàô]\õàùYôô\ãôŸ]ò[YJ
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]HOHö[XYŸ\»äBà\ﬁ[ò»Yà[XYŸ\◊€Y[ùJÿ[òX⁄Œàÿ[òX⁄‘]Y\ûJHOàõ€ôNÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä
+Bà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\äàº'ÂØè¥&4-Ù/¥,t`4,4-¥-t/t.4c»ù[î^OÿèóóàÇà¥)4/¥`¥/à4/4/¥-¥/t/à4`t`4,4-Ù`»4/¥`¥/Ù`4,4,¥.4`¥c4/Ù/¥.¥`Ù/Ù,4`¥-t.Ùcà4.Ù.4,t/à4-Ù,4,Ù`4`Ù-Ù.4`¥c4.4/Ù`4.4.¥`4-t/Ù.4`¥c4.à4`t`Ùbt-t`t`¥,¥`Ùc¥bt-t/4`»4.Ù/¥`¥`Ààãàô\W€X\ö›\ZŸ^Xõÿ\ô
+¬à º'‰´4'¥`¥/Ù`4,4,¥.4`¥c4,à4aÙ,4`àãö[XYŸWÿ⁄]ÿôY⁄[àäWKà º'Ê‰à4%4/¥,t,4,¥.4`¥c4,à4.Ù/¥`àãö[XYŸW€›ÿôY⁄[àäWKà ∏´!{Ó#»4'4-t/tcàãõY[ùHäWKàJKà
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]HOHö[XYŸWÿ⁄]ÿôY⁄[àäBà\ﬁ[ò»Yà[XYŸWÿ⁄]ÿôY⁄[äÿ[òX⁄Œàÿ[òX⁄‘]Y\ûK›]Nàî”P€€ù^
+HOàõ€ôNÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä
+Bà]ÿZ]›]KúŸ]‹›]J\ÿY[XYŸT›]Kò⁄]⁄Y
+Bà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\ä¥$¥,¥-t-4.4`¥-H4aÙ.4`t.Ù/¥,¥/¥.HQ4aÙ,4`¥,4.¥`Ù-4,4/¥`¥/Ù`4,4,¥.4`¥c4.4-Ù/¥,t`4,4-¥-t/t.4-KàäBÇàõ›]\ãõY\‹ÿYŸJ\ÿY[XYŸT›]Kò⁄]⁄Yãù^
+Bà\ﬁ[ò»Yà[XYŸWÿ⁄]⁄Y
+Y\‹ÿYŸNàY\‹ÿYŸK›]Nàî”P€€ù^
+HOàõ€ôNÇàYàõ›Y\‹ÿYŸKù^ú›ö\
+
+Kö\ŸY⁄]
+
+NÇà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\äíQ4aÙ,4`¥,4-4/¥.Ù-¥-t/H4`t/¥`t`¥/¥cÙ`¥c4.4-»4a¥.4a4`àäBàô]\õÇà]ÿZ]›]Kù\]WŸ]J⁄]⁄YZ[ù
+Y\‹ÿYŸKù^ú›ö\
+
+JJBà]ÿZ]\⁄◊Ÿõ‹ó⁄[XYŸJY\‹ÿYŸK›]K\ÿY[XYŸT›]Kò⁄]Ÿö[K¥aÙ,4`¥,äBÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]Kú›\ù›⁄]
+ö[XYŸWÿ⁄]àäJBà\ﬁ[ò»Yà[XYŸWÿ⁄]Ÿ\ôX›
+ÿ[òX⁄Œàÿ[òX⁄‘]Y\ûK›]Nàî”P€€ù^
+HOàõ€ôNÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä
+Bà⁄]⁄YHÿ[òX⁄Àô]Kú‹]
+éàãJVÃWBàYàõ›⁄]⁄Yö\ŸY⁄]
+
+NÇàô]\õÇà]ÿZ]›]Kù\]WŸ]J⁄]⁄YZ[ù
+⁄]⁄Y
+JBà]ÿZ]\⁄◊Ÿõ‹ó⁄[XYŸJÿ[òX⁄ÀõY\‹ÿYŸK›]K\ÿY[XYŸT›]Kò⁄]Ÿö[K¥aÙ,4`¥,äBÇàõ›]\ãõY\‹ÿYŸJ\ÿY[XYŸT›]Kò⁄]Ÿö[JBà\ﬁ[ò»Yà[XYŸWÿ⁄]Ÿö[JY\‹ÿYŸNàY\‹ÿYŸK›]Nàî”P€€ù^
+HOàõ€ôNÇàù[ù[YHH]ÿZ]ô\]Z\ôW‹ù[ù[YJY\‹ÿYŸKY\‹ÿYŸKôúõ€W›\Ÿ\ãöY
+BàYàõ›ù[ù[YNÇà]ÿZ]›]Kò€X\ä
+Bàô]\õÇà[XYŸWŸ]HH]ÿZ]›€õÿY›[Y‹ò[W⁄[XYŸJY\‹ÿYŸJBàYà[XYŸWŸ]H\»õ€ôNÇàô]\õÇà]HH]ÿZ]›]KôŸ]Ÿ]J
+BàûNÇà]ÿZ]\ﬁ[ò⁄[Àù◊›ôXY
+ù[ù[YKòXÿ€›[ùúŸ[ô⁄[XYŸK]V»ò⁄]⁄YóK[XYŸWŸ]JBà^Ÿ\^Ÿ\[€à\»^ŒÇàŸŸŸ\ãô^Ÿ\[€ä¥'t-H4`Ù-4,4.Ù/¥`tc4/¥`¥/Ù`4,4,¥.4`¥c4.4-Ù/¥,t`4,4-¥-t/t.4-H4,à4aÙ,4`àäBà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\äà∏ßcù[î^H4/t-H4/Ù`4.4/tcÙ.»4.4-Ù/¥,t`4,4-¥-t/t.4-Nà⁄[ô\ÿÿ\J€\Y
+^À
+J_HäBàô]\õÇà⁄]⁄YH]V»ò⁄]⁄YóBà]ÿZ]›]Kò€X\ä
+Bà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\äà∏ß!H4&4-Ù/¥,t`4,4-¥-t/t.4-H4/¥`¥/Ù`4,4,¥.Ù-t/t/à4,à4aÙ,4`àù[î^Kàãàô\W€X\ö›\X€€ùô\úÿ][€óÿX›[€ú◊⁄Ÿ^Xõÿ\ô
+⁄]⁄Y
+Kà
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]HOHö[XYŸW€›ÿôY⁄[àäBà\ﬁ[ò»Yà[XYŸW€›ÿôY⁄[äÿ[òX⁄Œàÿ[òX⁄‘]Y\ûK›]Nàî”P€€ù^
+HOàõ€ôNÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä
+Bà]ÿZ]›]KúŸ]‹›]J\ÿY[XYŸT›]Kõ›⁄Y
+Bà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\ä¥$¥,¥-t-4.4`¥-HQ4`t`Ùbt-t`t`¥,¥`Ùc¥bt-t,Ù/à4.Ù/¥`¥,4.à4.¥/¥`¥/¥`4/¥/4`»4-4/¥,t,4,¥.4`¥c4.4-Ù/¥,t`4,4-¥-t/t.4-KàäBÇàõ›]\ãõY\‹ÿYŸJ\ÿY[XYŸT›]Kõ›⁄Yãù^
+Bà\ﬁ[ò»Yà[XYŸW€›⁄Y
+Y\‹ÿYŸNàY\‹ÿYŸK›]Nàî”P€€ù^
+HOàõ€ôNÇàYàõ›Y\‹ÿYŸKù^ú›ö\
+
+Kö\ŸY⁄]
+
+NÇà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\äíQ4.Ù/¥`¥,4-4/¥.Ù-¥-t/H4`t/¥`t`¥/¥cÙ`¥c4.4-»4a¥.4a4`àäBàô]\õÇà]ÿZ]›]Kù\]WŸ]J›⁄YZ[ù
+Y\‹ÿYŸKù^ú›ö\
+
+JJBà]ÿZ]\⁄◊Ÿõ‹ó⁄[XYŸJY\‹ÿYŸK›]K\ÿY[XYŸT›]Kõ›Ÿö[K¥.Ù/¥`¥,äBÇàõ›]\ãõY\‹ÿYŸJ\ÿY[XYŸT›]Kõ›Ÿö[JBà\ﬁ[ò»Yà[XYŸW€›Ÿö[JY\‹ÿYŸNàY\‹ÿYŸK›]Nàî”P€€ù^
+HOàõ€ôNÇàù[ù[YHH]ÿZ]ô\]Z\ôW‹ù[ù[YJY\‹ÿYŸKY\‹ÿYŸKôúõ€W›\Ÿ\ãöY
+BàYàõ›ù[ù[YNÇà]ÿZ]›]Kò€X\ä
+Bàô]\õÇà[XYŸWŸ]HH]ÿZ]›€õÿY›[Y‹ò[W⁄[XYŸJY\‹ÿYŸJBàYà[XYŸWŸ]H\»õ€ôNÇàô]\õÇà]HH]ÿZ]›]KôŸ]Ÿ]J
+BàûNÇà[XYŸW⁄YH]ÿZ]\ﬁ[ò⁄[Àù◊›ôXY
+ù[ù[YKòXÿ€›[ùù\ÿY⁄[XYŸK[XYŸWŸ]KõŸôô\àäBà›ŸöY[»H]ÿZ]\ﬁ[ò⁄[Àù◊›ôXY
+ù[ù[YKòXÿ€›[ùôŸ]€›ŸöY[À]V»õ›⁄YóJBàYà[XYŸW⁄Yõ›[à›ŸöY[Àö[XYŸ\ŒÇà›ŸöY[Àö[XYŸ\Àò\[ô
+[XYŸW⁄Y
+Bà]ÿZ]\ﬁ[ò⁄[Àù◊›ôXY
+ù[ù[YKòXÿ€›[ùúÿ]ôW€››ŸöY[Àúô[ô]◊ŸöY[ 
+JBà^Ÿ\^Ÿ\[€à\»^ŒÇàŸŸŸ\ãô^Ÿ\[€ä¥'t-H4`Ù-4,4.Ù/¥`tc4-4/¥,t,4,¥.4`¥c4.4-Ù/¥,t`4,4-¥-t/t.4-H4.à4.Ù/¥`¥`»äBà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\äà∏ßc4't-H4`Ù-4,4.Ù/¥`tc4/¥,t/t/¥,¥.4`¥c4.Ù/¥`éà⁄[ô\ÿÿ\J€\Y
+^À
+J_HäBàô]\õÇà]ÿZ]›]Kò€X\ä
+Bà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\äàà∏ß!H4&4-Ù/¥,t`4,4-¥-t/t.4-H€ŸOû⁄[XYŸW⁄YOÿ€ŸOà4-4/¥,t,4,¥.Ù-t/t/à4.à4.Ù/¥`¥`»€ŸOûŸ]V…€›⁄Y	◊_Oÿ€ŸOãàãàô\W€X\ö›\[XZ[ó⁄Ÿ^Xõÿ\ô
+
+Kà
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]HOHõõ€‹äBà\ﬁ[ò»Yàõ€‹
+ÿ[òX⁄Œàÿ[òX⁄‘]Y\ûJHOàõ€ôNÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä
+BÇà\ﬁ[ò»Yà⁄›◊€‹ô\ä\ôŸ]àY\‹ÿYŸK\Ÿ\ó⁄Yà[ù‹ô\ó⁄Yà›äHOàõ€ôNÇàù[ù[YHH]ÿZ]ô\]Z\ôW‹ù[ù[YJ\ôŸ]\Ÿ\ó⁄Y
+BàYàõ›ù[ù[YNÇàô]\õÇàûNÇà‹ô\àH]ÿZ]\ﬁ[ò⁄[Àù◊›ôXY
+ù[ù[YKòXÿ€›[ùôŸ]€‹ô\ã‹ô\ó⁄Y
+BàYàù[ù[YKòXÿ€›[ùöYõ›[à€‹ô\ãúŸ[\ó⁄Y‹ô\ãòù^Y\ó⁄YNÇàòZ\ŸHù[ù[YQ\úõ‹ä¥-Ù,4.¥,4-»4/t-H4/Ù`4.4/t,4-4.Ù-t-¥.4`à4/Ù/¥-4.¥.Ùc¥aÙdt/t/t/¥/4`»4,4.¥.¥,4`Ù/t`¥`»äBà^Ÿ\^Ÿ\[€à\»^ŒÇàŸŸŸ\ãô^Ÿ\[€ä¥'t-H4`Ù-4,4.Ù/¥`tc4/Ù/¥.Ù`ÙaÙ.4`¥c4-Ù,4.¥,4-»	\»ã‹ô\ó⁄Y
+Bà]ÿZ]\ôŸ]ò[ú›Ÿ\äàà∏ßc4't-H4`Ù-4,4.Ù/¥`tc4-Ù,4,Ù`4`Ù-Ù.4`¥c4-Ù,4.¥,4-Œà⁄[ô\ÿÿ\J€\Y
+^À
+J_Hãàô\W€X\ö›\ZŸ^Xõÿ\ô
+÷ ∏´!{Ó#»4'4-t/tcàãõY[ùHäWWJKà
+Bàô]\õÇÇàù]€úŒà\›€\›“[õ[ôRŸ^Xõÿ\ôù]€óWHH◊BàYà›ä‹ô\ãò⁄]⁄Y
+Kö\ŸY⁄]
+
+NÇàù]€úÀò\[ô
+¬à[õ[ôRŸ^Xõÿ\ôù]€äà^H∏°™{Ó#»4'¥`¥,¥-t`¥.4`¥cãÿ[òX⁄◊Ÿ]OYàõ‹ô\ó‹ô\Nû€‹ô\ãöYHÇà
+Kà[õ[ôRŸ^Xõÿ\ôù]€ä^Hº'‰´4$¥-t`tc4aÙ,4`àãÿ[òX⁄◊Ÿ]OYàò⁄]Ÿù[û€‹ô\ãò⁄]⁄YNåäKàJBàYà‹ô\ãúŸ[\ó⁄YOHù[ù[YKòXÿ€›[ùöY[ô‹ô\ãú›]\»\»\\Àì‹ô\î›]\Ÿ\ÀîRQÇàù]€úÀò\[ô
+¬à[õ[ôRŸ^Xõÿ\ôù]€ä^Hº'‰Æ4$¥-t`4/t`Ù`¥c4-4-t/tc4,Ù.ãÿ[òX⁄◊Ÿ]OYàúôYù[ôÿ\⁄Œû€‹ô\ãöYHäBàJBàù]€úÀò\[ô
+¬à[õ[ôRŸ^Xõÿ\ôù]€ä^Hº'„$4'¥`¥.¥`4bÙ`¥c4/t,ù[î^Hã\õYàöŒãÀŸù[ú^Kò€€K€‹ô\úÀﬁ€‹ô\ãöYK»äBàJBàù]€úÀò\[ô
+“[õ[ôRŸ^Xõÿ\ôù]€ä^H∏´!{Ó#»4'4-t/tcàãÿ[òX⁄◊Ÿ]OHõY[ùHäWJBà]ÿZ]\ôŸ]ò[ú›Ÿ\äàõ‹õX]€‹ô\ä‹ô\äKàô\W€X\ö›\R[õ[ôRŸ^Xõÿ\ôX\ö›\
+[õ[ôW⁄Ÿ^Xõÿ\ôXù]€ú Kà\ÿXõW›ŸXó‹YŸW‹ô]öY]œUùYKà
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]HOHõ‹ô\ó€€⁄›\äBà\ﬁ[ò»Yà‹ô\ó€€⁄›\
+ÿ[òX⁄Œàÿ[òX⁄‘]Y\ûK›]Nàî”P€€ù^
+HOàõ€ôNÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä
+BàYàõ›]ÿZ]ô\]Z\ôW‹ù[ù[YJÿ[òX⁄ÀõY\‹ÿYŸKÿ[òX⁄Àôúõ€W›\Ÿ\ãöY
+NÇàô]\õÇà]ÿZ]›]KúŸ]‹›]J‹ô\î›]Kõ‹ô\ó⁄Y
+Bà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\ä¥$¥,¥-t-4.4`¥-HQ4-Ù,4.¥,4-Ù,4,t-t-»4`t.4/4,¥/¥.Ù,Àà4%4.Ùc»4/¥`¥/4-t/tbŒàÿÿ[òŸ[äBÇàõ›]\ãõY\‹ÿYŸJ‹ô\î›]Kõ‹ô\ó⁄Yãù^
+Bà\ﬁ[ò»Yà‹ô\ó€€⁄›\⁄Y
+Y\‹ÿYŸNàY\‹ÿYŸK›]Nàî”P€€ù^
+HOàõ€ôNÇà‹ô\ó⁄YHY\‹ÿYŸKù^ú›ö\
+
+Kúô[[›ô\ôYö^
+à»äBàYàõ›ôKôù[X]⁄
+àñ–KVòK^åNWÀW^ÕHã‹ô\ó⁄Y
+NÇà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\äíQ4-Ù,4.¥,4-Ù,4,¥bÙ,Ù.ÙcÙ-4.4`à4/t-t.¥/¥`4`4-t.¥`¥/t/ãà4$¥,¥-t-4.4`¥-H4-t,Ù/à4-tbtdH4`4,4-»4.4.Ù.4/t,4-¥/4.4`¥-Hÿÿ[òŸ[àäBàô]\õÇà]ÿZ]›]Kò€X\ä
+Bà]ÿZ]⁄›◊€‹ô\äY\‹ÿYŸKY\‹ÿYŸKôúõ€W›\Ÿ\ãöY‹ô\ó⁄Y
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]Kú›\ù›⁄]
+õ‹ô\ó›öY]ŒàäJBà\ﬁ[ò»Yà‹ô\ó›öY] ÿ[òX⁄Œàÿ[òX⁄‘]Y\ûJHOàõ€ôNÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä¥%Ù,4,Ù`4`Ù-¥,4cà4-Ù,4.¥,4-¯†)àäBà‹ô\ó⁄YHÿ[òX⁄Àô]Kú‹]
+éàãJVÃWBà]ÿZ]⁄›◊€‹ô\äÿ[òX⁄ÀõY\‹ÿYŸKÿ[òX⁄Àôúõ€W›\Ÿ\ãöY‹ô\ó⁄Y
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]Kú›\ù›⁄]
+õ‹ô\ó‹ô\NàäJBà\ﬁ[ò»Yà‹ô\ó‹ô\Jÿ[òX⁄Œàÿ[òX⁄‘]Y\ûK›]Nàî”P€€ù^
+HOàõ€ôNÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä¥%Ù,4,Ù`4`Ù-¥,4cà4-Ù,4.¥,4-¯†)àäBà‹ô\ó⁄YHÿ[òX⁄Àô]Kú‹]
+éàãJVÃWBàù[ù[YHH]ÿZ]ô\]Z\ôW‹ù[ù[YJÿ[òX⁄ÀõY\‹ÿYŸKÿ[òX⁄Àôúõ€W›\Ÿ\ãöY
+BàYàõ›ù[ù[YNÇàô]\õÇàûNÇà‹ô\àH]ÿZ]\ﬁ[ò⁄[Àù◊›ôXY
+ù[ù[YKòXÿ€›[ùôŸ]€‹ô\ã‹ô\ó⁄Y
+BàYàù[ù[YKòXÿ€›[ùöYõ›[à€‹ô\ãúŸ[\ó⁄Y‹ô\ãòù^Y\ó⁄YNÇàòZ\ŸHù[ù[YQ\úõ‹ä¥-Ù,4.¥,4-»4/t-H4/Ù`4.4/t,4-4.Ù-t-¥.4`à4/Ù/¥-4.¥.Ùc¥aÙdt/t/t/¥/4`»4,4.¥.¥,4`Ù/t`¥`»äBàYàõ››ä‹ô\ãò⁄]⁄Y
+Kö\ŸY⁄]
+
+NÇàòZ\ŸHù[ù[YQ\úõ‹ä¥`»4-Ù,4.¥,4-Ù,4/t-t`à4.Ù.4aÙ/t/¥,Ù/à4aÙ,4`¥,äBà^Ÿ\^Ÿ\[€à\»^ŒÇàŸŸŸ\ãùÿ\õö[ô ¥'t-H4`Ù-4,4.Ù/¥`tc4/¥`¥.¥`4bÙ`¥c4/¥`¥,¥-t`à4/Ù/à4-Ù,4.¥,4-Ù`»	\»ã‹ô\ó⁄Y^◊⁄[ôõœUùYJBà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\äàà∏ßc4't-t.Ùc4-Ùc»4/¥`¥.¥`4bÙ`¥c4/¥`¥,¥-t`à4/Ù/à4-Ù,4.¥,4-Ù`Œà⁄[ô\ÿÿ\J€\Y
+^À
+J_HÇà
+Bàô]\õÇà]ÿZ]›]Kò€X\ä
+Bà]ÿZ]›]KúŸ]‹›]JŸ[ôY\‹ÿYŸT›]Kù^
+Bà]ÿZ]›]Kù\]WŸ]J⁄]⁄YZ[ù
+‹ô\ãò⁄]⁄Y
+K‹ô\ó⁄Y[‹ô\ãöY
+Bà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\äà¥$¥,¥-t-4.4`¥-H4/¥`¥,¥-t`à4/Ù/¥.¥`Ù/Ù,4`¥-t.Ùcãà4'Ù-t`4-t/4-t/t/tbÙ-H4-Ù,4.¥,4-Ù,4.4aÙ,4`¥,4,t`Ù-4`Ù`à4/Ù/¥-4`t`¥,4,¥.Ù-t/tb»4,4,¥`¥/¥/4,4`¥.4aÙ-t`t.¥.àÇà
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]Kú›\ù›⁄]
+úô]öY]◊€X[ùX[àäJBà\ﬁ[ò»Yàô]öY]◊€X[ùX[
+ÿ[òX⁄Œàÿ[òX⁄‘]Y\ûK›]Nàî”P€€ù^
+HOàõ€ôNÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä
+Bà‹ô\ó⁄YHÿ[òX⁄Àô]Kú‹]
+éàãJVÃWBàYàõ›]ÿZ]ô\]Z\ôW‹ù[ù[YJÿ[òX⁄ÀõY\‹ÿYŸKÿ[òX⁄Àôúõ€W›\Ÿ\ãöY
+NÇàô]\õÇà]ÿZ]›]Kò€X\ä
+Bà]ÿZ]›]Kù\]WŸ]J‹ô\ó⁄Y[‹ô\ó⁄Y
+Bà]ÿZ]›]KúŸ]‹›]Jô]öY]‘ô\T›]Kù^
+Bà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\äà¥$¥,¥-t-4.4`¥-H4/¥`¥,¥-t`à4/t,4/¥`¥-ÙbÙ,à4-4/àNNH4`t.4/4,¥/¥.Ù/¥,ãà4'4/¥-¥/t/à4.4`t/Ù/¥.Ùc4-Ù/¥,¥,4`¥c4/Ù-t`4-t/4-t/t/tbÙ-Kà4%4.Ùc»4/¥`¥/4-t/tbŒàÿÿ[òŸ[Çà
+BÇàõ›]\ãõY\‹ÿYŸJô]öY]‘ô\T›]Kù^ãù^
+Bà\ﬁ[ò»Yàô]öY]◊€X[ùX[›^
+Y\‹ÿYŸNàY\‹ÿYŸK›]Nàî”P€€ù^
+HOàõ€ôNÇàù[ù[YHH]ÿZ]ô\]Z\ôW‹ù[ù[YJY\‹ÿYŸKY\‹ÿYŸKôúõ€W›\Ÿ\ãöY
+BàYàõ›ù[ù[YNÇà]ÿZ]›]Kò€X\ä
+Bàô]\õÇà]HH]ÿZ]›]KôŸ]Ÿ]J
+BàûNÇà‹ô\àH]ÿZ]\ﬁ[ò⁄[Àù◊›ôXY
+ù[ù[YKòXÿ€›[ùôŸ]€‹ô\ã]V»õ‹ô\ó⁄YóJBàYà‹ô\ãúŸ[\ó⁄YOHù[ù[YKòXÿ€›[ùöY‹àõ›‹ô\ãúô]öY]ŒÇàòZ\ŸHù[ù[YQ\úõ‹ä¥`»4-Ù,4.¥,4-Ù,4/t-t`à4-4/¥`t`¥`Ù/Ù/t/¥,Ù/à4/¥`¥-ÙbÙ,¥,4/Ù/¥.¥`Ù/Ù,4`¥-t.Ùc»äBà^Hõ‹õX[^ôW‹ô]öY]◊‹ô\Jàô[ô\ó›[\]JàY\‹ÿYŸKù^à‹ô\è[‹ô\ãàô]öY]œ[‹ô\ãúô]öY]ÀàXÿ€›[ù\ù[ù[YKòXÿ€›[ùà
+Bà
+BàYàõ›^ÇàòZ\ŸHù[ù[YQ\úõ‹ä¥/¥`¥,¥-t`à4/t-H4/4/¥-¥-t`à4,tbÙ`¥c4/Ù`Ù`t`¥bÙ/äBà]ÿZ]\ﬁ[ò⁄[Àù◊›ôXY
+ù[ù[YKòXÿ€›[ùúŸ[ô‹ô]öY]À‹ô\ãöY^
+Bà^Ÿ\^Ÿ\[€à\»^ŒÇàŸŸŸ\ãô^Ÿ\[€ä¥'t-H4`Ù-4,4.Ù/¥`tc4/¥`¥/Ù`4,4,¥.4`¥c4`4`ÙaÙ/t/¥.H4/¥`¥,¥-t`à4/t,4/¥`¥-ÙbÙ,àäBà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\äàà∏ßc4'¥`¥,¥-t`à4/t-H4/¥`¥/Ù`4,4,¥.Ù-t/Nà⁄[ô\ÿÿ\J€\Y
+^ÀL
+J_HÇà
+Bàô]\õÇà‹ô\ó⁄YH]V»õ‹ô\ó⁄YóBà]ÿZ]›]Kò€X\ä
+Bà]ÿZ]Y\‹ÿYŸKò[ú›Ÿ\äà∏ß!H4'¥`¥,¥-t`à4/t,4/¥`¥-ÙbÙ,à4/¥`¥/Ù`4,4,¥.Ù-t/Kàãàô\W€X\ö›\ZŸ^Xõÿ\ô
+¬à º'‰Èà4'¥`¥.¥`4bÙ`¥c4-Ù,4.¥,4-»ãàõ‹ô\ó›öY]Œû€‹ô\ó⁄YHäWKà ∏´d4't,4`t`¥`4/¥.t.¥.4,4,¥`¥/¥/¥`¥,¥-t`¥/¥,àãúô]öY]◊‹ô\Y\»äWKàJKà
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]Kú›\ù›⁄]
+úôYù[ôÿ\⁄ŒàäJBà\ﬁ[ò»YàôYù[ôÿ\⁄ ÿ[òX⁄Œàÿ[òX⁄‘]Y\ûJHOàõ€ôNÇà‹ô\ó⁄YHÿ[òX⁄Àô]Kú‹]
+éàãJVÃWBà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä
+Bà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\äàà∏¶®;Ó#»4$¥-t`4/t`Ù`¥c4/Ù/¥.¥`Ù/Ù,4`¥-t.Ùcà4,¥`tcà4`t`Ù/4/4`»4-Ù,4.¥,4-Ù,€ŸOû⁄[ô\ÿÿ\J‹ô\ó⁄Y
+_Oÿ€ŸOè◊àÇà¥%4-t.t`t`¥,¥.4-H4,¥bÙ/Ù/¥.Ù/tcÙ-t`¥`tc»4/t,ù[î^H4.4/t-t/¥,t`4,4`¥.4/4/ãàãàô\W€X\ö›\ZŸ^Xõÿ\ô
+¬à ¥%4,4,¥-t`4/t`Ù`¥c4-4-t/tc4,Ù.ãàúôYù[ôŸŒû€‹ô\ó⁄YHäWKà ¥'¥`¥/4-t/t,ãàúôYù[ôÿÿ[òŸ[û€‹ô\ó⁄YHäWKàJKà
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]Kú›\ù›⁄]
+úôYù[ôÿÿ[òŸ[àäJBà\ﬁ[ò»YàôYù[ôÿÿ[òŸ[
+ÿ[òX⁄Œàÿ[òX⁄‘]Y\ûJHOàõ€ôNÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä¥$¥/¥-Ù,¥`4,4`à4/¥`¥/4-t/tdt/HäBà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKôY]›^
+¥$¥/¥-Ù,¥`4,4`à4/¥`¥/4-t/tdt/KàäBÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]Kú›\ù›⁄]
+úôYù[ôŸŒàäJBà\ﬁ[ò»YàôYù[ôŸ ÿ[òX⁄Œàÿ[òX⁄‘]Y\ûJHOàõ€ôNÇà‹ô\ó⁄YHÿ[òX⁄Àô]Kú‹]
+éàãJVÃWBà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä¥'Ù`4/¥,¥-t`4cÙcà4-Ù,4.¥,4-¯†)àäBàù[ù[YHH]ÿZ]ô\]Z\ôW‹ù[ù[YJÿ[òX⁄ÀõY\‹ÿYŸKÿ[òX⁄Àôúõ€W›\Ÿ\ãöY
+BàYàõ›ù[ù[YNÇàô]\õÇàûNÇà‹ô\àH]ÿZ]\ﬁ[ò⁄[Àù◊›ôXY
+ù[ù[YKòXÿ€›[ùôŸ]€‹ô\ã‹ô\ó⁄Y
+BàYà‹ô\ãúŸ[\ó⁄YOHù[ù[YKòXÿ€›[ùöYÇàòZ\ŸHù[ù[YQ\úõ‹ä¥-Ù,4.¥,4-»4/t-H4/Ù`4.4/t,4-4.Ù-t-¥.4`à4/Ù/¥-4.¥.Ùc¥aÙdt/t/t/¥/4`»4/Ù`4/¥-4,4,¥a¥`»äBàYà‹ô\ãú›]\»\»õ›\\Àì‹ô\î›]\Ÿ\ÀîRQÇàòZ\ŸHù[ù[YQ\úõ‹äà¥,¥/¥-Ù,¥`4,4`à4/t-t-4/¥`t`¥`Ù/Ù-t/H4-4.Ùc»4`t`¥,4`¥`Ù`t,€‹ô\ãú›]\Àõò[Y_HäBà]ÿZ]\ﬁ[ò⁄[Àù◊›ôXY
+ù[ù[YKòXÿ€›[ùúôYù[ô‹ô\ó⁄Y
+Bà^Ÿ\^Ÿ\[€à\»^ŒÇàŸŸŸ\ãô^Ÿ\[€ä¥$¥/¥-Ù,¥`4,4`à4-Ù,4.¥,4-Ù,	\»4/t-H4,¥bÙ/Ù/¥.Ù/t-t/Hã‹ô\ó⁄Y
+Bà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKôY]›^
+àà∏ßc4$¥/¥-Ù,¥`4,4`à4-Ù,4.¥,4-Ù,€ŸOû⁄[ô\ÿÿ\J‹ô\ó⁄Y
+_Oÿ€ŸOà4/t-H4,¥bÙ/Ù/¥.Ù/t-t/NàÇààû⁄[ô\ÿÿ\J€\Y
+^ÀL
+J_HÇà
+Bàô]\õÇà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKôY]›^
+àà∏ß!H4%4-t/tc4,Ù.4/Ù/à4-Ù,4.¥,4-Ù`»€ŸOû⁄[ô\ÿÿ\J‹ô\ó⁄Y
+_Oÿ€ŸOà4,¥/¥-Ù,¥`4,4bt-t/tb»4/Ù/¥.¥`Ù/Ù,4`¥-t.Ùcãàãàô\W€X\ö›\R[õ[ôRŸ^Xõÿ\ôX\ö›\
+[õ[ôW⁄Ÿ^Xõÿ\ôV÷¬à[õ[ôRŸ^Xõÿ\ôù]€ä^Hº'„$4'¥`¥.¥`4bÙ`¥c4-Ù,4.¥,4-»ã\õYàöŒãÀŸù[ú^Kò€€K€‹ô\úÀﬁ€‹ô\ó⁄YK»äBàWJKà
+BÇà\ﬁ[ò»Yà⁄›◊ÿXÿ€›[ù
+\ôŸ]àY\‹ÿYŸK\Ÿ\ó⁄Yà[ù
+HOàõ€ôNÇàõ›»H]ÿZ]ãôŸ]›\Ÿ\ä\Ÿ\ó⁄Y
+BàXÿ€›[ù‹õ›»H]ÿZ]ãôŸ]ÿX›]ôW€X\öŸ]XŸWÿXÿ€›[ù
+\Ÿ\ó⁄Yôù[ú^HäBàXÿ€›[ù»H]ÿZ]ãõ\›€X\öŸ]XŸWÿXÿ€›[ù \Ÿ\ó⁄Yôù[ú^HäBàYàõ›õ›»‹àõ›Xÿ€›[ù‹õ›ŒÇà]ÿZ]\ôŸ]ò[ú›Ÿ\ä¥$4.¥.¥,4`Ù/t`à4/t-H4/Ù/¥-4.¥.Ùc¥aÙdt/Kàãô\W€X\ö›\ZŸ^Xõÿ\ô
+÷ º'Â%»4'Ù/¥-4.¥.Ùc¥aÙ.4`¥cãò€€õôX›äWWJJBàô]\õÇàûNÇàõﬁHHõﬁW€Xô[
+ŸX‹ô]ÀôX‹û\
+Xÿ€›[ù‹õ›÷»úõﬁWŸ[ò»óJJBà^Ÿ\
+[ùò[Y⁄Ÿ[ãò[YQ\úõ‹ã\Q\úõ‹äNÇàõﬁHH¥/t-H4`Ù-4,4.Ù/¥`tc4`4,4`tb4.4a4`4/¥,¥,4`¥cÇà›]\»Hº'ÁËà4`4,4,t/¥`¥,4-t`ààYàX[òYŸ\ãôŸ]
+\Ÿ\ó⁄Y
+H[ŸHº'Â-4/¥`t`¥,4/t/¥,¥.Ù-t/HÇà]ÿZ]\ôŸ]ò[ú›Ÿ\äà∏¶¶{Ó#»è¥$4.¥.¥,4`Ù/t`èÿèóàÇààëù[î^Nàèû⁄[ô\ÿÿ\JXÿ€›[ù‹õ›÷…›\Ÿ\õò[YI◊H‹à	¯†%	 _OÿèàÇààä€ŸOûÿXÿ€›[ù‹õ›÷…Ÿ^\õò[⁄Y	◊_Oÿ€ŸOäWàÇàà¥$¥`t-t,Ù/à4,4.¥.¥,4`Ù/t`¥/¥,éàèû€[äXÿ€›[ù _OÿèóàÇàà¥'Ù`4/¥.¥`t.à€ŸOû⁄[ô\ÿÿ\JõﬁJ_Oÿ€ŸOóàÇààîù[õô\éà‹›]\ﬂWàÇàà¥$¥-taÙ/tbÙ.H4/¥/t.Ù,4.t/H»4/¥,t/t/¥,¥.Ù-t/t.4-H4`t-t`t`t.4.àÿõ€€⁄X€€äõ›÷…⁄ŸY\€€õ[ôWŸ[òXõY	◊J_Hãàô\W€X\ö›\ZŸ^Xõÿ\ô
+¬à àûÿõ€€⁄X€€äõ›÷…⁄ŸY\€€õ[ôWŸ[òXõY	◊J_H4'Ù/¥-4-4-t`4-¥.4,¥,4`¥c4`t-t`t`t.4càãùŸŸ€NöŸY\€€õ[ôWŸ[òXõYäWKà º'‰iH4'Ù-t`4-t.¥.Ùc¥aÙ.4`¥c4,4.¥.¥,4`Ù/t`àãòXÿ€›[ù‹›⁄]⁄ôù[ú^HäWKà ∏ß•H4%4/¥,t,4,¥.4`¥cãò€€õôX›äK
+º'Â!4'Ù-t`4-t/Ù/¥-4.¥.Ùc¥aÙ.4`¥cãúôX€€õôX›äWKà º'Â$H4&4-Ù/4-t/t.4`¥c4-4,4/t/tbÙ-Hãò€€õôX›äWKà º'Â‰H4'¥`¥.¥.Ùc¥aÙ.4`¥c4,4.¥.¥,4`Ù/t`àãô\ÿ€€õôX›ÿ€€ôö\õHäWKà ∏´!{Ó#»4'4-t/tcàãõY[ùHäWKàJKà
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]HOHòXÿ€›[ùäBà\ﬁ[ò»YàXÿ€›[ù
+ÿ[òX⁄Œàÿ[òX⁄‘]Y\ûJHOàõ€ôNÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä
+Bà]ÿZ]⁄›◊ÿXÿ€›[ù
+ÿ[òX⁄ÀõY\‹ÿYŸKÿ[òX⁄Àôúõ€W›\Ÿ\ãöY
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]HOHúôX€€õôX›äBà\ﬁ[ò»YàôX€€õôX›
+ÿ[òX⁄Œàÿ[òX⁄‘]Y\ûJHOàõ€ôNÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä¥'Ù-t`4-t/Ù/¥-4.¥.Ùc¥aÙ,4c∏†)àäBàûNÇàXÿ€›[ù‹õ›»H]ÿZ]ãôŸ]ÿX›]ôW€X\öŸ]XŸWÿXÿ€›[ù
+àÿ[òX⁄Àôúõ€W›\Ÿ\ãöYôù[ú^HÇà
+BàYàõ›Xÿ€›[ù‹õ›ŒÇàòZ\ŸHù[ù[YQ\úõ‹ä¥,4.¥.¥,4`Ù/t`à4/t-H4/t,4.t-4-t/HäBà]ÿZ]X[òYŸ\ãú›\ù
+ÿ[òX⁄Àôúõ€W›\Ÿ\ãöYõ›œXXÿ€›[ù‹õ› Bà^Ÿ\^Ÿ\[€à\»^ŒÇàŸŸŸ\ãô^Ÿ\[€ä¥'Ù-t`4-t/Ù/¥-4.¥.Ùc¥aÙ-t/t.4-H4/t-H4`Ù-4,4.Ù/¥`tcäBà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\äàà∏ßc4'Ù-t`4-t/Ù/¥-4.¥.Ùc¥aÙ.4`¥c4`tc»4/t-H4`Ù-4,4.Ù/¥`tcàŸù[ú^Wÿ€€õôX›[€óŸ\úõ‹ó€Y\‹ÿYŸJ^ _HÇà
+Bàô]\õÇà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\ä∏ß!H4'Ù/¥-4.¥.Ùc¥aÙ-t/t.4-H4,¥/¥`t`t`¥,4/t/¥,¥.Ù-t/t/ãàäBà]ÿZ]⁄›◊€XZ[äÿ[òX⁄ÀõY\‹ÿYŸKÿ[òX⁄Àôúõ€W›\Ÿ\ãöY
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]HOHô\ÿ€€õôX›ÿ€€ôö\õHäBà\ﬁ[ò»Yà\ÿ€€õôX›ÿ€€ôö\õJÿ[òX⁄Œàÿ[òX⁄‘]Y\ûJHOàõ€ôNÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä
+Bà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\äà¥(Ù-4,4.Ù.4`¥c4`t/¥at`4,4/tdt/t/tbÙ-H4/Ù`4/¥.¥`t.4.€€[ó⁄Ÿ^H4.4/¥`t`¥,4/t/¥,¥.4`¥c4,4,¥`¥/¥/4,4`¥.4-Ù,4a¥.4cè»ãàô\W€X\ö›\ZŸ^Xõÿ\ô
+÷ ¥%4,4/¥`¥.¥.Ùc¥aÙ.4`¥cãô\ÿ€€õôX›äK
+¥'t-t`àãòXÿ€›[ùäWWJKà
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJãô]HOHô\ÿ€€õôX›äBà\ﬁ[ò»Yà\ÿ€€õôX›
+ÿ[òX⁄Œàÿ[òX⁄‘]Y\ûK›]Nàî”P€€ù^
+HOàõ€ôNÇà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä
+BàXÿ€›[ù‹õ›»H]ÿZ]ãôŸ]ÿX›]ôW€X\öŸ]XŸWÿXÿ€›[ù
+àÿ[òX⁄Àôúõ€W›\Ÿ\ãöYôù[ú^HÇà
+BàYàXÿ€›[ù‹õ›ŒÇàXÿ€›[ù⁄YH[ù
+Xÿ€›[ù‹õ›÷»öYóJBà]ÿZ]X[òYŸ\ãú›‹Ÿù[ú^WÿXÿ€›[ù
+Xÿ€›[ù⁄Y
+Bàô\XŸ[Y[ùH]ÿZ]ãô[]W€X\öŸ]XŸWÿXÿ€›[ù
+àÿ[òX⁄Àôúõ€W›\Ÿ\ãöYôù[ú^HãXÿ€›[ù⁄Yà
+BàYàô\XŸ[Y[ùÇà]ÿZ]X[òYŸ\ãòX›]ò]WÿXÿ€›[ù
+àÿ[òX⁄Àôúõ€W›\Ÿ\ãöYôù[ú^Hã[ù
+ô\XŸ[Y[ù»öYóJBà
+Bà]ÿZ]›]Kò€X\ä
+Bà]ÿZ]ÿ[òX⁄ÀõY\‹ÿYŸKò[ú›Ÿ\äà¥(¥-t.¥`Ùbt.4.Hù[î^Kt,4.¥.¥,4`Ù/t`ã4-t,Ù/à4/Ù`4/¥.¥`t.4.€€[ó⁄Ÿ^H4`Ù-4,4.Ù-t/tbÀàãà
+Bà]ÿZ]⁄›◊€XZ[äÿ[òX⁄ÀõY\‹ÿYŸKÿ[òX⁄Àôúõ€W›\Ÿ\ãöY
+BÇàõ›]\ãõY\‹ÿYŸJ
+Bà\ﬁ[ò»Yàò[òX⁄ Y\‹ÿYŸNàY\‹ÿYŸJHOàõ€ôNÇàûNÇàYà]ÿZ]X[òYŸ\ãúY⁄[úÀô\‹]⁄›[Y‹ò[W€Y\‹ÿYŸJàY\‹ÿYŸKôúõ€W›\Ÿ\ãöYY\‹ÿYŸBà
+NÇàô]\õÇà^Ÿ\^Ÿ\[€éÇàŸŸŸ\ãô^Ÿ\[€ä¥'¥b4.4,t.¥,[Y‹ò[Ktatct/t-4.Ù-t`4,4/Ù.Ù,4,Ù.4/t,äBà]ÿZ]⁄›◊€XZ[äY\‹ÿYŸKY\‹ÿYŸKôúõ€W›\Ÿ\ãöY
+BÇàõ›]\ãòÿ[òX⁄◊‹]Y\ûJ
+Bà\ﬁ[ò»YàY⁄[óÿÿ[òX⁄◊Ÿò[òX⁄ ÿ[òX⁄Œàÿ[òX⁄‘]Y\ûJHOàõ€ôNÇàûNÇàYà]ÿZ]X[òYŸ\ãúY⁄[úÀô\‹]⁄›[Y‹ò[Wÿÿ[òX⁄ àÿ[òX⁄Àôúõ€W›\Ÿ\ãöYÿ[òX⁄¬à
+NÇàô]\õÇà^Ÿ\^Ÿ\[€éÇàŸŸŸ\ãô^Ÿ\[€ä¥'¥b4.4,t.¥,ÿ[òX⁄Àtatct/t-4.Ù-t`4,4/Ù.Ù,4,Ù.4/t,äBà]ÿZ]ÿ[òX⁄Àò[ú›Ÿ\ä¥%4-t.t`t`¥,¥.4-H4`Ù`t`¥,4`4-t.Ù/à4.4.Ù.4/t-H4/Ù/¥-4-4-t`4-¥.4,¥,4-t`¥`tc»ã⁄›◊ÿ[\ùUùYJBÇàô]\õàõ›]\ÇÇÇò\ﬁ[ò»YàXZ[ä
+HOàõ€ôNÇà€€ôöY»H€€ôöYÀôúõ€WŸ[ùä
+BààH]Xò\ŸJ€€ôöYÀô]Xò\ŸW›\õ
+Bà]ÿZ]ãò€€õôX›
+
+Bàõ›Hõ›
+€€ôöYÀòõ››⁄Ÿ[ãYò][QYò][õ›õ‹\ùY\ \úŸW€[ŸOT\úŸS[ŸKíS
+JBàŸX‹ô]»HŸX‹ô]õﬁ
+€€ôöYÀò\‹ŸX‹ô]
+BàX[òYŸ\àHù[ù[YSX[òYŸ\äõ›ãŸX‹ô] Bà\‹]⁄\àH\‹]⁄\ä
+Bà\‹]⁄\ãö[ò€YW‹õ›]\äùZ[‹õ›]\äãX[òYŸ\ãŸX‹ô] JBà]ÿZ]õ›úŸ]€^Wÿ€€[X[ô ¬àõ›€€[X[ô
+€€[X[ôHú›\ùã\ÿ‹ö\[€èH¥'¥`¥.¥`4bÙ`¥c4/4-t/tcàäKàõ›€€[X[ô
+€€[X[ôHòÿ[òŸ[ã\ÿ‹ö\[€èH¥'¥`¥/4-t/t.4`¥c4`¥-t.¥`Ùbt-t-H4-4-t.t`t`¥,¥.4-HäKàJBàûNÇàûNÇà]ÿZ]X[òYŸ\ãú›\ù‹ÿ]ôY
+
+Bà^Ÿ\\ﬁ[ò⁄[Àêÿ[òŸ[Y\úõ‹éÇàòZ\ŸBà^Ÿ\^Ÿ\[€éÇàŸŸŸ\ãô^Ÿ\[€äà¥$¥/¥`t`t`¥,4/t/¥,¥.Ù-t/t.4-H4`t/¥at`4,4/tdt/t/tbÙaH4,4.¥.¥,4`Ù/t`¥/¥,à4-Ù,4,¥-t`4b4.4.Ù/¥`tc4`H4/¥b4.4,t.¥/¥.N»Çàï[Y‹ò[H€[ô»4,¥`tdH4`4,4,¥/t/à4,t`Ù-4-t`à4-Ù,4/Ù`Ùbt-t/HÇà
+Bà]ÿZ]\‹]⁄\ãú›\ù‹€[ô õ›[›ŸY›\]\œY\‹]⁄\ãúô\€€ôW›\ŸY›\]W›\\ 
+JBàö[ò[NÇà]ÿZ]X[òYŸ\ãò€‹ŸJ
+Bà]ÿZ]ãò€‹ŸJ
+Bà]ÿZ]õ›úŸ\‹⁄[€ãò€‹ŸJ
+BÇÇöYà◊€ò[YW◊»OHó◊€XZ[ó◊»éÇà\ﬁ[ò⁄[Àúù[äXZ[ä
+JB

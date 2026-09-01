@@ -22,6 +22,9 @@ class PluginTelethonBridge:
     def get_client(self, plugin_uuid: str) -> TelegramClient | None:
         return self._service.get_client(self.telegram_id, plugin_uuid)
 
+    def get_clients(self, plugin_uuid: str) -> list[TelegramClient]:
+        return self._service.get_clients(self.telegram_id, plugin_uuid)
+
     def is_connected(self, plugin_uuid: str) -> bool:
         client = self.get_client(plugin_uuid)
         return bool(client and client.is_connected())
@@ -47,7 +50,7 @@ class PluginTelethonService:
     def __init__(self, db: Any, secrets: Any):
         self.db = db
         self.secrets = secrets
-        self.clients: dict[tuple[int, str], TelegramClient] = {}
+        self.clients: dict[tuple[int, str, int], TelegramClient] = {}
         self.loop: asyncio.AbstractEventLoop | None = None
 
     @property
@@ -83,28 +86,53 @@ class PluginTelethonService:
         return PluginTelethonBridge(self, telegram_id)
 
     def get_client(self, telegram_id: int, plugin_uuid: str) -> TelegramClient | None:
-        return self.clients.get((telegram_id, plugin_uuid))
+        clients = self.get_clients(telegram_id, plugin_uuid)
+        return clients[0] if clients else None
+
+    def get_clients(self, telegram_id: int, plugin_uuid: str) -> list[TelegramClient]:
+        return [
+            client
+            for (owner_id, uuid, _session_id), client in self.clients.items()
+            if owner_id == telegram_id and uuid == plugin_uuid
+        ]
+
+    def get_client_by_session(
+        self, telegram_id: int, plugin_uuid: str, session_id: int
+    ) -> TelegramClient | None:
+        return self.clients.get((telegram_id, plugin_uuid, session_id))
+
+    def session_id_for_client(
+        self, telegram_id: int, plugin_uuid: str, client: TelegramClient
+    ) -> int | None:
+        for (owner_id, uuid, session_id), current in self.clients.items():
+            if owner_id == telegram_id and uuid == plugin_uuid and current is client:
+                return session_id
+        return None
 
     async def start_plugin(
         self, telegram_id: int, plugin_uuid: str
     ) -> TelegramClient | None:
         self.loop = asyncio.get_running_loop()
-        current = self.get_client(telegram_id, plugin_uuid)
-        if current and current.is_connected():
-            return current
-        if current:
-            self.clients.pop((telegram_id, plugin_uuid), None)
-            await current.disconnect()
-        row = await self.db.get_plugin_telethon_session(telegram_id, plugin_uuid)
-        if not row or not self.configured:
+        existing = self.get_clients(telegram_id, plugin_uuid)
+        if existing and all(client.is_connected() for client in existing):
+            return existing[0]
+        await self.stop_plugin(telegram_id, plugin_uuid)
+        rows = await self.db.get_plugin_telethon_sessions(telegram_id, plugin_uuid)
+        if not rows or not self.configured:
             return None
-        client = self.create_client(self.secrets.decrypt(row["session_enc"]))
-        await client.connect()
-        if not await client.is_user_authorized():
-            await client.disconnect()
-            return None
-        self.clients[(telegram_id, plugin_uuid)] = client
-        return client
+        for row in rows:
+            client = None
+            try:
+                client = self.create_client(self.secrets.decrypt(row["session_enc"]))
+                await client.connect()
+                if not await client.is_user_authorized():
+                    await client.disconnect()
+                    continue
+                self.clients[(telegram_id, plugin_uuid, int(row["id"]))] = client
+            except Exception:
+                if client:
+                    await client.disconnect()
+        return self.get_client(telegram_id, plugin_uuid)
 
     async def activate(
         self,
@@ -120,7 +148,7 @@ class PluginTelethonService:
             raise RuntimeError("Telegram-сессия не авторизована")
         me = await client.get_me()
         session = client.session.save()
-        await self.db.save_plugin_telethon_session(
+        row = await self.db.save_plugin_telethon_session(
             telegram_id,
             plugin_uuid,
             self.secrets.encrypt(phone),
@@ -129,33 +157,46 @@ class PluginTelethonService:
             int(me.id),
             getattr(me, "username", None),
         )
-        old = self.clients.pop((telegram_id, plugin_uuid), None)
+        session_id = int(row["id"])
+        old = self.clients.pop((telegram_id, plugin_uuid, session_id), None)
         if old and old is not client:
             await old.disconnect()
-        self.clients[(telegram_id, plugin_uuid)] = client
+        self.clients[(telegram_id, plugin_uuid, session_id)] = client
         return me
 
     async def get_2fa_password(
-        self, telegram_id: int, plugin_uuid: str
+        self, telegram_id: int, plugin_uuid: str, session_id: int | None = None
     ) -> str | None:
-        row = await self.db.get_plugin_telethon_session(telegram_id, plugin_uuid)
+        row = await self.db.get_plugin_telethon_session(
+            telegram_id, plugin_uuid, session_id
+        )
         encrypted = row["password_enc"] if row else None
         return self.secrets.decrypt(encrypted) if encrypted else None
 
     async def stop_plugin(
-        self, telegram_id: int, plugin_uuid: str, *, delete_session: bool = False
+        self, telegram_id: int, plugin_uuid: str, *, delete_session: bool = False,
+        session_id: int | None = None,
     ) -> None:
-        client = self.clients.pop((telegram_id, plugin_uuid), None)
-        if client:
+        keys = [
+            key for key in self.clients
+            if key[0] == telegram_id and key[1] == plugin_uuid
+            and (session_id is None or key[2] == session_id)
+        ]
+        for key in keys:
+            client = self.clients.pop(key)
             await client.disconnect()
         if delete_session:
-            await self.db.delete_plugin_telethon_session(telegram_id, plugin_uuid)
+            await self.db.delete_plugin_telethon_session(
+                telegram_id, plugin_uuid, session_id
+            )
 
     async def stop_user(self, telegram_id: int) -> None:
-        keys = [key for key in self.clients if key[0] == telegram_id]
-        for _, plugin_uuid in keys:
+        plugin_uuids = {key[1] for key in self.clients if key[0] == telegram_id}
+        for plugin_uuid in plugin_uuids:
             await self.stop_plugin(telegram_id, plugin_uuid)
 
     async def close(self) -> None:
-        for telegram_id, plugin_uuid in list(self.clients):
+        for telegram_id, plugin_uuid in {
+            (key[0], key[1]) for key in self.clients
+        }:
             await self.stop_plugin(telegram_id, plugin_uuid)

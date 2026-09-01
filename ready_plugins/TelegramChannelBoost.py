@@ -33,8 +33,8 @@ from telethon.tl.types import ChatAdminRights, InputChannel
 
 
 NAME = "Telegram Channel Boost"
-VERSION = "1.1.0"
-DESCRIPTION = "Предварительная подготовка, хранение и передача Telegram-каналов покупателям FunPay"
+VERSION = "1.2.0"
+DESCRIPTION = "Склад Telegram-каналов для нескольких лотов и нескольких Telethon-аккаунтов"
 CREDITS = "FunPay aiogram bot"
 SETTINGS_PAGE = True
 TELETHON = True
@@ -53,6 +53,7 @@ _cardinal: Any | None = None
 _client: Any | None = None
 _pending_input: tuple[str, int | None] | None = None
 _lot_cache: dict[str, str] = {}
+_draft_rule: dict[str, Any] = {}
 _futures: set[Future[Any]] = set()
 _running_job_ids: set[int] = set()
 _running_transfer_ids: set[int] = set()
@@ -159,7 +160,10 @@ async def _ensure_schema() -> None:
             chat_id TEXT NOT NULL,
             chat_name TEXT,
             buyer_id BIGINT,
+            rule_id BIGINT,
+            lot_id TEXT,
             lot_title TEXT NOT NULL,
+            telethon_session_id BIGINT,
             channel_id BIGINT,
             channel_access_hash BIGINT,
             channel_username TEXT,
@@ -180,6 +184,10 @@ async def _ensure_schema() -> None:
             id BIGSERIAL PRIMARY KEY,
             telegram_id BIGINT NOT NULL
                 REFERENCES funpay_users(telegram_id) ON DELETE CASCADE,
+            rule_id BIGINT,
+            lot_id TEXT,
+            lot_title TEXT,
+            telethon_session_id BIGINT,
             channel_id BIGINT,
             channel_access_hash BIGINT,
             channel_username TEXT,
@@ -208,6 +216,22 @@ async def _ensure_schema() -> None:
         CREATE INDEX IF NOT EXISTS telegram_channel_boost_inventory_status_idx
             ON telegram_channel_boost_inventory
                 (telegram_id, status, ready_at, updated_at);
+
+        CREATE TABLE IF NOT EXISTS telegram_channel_boost_lot_rules (
+            id BIGSERIAL PRIMARY KEY,
+            telegram_id BIGINT NOT NULL
+                REFERENCES funpay_users(telegram_id) ON DELETE CASCADE,
+            lot_id TEXT NOT NULL,
+            lot_title TEXT NOT NULL,
+            service_id BIGINT NOT NULL,
+            quantity INTEGER NOT NULL,
+            target_members INTEGER NOT NULL,
+            min_ready_channels INTEGER NOT NULL DEFAULT 1,
+            enabled BOOLEAN NOT NULL DEFAULT TRUE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (telegram_id, lot_id)
+        );
         """
     )
     await _db().execute(
@@ -218,7 +242,14 @@ async def _ensure_schema() -> None:
             ADD COLUMN IF NOT EXISTS buyer_id BIGINT;
         ALTER TABLE telegram_channel_boost_jobs
             ADD COLUMN IF NOT EXISTS inventory_id BIGINT
-                REFERENCES telegram_channel_boost_inventory(id) ON DELETE SET NULL
+                REFERENCES telegram_channel_boost_inventory(id) ON DELETE SET NULL;
+        ALTER TABLE telegram_channel_boost_jobs ADD COLUMN IF NOT EXISTS rule_id BIGINT;
+        ALTER TABLE telegram_channel_boost_jobs ADD COLUMN IF NOT EXISTS lot_id TEXT;
+        ALTER TABLE telegram_channel_boost_jobs ADD COLUMN IF NOT EXISTS telethon_session_id BIGINT;
+        ALTER TABLE telegram_channel_boost_inventory ADD COLUMN IF NOT EXISTS rule_id BIGINT;
+        ALTER TABLE telegram_channel_boost_inventory ADD COLUMN IF NOT EXISTS lot_id TEXT;
+        ALTER TABLE telegram_channel_boost_inventory ADD COLUMN IF NOT EXISTS lot_title TEXT;
+        ALTER TABLE telegram_channel_boost_inventory ADD COLUMN IF NOT EXISTS telethon_session_id BIGINT;
         """
     )
     await _db().execute(
@@ -226,6 +257,51 @@ async def _ensure_schema() -> None:
         INSERT INTO telegram_channel_boost_settings (telegram_id)
         VALUES ($1)
         ON CONFLICT (telegram_id) DO NOTHING
+        """,
+        _telegram_id(),
+    )
+    await _db().execute(
+        """
+        INSERT INTO telegram_channel_boost_lot_rules
+            (telegram_id, lot_id, lot_title, service_id, quantity,
+             target_members, min_ready_channels)
+        SELECT telegram_id, lot_id, lot_title, service_id, quantity,
+               target_members, min_ready_channels
+          FROM telegram_channel_boost_settings
+         WHERE telegram_id=$1 AND lot_id IS NOT NULL AND lot_title IS NOT NULL
+           AND service_id IS NOT NULL
+        ON CONFLICT (telegram_id, lot_id) DO NOTHING;
+
+        UPDATE telegram_channel_boost_inventory AS inventory
+           SET rule_id=rule.id, lot_id=rule.lot_id, lot_title=rule.lot_title
+          FROM telegram_channel_boost_lot_rules AS rule
+         WHERE inventory.telegram_id=$1 AND inventory.rule_id IS NULL
+           AND rule.telegram_id=inventory.telegram_id
+           AND rule.id=(
+               SELECT MIN(single_rule.id)
+                 FROM telegram_channel_boost_lot_rules AS single_rule
+               WHERE single_rule.telegram_id=inventory.telegram_id
+           );
+
+        UPDATE telegram_channel_boost_jobs AS job
+           SET rule_id=rule.id, lot_id=rule.lot_id,
+               lot_title=COALESCE(job.lot_title, rule.lot_title)
+          FROM telegram_channel_boost_lot_rules AS rule
+         WHERE job.telegram_id=$1 AND job.rule_id IS NULL
+           AND rule.telegram_id=job.telegram_id
+           AND rule.id=(
+               SELECT MIN(single_rule.id)
+                 FROM telegram_channel_boost_lot_rules AS single_rule
+                WHERE single_rule.telegram_id=job.telegram_id
+           );
+
+        UPDATE telegram_channel_boost_settings AS settings
+           SET lot_id=NULL, lot_title=NULL, updated_at=NOW()
+         WHERE settings.telegram_id=$1 AND settings.lot_id IS NOT NULL
+           AND EXISTS (
+               SELECT 1 FROM telegram_channel_boost_lot_rules AS rule
+                WHERE rule.telegram_id=settings.telegram_id
+           );
         """,
         _telegram_id(),
     )
@@ -289,12 +365,84 @@ def _settings_ready(settings: Any) -> bool:
         settings
         and settings["api_base_url"]
         and settings["api_token_enc"]
-        and settings["service_id"]
-        and int(settings["quantity"] or 0) > 0
-        and int(settings["target_members"] or 0) > 0
-        and int(settings["min_ready_channels"] or 0) >= 1
-        and settings["lot_id"]
-        and settings["lot_title"]
+    )
+
+
+def _rule_ready(rule: Any) -> bool:
+    return bool(
+        rule and rule["enabled"] and rule["lot_id"] and rule["lot_title"]
+        and int(rule["service_id"] or 0) > 0
+        and int(rule["quantity"] or 0) > 0
+        and int(rule["target_members"] or 0) > 0
+        and int(rule["min_ready_channels"] or 0) >= 1
+    )
+
+
+async def _rules(*, enabled_only: bool = False) -> list[Any]:
+    await _ensure_schema()
+    clause = " AND enabled=TRUE" if enabled_only else ""
+    return list(await _db().fetch(
+        f"""SELECT * FROM telegram_channel_boost_lot_rules
+             WHERE telegram_id=$1{clause} ORDER BY created_at, id""",
+        _telegram_id(),
+    ))
+
+
+async def _rule(rule_id: int) -> Any | None:
+    await _ensure_schema()
+    return await _db().fetchrow(
+        """SELECT * FROM telegram_channel_boost_lot_rules
+             WHERE telegram_id=$1 AND id=$2""",
+        _telegram_id(), rule_id,
+    )
+
+
+async def _upsert_rule(lot_id: str, lot_title: str, service_id: int,
+                       quantity: int, target_members: int,
+                       min_ready_channels: int) -> Any:
+    return await _db().fetchrow(
+        """INSERT INTO telegram_channel_boost_lot_rules
+               (telegram_id, lot_id, lot_title, service_id, quantity,
+                target_members, min_ready_channels)
+            VALUES ($1,$2,$3,$4,$5,$6,$7)
+            ON CONFLICT (telegram_id, lot_id) DO UPDATE SET
+                lot_title=EXCLUDED.lot_title, service_id=EXCLUDED.service_id,
+                quantity=EXCLUDED.quantity, target_members=EXCLUDED.target_members,
+                min_ready_channels=EXCLUDED.min_ready_channels,
+                enabled=TRUE, updated_at=NOW()
+            RETURNING *""",
+        _telegram_id(), lot_id, lot_title, service_id, quantity,
+        target_members, min_ready_channels,
+    )
+
+
+async def _update_rule(rule_id: int, column: str, value: Any) -> None:
+    if column not in {"service_id", "quantity", "target_members", "min_ready_channels", "enabled"}:
+        raise ValueError("неизвестное поле позиции")
+    await _db().execute(
+        f"""UPDATE telegram_channel_boost_lot_rules
+               SET {column}=$3, updated_at=NOW()
+             WHERE telegram_id=$1 AND id=$2""",
+        _telegram_id(), rule_id, value,
+    )
+
+
+async def _delete_rule(rule_id: int) -> None:
+    active = await _db().fetchrow(
+        """SELECT 1 FROM telegram_channel_boost_jobs
+             WHERE telegram_id=$1 AND rule_id=$2
+               AND status NOT IN ('completed','failed','canceled') LIMIT 1""",
+        _telegram_id(), rule_id,
+    )
+    if active:
+        raise RuntimeError("у позиции есть активный заказ; сначала дождитесь его завершения")
+    await _db().execute(
+        """UPDATE telegram_channel_boost_inventory SET status='failed',
+                  error_text='Lot binding deleted', updated_at=NOW()
+             WHERE telegram_id=$1 AND rule_id=$2 AND status NOT IN ('transferred','reserved');
+            DELETE FROM telegram_channel_boost_lot_rules
+             WHERE telegram_id=$1 AND id=$2""",
+        _telegram_id(), rule_id,
     )
 
 
@@ -370,41 +518,44 @@ def _inventory_status_label(status: str) -> str:
 
 def _show_settings(chat_id: int) -> None:
     settings = _sync(_settings())
+    rules = _sync(_rules())
     jobs = _sync(_recent_jobs())
     inventory = _sync(_recent_inventory())
     counts = _sync(_inventory_counts())
-    telethon_ready = bool(
-        _cardinal
-        and _cardinal.telethon
-        and _cardinal.telethon.is_connected(UUID)
-    )
+    account_count = len(_telethon_accounts())
+    enabled_rules = sum(1 for rule in rules if rule["enabled"])
     lines = [
         "🚀 <b>Telegram Channel Boost</b>",
         "",
-        f"Telethon: <b>{'подключён' if telethon_ready else 'не подключён'}</b>",
+        f"Telegram-аккаунты: <b>{account_count} подключено</b>",
         f"API URL: <code>{html.escape(str(settings['api_base_url']))}</code>",
         f"API-токен: <b>{html.escape(_token_label(settings))}</b>",
-        f"ID услуги: <b>{settings['service_id'] or 'не задан'}</b>",
-        f"Количество для SMM: <b>{settings['quantity']}</b>",
-        f"Порог готовности: <b>{settings['target_members']} подписчиков</b>",
-        f"Минимум готовых каналов: <b>{settings['min_ready_channels']}</b>",
-        f"Лот Telegram: <b>{html.escape(str(settings['lot_title'] or 'не выбран'))}</b>",
+        f"Позиции: <b>{enabled_rules}/{len(rules)} включено</b>",
         "",
         "<b>Склад каналов</b>",
         f"Готовы: <b>{int(counts['ready'] or 0)}</b> · готовятся: <b>{int(counts['preparing'] or 0)}</b> · "
         f"зарезервированы: <b>{int(counts['reserved'] or 0)}</b> · исключены: <b>{int(counts['failed'] or 0)}</b>",
         "",
-        f"Готовность: <b>{'✅ настроено' if _settings_ready(settings) and telethon_ready else '⚠️ требуется настройка'}</b>",
+        f"Готовность: <b>{'✅ настроено' if _settings_ready(settings) and account_count and enabled_rules else '⚠️ требуется настройка'}</b>",
         "",
-        "Пароль 2FA хранится только зашифрованно в Telethon-сессии и используется для автоматической передачи владельца.",
+        "Каждая позиция имеет свои услугу, количество, порог и запас. Каналы распределяются между Telegram-аккаунтами автоматически.",
     ]
+    if rules:
+        lines.extend(["", "<b>Привязанные позиции</b>"])
+        for rule in rules[:12]:
+            marker = "✅" if rule["enabled"] else "⏸"
+            lines.append(
+                f"{marker} {html.escape(str(rule['lot_title'])[:65])}\n"
+                f"   услуга <code>{rule['service_id']}</code> · {rule['quantity']} SMM · "
+                f"порог {rule['target_members']} · склад {rule['min_ready_channels']}"
+            )
     if inventory:
         lines.extend(["", "<b>Последние каналы склада</b>"])
         for item in inventory:
             link = html.escape(str(item["channel_url"] or f"канал #{item['id']}"))
             refill = " · refill" if item["refill_pending"] else ""
             lines.append(
-                f"• {link} — {html.escape(_inventory_status_label(item['status']))}{refill}; "
+                f"• {html.escape(str(_row_get(item, 'lot_title', '—'))[:35])}: {link} — {html.escape(_inventory_status_label(item['status']))}{refill}; "
                 f"{item['member_count']}/{item['target_members']}"
             )
     if jobs:
@@ -419,11 +570,9 @@ def _show_settings(chat_id: int) -> None:
     rows: list[list[tuple[str, str]]] = [
         [("🌐 Base URL API", f"{CALLBACK_PREFIX}set:base")],
         [("🔑 API-токен", f"{CALLBACK_PREFIX}set:token")],
-        [("🧩 ID услуги", f"{CALLBACK_PREFIX}set:service")],
-        [("📈 Количество накрутки", f"{CALLBACK_PREFIX}set:quantity")],
-        [("🎯 Порог подписчиков", f"{CALLBACK_PREFIX}set:target")],
-        [("📦 Минимум готовых каналов", f"{CALLBACK_PREFIX}set:stock")],
-        [("🛒 Выбрать Telegram-лот", f"{CALLBACK_PREFIX}lots")],
+        [("📱 Telegram-аккаунты", f"plugin_telethon:{UUID}")],
+        [("➕ Добавить позицию", f"{CALLBACK_PREFIX}lots")],
+        [("🧩 Управление позициями", f"{CALLBACK_PREFIX}rules")],
         [("🧪 Проверить API", f"{CALLBACK_PREFIX}api_test")],
     ]
     rows.append([("🔄 Обновить", SETTINGS_CALLBACK)])
@@ -463,10 +612,12 @@ def _load_telegram_lots(chat_id: int) -> None:
         ).casefold()
         if "telegram" in haystack or "телеграм" in haystack:
             lots.append(lot)
+    existing_ids = {str(rule["lot_id"]) for rule in _sync(_rules())}
+    lots = [lot for lot in lots if str(lot.id) not in existing_ids]
     if not lots:
         _bot().send_message(
             chat_id,
-            "❌ В профиле не найдены лоты из категории Telegram. Создайте или активируйте лот и обновите список.",
+            "❌ Нет свободных лотов Telegram: все найденные уже привязаны либо профиль пуст.",
         )
         return
     _lot_cache = {
@@ -486,9 +637,51 @@ def _load_telegram_lots(chat_id: int) -> None:
     _bot().send_message(
         chat_id,
         "🛒 <b>Выберите лот категории Telegram</b>\n\n"
-        "Плагин будет запускаться только для заказов, описание которых содержит название выбранного лота.",
+        "После выбора поэтапно задайте услугу, количество, порог и размер склада.",
         reply_markup=_markup(*rows),
     )
+
+
+def _show_rules(chat_id: int) -> None:
+    rules = _sync(_rules())
+    rows = [[(
+        f"{'✅' if rule['enabled'] else '⏸'} {str(rule['lot_title'])[:42]}",
+        f"{CALLBACK_PREFIX}r:{rule['id']}",
+    )] for rule in rules]
+    rows.extend([
+        [("➕ Добавить позицию", f"{CALLBACK_PREFIX}lots")],
+        [("⬅️ Настройки", SETTINGS_CALLBACK)],
+    ])
+    _bot().send_message(
+        chat_id,
+        "🧩 <b>Позиции Telegram Channel Boost</b>\n\n"
+        + ("Выберите позицию для настройки." if rules else "Пока нет привязанных лотов."),
+        reply_markup=_markup(*rows),
+    )
+
+
+def _show_rule(chat_id: int, rule_id: int) -> None:
+    rule = _sync(_rule(rule_id))
+    if not rule:
+        raise RuntimeError("позиция не найдена")
+    text = (
+        f"🛒 <b>{html.escape(str(rule['lot_title']))}</b>\n\n"
+        f"ID лота: <code>{rule['lot_id']}</code>\n"
+        f"ID услуги: <b>{rule['service_id']}</b>\n"
+        f"Количество SMM: <b>{rule['quantity']}</b>\n"
+        f"Порог подписчиков: <b>{rule['target_members']}</b>\n"
+        f"Минимум готовых: <b>{rule['min_ready_channels']}</b>\n"
+        f"Состояние: <b>{'включена' if rule['enabled'] else 'выключена'}</b>"
+    )
+    _bot().send_message(chat_id, text, reply_markup=_markup(
+        [("🧩 Изменить ID услуги", f"{CALLBACK_PREFIX}rs:{rule_id}")],
+        [("📈 Изменить количество", f"{CALLBACK_PREFIX}rq:{rule_id}")],
+        [("🎯 Изменить порог", f"{CALLBACK_PREFIX}rtg:{rule_id}")],
+        [("📦 Изменить склад", f"{CALLBACK_PREFIX}rst:{rule_id}")],
+        [("⏸ Выключить" if rule["enabled"] else "▶️ Включить", f"{CALLBACK_PREFIX}re:{rule_id}")],
+        [("🗑 Удалить", f"{CALLBACK_PREFIX}rd:{rule_id}")],
+        [("⬅️ Все позиции", f"{CALLBACK_PREFIX}rules")],
+    ))
 
 
 def _smm_request(settings: Any, **payload: Any) -> dict[str, Any]:
@@ -537,26 +730,50 @@ def _on_callback(call: Any) -> None:
             _prompt(chat_id, "base", "Отправьте HTTPS Base URL API сервиса, например <code>https://smmway.ru/api/v2</code>.")
         elif data == f"{CALLBACK_PREFIX}set:token":
             _prompt(chat_id, "token", "Отправьте API-токен. Сообщение будет удалено, токен сохранится зашифрованным.")
-        elif data == f"{CALLBACK_PREFIX}set:service":
-            _prompt(chat_id, "service", "Отправьте числовой ID услуги подписчиков Telegram.")
-        elif data == f"{CALLBACK_PREFIX}set:quantity":
-            _prompt(chat_id, "quantity", "Отправьте количество подписчиков для заказа в SMM API (1–1 000 000).")
-        elif data == f"{CALLBACK_PREFIX}set:target":
-            _prompt(chat_id, "target", "Отправьте фактическое число подписчиков канала, при котором заказ готов (1–1 000 000).")
-        elif data == f"{CALLBACK_PREFIX}set:stock":
-            _prompt(chat_id, "stock", "Сколько готовых каналов постоянно держать на складе? Отправьте число от 1 до 20.")
         elif data == f"{CALLBACK_PREFIX}lots":
             _load_telegram_lots(chat_id)
+        elif data == f"{CALLBACK_PREFIX}rules":
+            _show_rules(chat_id)
         elif data.startswith(f"{CALLBACK_PREFIX}lot:"):
             lot_id = data.rsplit(":", 1)[1]
             title = _lot_cache.get(lot_id)
             if not title:
                 raise RuntimeError("список лотов устарел; откройте его повторно")
-            _sync(_set_setting("lot_id", lot_id))
-            _sync(_set_setting("lot_title", title))
-            _bot().send_message(chat_id, f"✅ Выбран лот: <b>{html.escape(title)}</b>")
+            _draft_rule.clear()
+            _draft_rule.update(lot_id=lot_id, lot_title=title)
+            _prompt(chat_id, "new_service", "Шаг 1/4. Отправьте числовой ID SMM-услуги.")
+        elif data.startswith(f"{CALLBACK_PREFIX}r:"):
+            _show_rule(chat_id, int(data.rsplit(":", 1)[1]))
+        elif data.startswith(f"{CALLBACK_PREFIX}rs:"):
+            rule_id = int(data.rsplit(":", 1)[1])
+            _prompt(chat_id, "edit_service", "Отправьте новый ID SMM-услуги.", rule_id)
+        elif data.startswith(f"{CALLBACK_PREFIX}rq:"):
+            rule_id = int(data.rsplit(":", 1)[1])
+            _prompt(chat_id, "edit_quantity", "Отправьте новое количество SMM.", rule_id)
+        elif data.startswith(f"{CALLBACK_PREFIX}rtg:"):
+            rule_id = int(data.rsplit(":", 1)[1])
+            _prompt(chat_id, "edit_target", "Отправьте новый порог подписчиков.", rule_id)
+        elif data.startswith(f"{CALLBACK_PREFIX}rst:"):
+            rule_id = int(data.rsplit(":", 1)[1])
+            _prompt(chat_id, "edit_stock", "Отправьте новый минимум готовых каналов (1–20).", rule_id)
+        elif data.startswith(f"{CALLBACK_PREFIX}re:"):
+            rule_id = int(data.rsplit(":", 1)[1])
+            rule = _sync(_rule(rule_id))
+            if not rule:
+                raise RuntimeError("позиция не найдена")
+            _sync(_update_rule(rule_id, "enabled", not bool(rule["enabled"])))
             _spawn(_maintain_inventory())
-            _show_settings(chat_id)
+            _show_rule(chat_id, rule_id)
+        elif data.startswith(f"{CALLBACK_PREFIX}rd:"):
+            rule_id = int(data.rsplit(":", 1)[1])
+            _bot().send_message(chat_id, "Удалить эту привязку? Готовые непроданные каналы позиции будут исключены.", reply_markup=_markup(
+                [("Да, удалить", f"{CALLBACK_PREFIX}rx:{rule_id}")],
+                [("Отмена", f"{CALLBACK_PREFIX}r:{rule_id}")],
+            ))
+        elif data.startswith(f"{CALLBACK_PREFIX}rx:"):
+            _sync(_delete_rule(int(data.rsplit(":", 1)[1])))
+            _bot().send_message(chat_id, "✅ Привязка удалена.")
+            _show_rules(chat_id)
         elif data == f"{CALLBACK_PREFIX}api_test":
             _spawn(_api_test(chat_id))
     except Exception as exc:
@@ -584,20 +801,46 @@ def _on_setting_message(message: Any) -> None:
             if not 8 <= len(value) <= 1024:
                 raise ValueError("длина API-токена должна быть от 8 до 1024 символов")
             _sync(_set_setting("api_token_enc", _secret_box().encrypt(value)))
-        elif key in {"service", "quantity", "target", "stock"}:
+        elif key in {
+            "new_service", "new_quantity", "new_target", "new_stock",
+            "edit_service", "edit_quantity", "edit_target", "edit_stock",
+        }:
             if not value.isdigit():
                 raise ValueError("нужно отправить целое положительное число")
             number = int(value)
-            maximum = 20 if key == "stock" else 1_000_000
+            maximum = 20 if key in {"new_stock", "edit_stock"} else 1_000_000
             if not 1 <= number <= maximum:
                 raise ValueError(f"значение должно быть от 1 до {maximum}")
-            column = {
-                "service": "service_id",
-                "quantity": "quantity",
-                "target": "target_members",
-                "stock": "min_ready_channels",
-            }[key]
-            _sync(_set_setting(column, number))
+            if key == "new_service":
+                _draft_rule["service_id"] = number
+                _prompt(chat_id, "new_quantity", "Шаг 2/4. Отправьте количество для SMM-заказа.")
+                return
+            if key == "new_quantity":
+                _draft_rule["quantity"] = number
+                _prompt(chat_id, "new_target", "Шаг 3/4. При каком фактическом числе подписчиков канал считать готовым?")
+                return
+            if key == "new_target":
+                _draft_rule["target_members"] = number
+                _prompt(chat_id, "new_stock", "Шаг 4/4. Сколько готовых каналов этой позиции держать на складе (1–20)?")
+                return
+            if key == "new_stock":
+                required = {"lot_id", "lot_title", "service_id", "quantity", "target_members"}
+                if not required.issubset(_draft_rule):
+                    raise RuntimeError("мастер устарел; выберите лот заново")
+                _sync(_upsert_rule(
+                    str(_draft_rule["lot_id"]), str(_draft_rule["lot_title"]),
+                    int(_draft_rule["service_id"]), int(_draft_rule["quantity"]),
+                    int(_draft_rule["target_members"]), number,
+                ))
+                _draft_rule.clear()
+            else:
+                if job_id is None:
+                    raise RuntimeError("позиция не выбрана")
+                column = {
+                    "edit_service": "service_id", "edit_quantity": "quantity",
+                    "edit_target": "target_members", "edit_stock": "min_ready_channels",
+                }[key]
+                _sync(_update_rule(job_id, column, number))
         _bot().send_message(chat_id, "✅ Настройка сохранена.")
         _spawn(_maintain_inventory())
         _show_settings(chat_id)
@@ -606,13 +849,28 @@ def _on_setting_message(message: Any) -> None:
         _bot().send_message(chat_id, f"❌ {html.escape(str(exc)[:500])}")
 
 
-async def _insert_job(order: dict[str, Any], settings: Any) -> Any | None:
+def _normalized_order_title(value: str) -> str:
+    value = re.sub(r",\s*\d{1,3}(?:\s?\d{3})*\s*(?:шт|pcs)\.\s*$", "", value, flags=re.I)
+    return " ".join(value.split()).casefold()
+
+
+def _match_rule(description: str, rules: list[Any], lot_id: str | None = None) -> Any | None:
+    enabled = [rule for rule in rules if _rule_ready(rule)]
+    if lot_id is not None:
+        return next((rule for rule in enabled if str(rule["lot_id"]) == str(lot_id)), None)
+    normalized = _normalized_order_title(description)
+    matches = [rule for rule in enabled
+               if _normalized_order_title(str(rule["lot_title"])) == normalized]
+    return matches[0] if len(matches) == 1 else None
+
+
+async def _insert_job(order: dict[str, Any], rule: Any) -> Any | None:
     return await _db().fetchrow(
         """
         INSERT INTO telegram_channel_boost_jobs
-            (telegram_id, order_id, chat_id, chat_name, buyer_id,
-             lot_title, target_members, status)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, 'waiting_inventory')
+            (telegram_id, order_id, chat_id, chat_name, buyer_id, rule_id,
+             lot_id, lot_title, target_members, status)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'waiting_inventory')
         ON CONFLICT (telegram_id, order_id) DO NOTHING
         RETURNING *
         """,
@@ -621,8 +879,10 @@ async def _insert_job(order: dict[str, Any], settings: Any) -> Any | None:
         str(order["chat_id"]),
         order["chat_name"],
         order["buyer_id"],
-        order["description"],
-        int(settings["target_members"]),
+        int(rule["id"]),
+        str(rule["lot_id"]),
+        str(rule["lot_title"]),
+        int(rule["target_members"]),
     )
 
 
@@ -645,6 +905,7 @@ async def _update_job(job_id: int, **values: Any) -> None:
         "channel_username",
         "channel_url",
         "inventory_id",
+        "telethon_session_id",
         "smm_order_id",
         "smm_status",
         "member_count",
@@ -671,13 +932,13 @@ async def _update_job(job_id: int, **values: Any) -> None:
     )
 
 
-async def _claim_ready_inventory(order_id: str) -> Any | None:
+async def _claim_ready_inventory(order_id: str, rule_id: int) -> Any | None:
     return await _db().fetchrow(
         """
         WITH candidate AS (
             SELECT id
               FROM telegram_channel_boost_inventory
-             WHERE telegram_id=$1 AND status='ready'
+             WHERE telegram_id=$1 AND status='ready' AND rule_id=$3
              ORDER BY ready_at, id
              FOR UPDATE SKIP LOCKED
              LIMIT 1
@@ -690,6 +951,7 @@ async def _claim_ready_inventory(order_id: str) -> Any | None:
         """,
         _telegram_id(),
         order_id,
+        rule_id,
     )
 
 
@@ -711,7 +973,7 @@ async def _assign_inventory_to_job(job_id: int) -> bool:
     try:
         settings = await _settings()
         while True:
-            item = await _claim_ready_inventory(str(job["order_id"]))
+            item = await _claim_ready_inventory(str(job["order_id"]), int(job["rule_id"]))
             if not item:
                 await _update_job(job_id, status="waiting_inventory")
                 return False
@@ -747,7 +1009,8 @@ async def _assign_inventory_to_job(job_id: int) -> bool:
                    SET inventory_id=$3, channel_id=$4, channel_access_hash=$5,
                        channel_username=$6, channel_url=$7, smm_order_id=$8,
                        smm_status=$9, member_count=$10, target_members=$11,
-                       status='awaiting_username', error_text=NULL, updated_at=NOW()
+                       telethon_session_id=$12, status='awaiting_username',
+                       error_text=NULL, updated_at=NOW()
                  WHERE telegram_id=$1 AND id=$2 AND status='assigning'
                 RETURNING *
                 """,
@@ -762,6 +1025,7 @@ async def _assign_inventory_to_job(job_id: int) -> bool:
                 str(item["smm_status"] or "Completed"),
                 members,
                 required_members,
+                item["telethon_session_id"],
             )
             if not assigned_job:
                 await _update_inventory(
@@ -818,8 +1082,7 @@ async def _assign_waiting_jobs() -> None:
         _telegram_id(),
     )
     for row in rows:
-        if not await _assign_inventory_to_job(int(row["id"])):
-            break
+        await _assign_inventory_to_job(int(row["id"]))
 
 
 async def _funpay_send(job: Any, text: str) -> None:
@@ -846,10 +1109,63 @@ async def _stored_2fa_password() -> str | None:
     return await service.get_2fa_password(_telegram_id(), UUID)
 
 
-async def _create_public_channel(reference: str) -> tuple[Any, str]:
-    if _client is None or not _client.is_connected():
+def _telethon_accounts() -> list[tuple[int, Any]]:
+    service = getattr(getattr(_cardinal, "plugin_manager", None), "telethon_service", None)
+    if service is None:
+        return []
+    result: list[tuple[int, Any]] = []
+    for client in service.get_clients(_telegram_id(), UUID):
+        if not client.is_connected():
+            continue
+        session_id = service.session_id_for_client(_telegram_id(), UUID, client)
+        if session_id is not None:
+            result.append((int(session_id), client))
+    return result
+
+
+def _client_for(row: Any) -> Any:
+    session_id = _row_get(row, "telethon_session_id")
+    service = getattr(getattr(_cardinal, "plugin_manager", None), "telethon_service", None)
+    client = (
+        service.get_client_by_session(_telegram_id(), UUID, int(session_id))
+        if service is not None and session_id is not None else _client
+    )
+    if client is None or not client.is_connected():
+        raise RuntimeError("Telegram-аккаунт канала не подключён")
+    return client
+
+
+async def _password_for(row: Any) -> str | None:
+    service = getattr(getattr(_cardinal, "plugin_manager", None), "telethon_service", None)
+    if service is None:
+        return await _stored_2fa_password()
+    session_id = _row_get(row, "telethon_session_id")
+    return await service.get_2fa_password(
+        _telegram_id(), UUID, int(session_id) if session_id is not None else None
+    )
+
+
+async def _select_telethon_account() -> tuple[int, Any]:
+    accounts = _telethon_accounts()
+    if not accounts:
+        raise RuntimeError("нет подключённых Telegram-аккаунтов")
+    usage_rows = await _db().fetch(
+        """SELECT telethon_session_id, COUNT(*) AS count
+             FROM telegram_channel_boost_inventory
+            WHERE telegram_id=$1 AND status NOT IN ('transferred','failed')
+            GROUP BY telethon_session_id""",
+        _telegram_id(),
+    )
+    usage = {int(row["telethon_session_id"]): int(row["count"])
+             for row in usage_rows if row["telethon_session_id"] is not None}
+    return min(accounts, key=lambda pair: (usage.get(pair[0], 0), pair[0]))
+
+
+async def _create_public_channel(reference: str, client: Any | None = None) -> tuple[Any, str]:
+    client = client or _client
+    if client is None or not client.is_connected():
         raise RuntimeError("Telethon не подключён")
-    result = await _client(
+    result = await client(
         CreateChannelRequest(
             title=f"Ready Telegram channel {reference}",
             about="Канал заранее подготовлен для автоматической выдачи на FunPay.",
@@ -863,7 +1179,7 @@ async def _create_public_channel(reference: str) -> tuple[Any, str]:
             random.choice(string.ascii_lowercase) for _ in range(14)
         )
         try:
-            await _client(UpdateUsernameRequest(channel, username))
+            await client(UpdateUsernameRequest(channel, username))
             return channel, username
         except UsernameOccupiedError:
             continue
@@ -879,7 +1195,8 @@ def _input_channel(job: Any) -> InputChannel:
 
 
 async def _member_count(job: Any) -> int:
-    participants = await _client.get_participants(_input_channel(job), limit=0)
+    client = _client_for(job)
+    participants = await client.get_participants(_input_channel(job), limit=0)
     return int(getattr(participants, "total", len(participants)))
 
 
@@ -915,16 +1232,17 @@ async def _update_inventory(item_id: int, **values: Any) -> None:
     )
 
 
-async def _insert_inventory_item(settings: Any) -> Any:
+async def _insert_inventory_item(rule: Any) -> Any:
+    session_id, _selected_client = await _select_telethon_account()
     return await _db().fetchrow(
         """INSERT INTO telegram_channel_boost_inventory
-               (telegram_id, service_id, quantity, target_members, status)
-            VALUES ($1, $2, $3, $4, 'queued')
+               (telegram_id, rule_id, lot_id, lot_title, telethon_session_id,
+                service_id, quantity, target_members, status)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'queued')
             RETURNING *""",
         _telegram_id(),
-        int(settings["service_id"]),
-        int(settings["quantity"]),
-        int(settings["target_members"]),
+        int(rule["id"]), str(rule["lot_id"]), str(rule["lot_title"]), session_id,
+        int(rule["service_id"]), int(rule["quantity"]), int(rule["target_members"]),
     )
 
 
@@ -1010,16 +1328,22 @@ async def _run_inventory_item(item_id: int) -> None:
         if not item or item["status"] not in {"queued", "boosting"}:
             return
         settings = await _settings()
-        if not _settings_ready(settings):
+        rule = await _rule(int(item["rule_id"])) if item["rule_id"] else None
+        if not _settings_ready(settings) or not _rule_ready(rule):
             return
-        while _client is None or not _client.is_connected():
+        while True:
+            try:
+                account_client = _client_for(item)
+                break
+            except RuntimeError:
+                account_client = None
             if not _cardinal.plugin_manager.is_enabled(_telegram_id(), UUID):
                 return
             if time.monotonic() - started_at > 600:
                 raise RuntimeError("Telethon не подключён в течение 10 минут")
             await asyncio.sleep(5)
         if not item["channel_id"]:
-            channel, username = await _create_public_channel(f"stock-{item_id}")
+            channel, username = await _create_public_channel(f"stock-{item_id}", account_client)
             await _update_inventory(
                 item_id,
                 channel_id=int(channel.id),
@@ -1117,12 +1441,19 @@ async def _run_inventory_item(item_id: int) -> None:
         _running_inventory_ids.discard(item_id)
 
 
-async def _check_ready_inventory(settings: Any) -> None:
+async def _check_ready_inventory(settings: Any, rule: Any | None = None) -> None:
     rows = await _db().fetch(
         """SELECT * FROM telegram_channel_boost_inventory
             WHERE telegram_id=$1 AND status='ready'
+              AND ($2::BIGINT IS NULL OR rule_id=$2)
+              AND EXISTS (
+                  SELECT 1 FROM telegram_channel_boost_lot_rules AS rule
+                   WHERE rule.id=telegram_channel_boost_inventory.rule_id
+                     AND rule.enabled=TRUE
+              )
             ORDER BY ready_at, id""",
         _telegram_id(),
+        int(rule["id"]) if rule else None,
     )
     for item in rows:
         try:
@@ -1145,10 +1476,11 @@ async def _maintain_inventory() -> None:
         _inventory_maintenance_lock = asyncio.Lock()
     async with _inventory_maintenance_lock:
         settings = await _settings()
+        rules = await _rules(enabled_only=True)
         if (
             not _settings_ready(settings)
-            or _client is None
-            or not _client.is_connected()
+            or not _telethon_accounts()
+            or not rules
             or not _cardinal.plugin_manager.is_enabled(_telegram_id(), UUID)
         ):
             return
@@ -1157,27 +1489,33 @@ async def _maintain_inventory() -> None:
         preparing = await _db().fetch(
             """SELECT id FROM telegram_channel_boost_inventory
                 WHERE telegram_id=$1 AND status IN ('queued', 'boosting')
+                  AND EXISTS (
+                      SELECT 1 FROM telegram_channel_boost_lot_rules AS rule
+                       WHERE rule.id=telegram_channel_boost_inventory.rule_id
+                         AND rule.enabled=TRUE
+                  )
                 ORDER BY created_at""",
             _telegram_id(),
         )
         for item in preparing:
             _launch_inventory_item(int(item["id"]))
-        count = await _db().fetchrow(
-            """SELECT COUNT(*) AS count FROM telegram_channel_boost_inventory
-                WHERE telegram_id=$1
-                  AND (
-                      status IN ('ready', 'queued')
-                      OR (status='boosting' AND last_refill_at IS NULL)
-                  )""",
-            _telegram_id(),
-        )
-        shortage = max(
-            int(settings["min_ready_channels"]) - int(count["count"] if count else 0),
-            0,
-        )
-        for _ in range(shortage):
-            item = await _insert_inventory_item(settings)
-            _launch_inventory_item(int(item["id"]))
+        for rule in rules:
+            count = await _db().fetchrow(
+                """SELECT COUNT(*) AS count FROM telegram_channel_boost_inventory
+                    WHERE telegram_id=$1 AND rule_id=$2
+                      AND (
+                          status IN ('ready', 'queued')
+                          OR (status='boosting' AND last_refill_at IS NULL)
+                      )""",
+                _telegram_id(), int(rule["id"]),
+            )
+            shortage = max(
+                int(rule["min_ready_channels"]) - int(count["count"] if count else 0),
+                0,
+            )
+            for _ in range(shortage):
+                item = await _insert_inventory_item(rule)
+                _launch_inventory_item(int(item["id"]))
 
 
 async def _inventory_loop() -> None:
@@ -1346,9 +1684,12 @@ async def _run_job(job_id: int) -> None:
 
 async def _process_new_order(order: dict[str, Any]) -> None:
     settings = await _settings()
-    lot_title = str(settings["lot_title"] or "").strip()
-    description = str(order["description"] or "")
-    if not lot_title or lot_title.casefold() not in description.casefold():
+    rule = _match_rule(
+        str(order.get("description") or ""),
+        await _rules(enabled_only=True),
+        str(order["lot_id"]) if order.get("lot_id") is not None else None,
+    )
+    if not rule:
         return
     if not _settings_ready(settings):
         await _notify_owner(
@@ -1356,7 +1697,7 @@ async def _process_new_order(order: dict[str, Any]) -> None:
             f"Заказ: <code>#{html.escape(order['id'])}</code>"
         )
         return
-    job = await _insert_job(order, settings)
+    job = await _insert_job(order, rule)
     if not job:
         return
     if not await _assign_inventory_to_job(int(job["id"])):
@@ -1412,9 +1753,6 @@ async def _resume_jobs() -> None:
 
 
 async def _resume_transfers() -> None:
-    password = await _stored_2fa_password()
-    if not password:
-        return
     rows = await _db().fetch(
         """
         SELECT id FROM telegram_channel_boost_jobs
@@ -1423,10 +1761,13 @@ async def _resume_transfers() -> None:
         """,
         _telegram_id(),
     )
-    await asyncio.gather(
-        *[_transfer_owner(int(row["id"]), password) for row in rows],
-        return_exceptions=True,
-    )
+    transfers = []
+    for row in rows:
+        job = await _job(int(row["id"]))
+        password = await _password_for(job) if job else None
+        if password:
+            transfers.append(_transfer_owner(int(row["id"]), password))
+    await asyncio.gather(*transfers, return_exceptions=True)
 
 
 async def _active_buyer_job(
@@ -1469,13 +1810,15 @@ async def _verify_buyer(job: Any) -> None:
     if not username:
         await _update_job(job["id"], status="awaiting_username")
         return
-    if _client is None or not _client.is_connected():
+    try:
+        account_client = _client_for(job)
+    except RuntimeError:
         await _funpay_send(job, "Telethon временно не подключён. Продавец уже уведомлён.")
         await _notify_owner("⚠️ Для проверки покупателя подключите Telethon в настройках плагина.")
         return
     try:
-        user = await _client.get_entity(username)
-        await _client(GetParticipantRequest(_input_channel(job), user))
+        user = await account_client.get_entity(username)
+        await account_client(GetParticipantRequest(_input_channel(job), user))
     except UserNotParticipantError:
         await _update_job(job["id"], status="awaiting_join")
         await _funpay_send(
@@ -1495,7 +1838,7 @@ async def _verify_buyer(job: Any) -> None:
         job,
         f"✅ {username} найден в канале. Автоматически передаю вам права владельца.",
     )
-    password = await _stored_2fa_password()
+    password = await _password_for(job)
     if not password:
         await _notify_owner(
             "⚠️ <b>Нельзя автоматически передать Telegram-канал</b>\n\n"
@@ -1555,17 +1898,19 @@ async def _transfer_owner(job_id: int, password: str) -> None:
         job = await _job(job_id)
         if not job or job["status"] != "awaiting_owner_2fa":
             return
-        if _client is None or not _client.is_connected():
+        try:
+            account_client = _client_for(job)
+        except RuntimeError:
             await _notify_owner("❌ Telethon не подключён; автоматическая передача канала отложена.")
             return
-        user = await _client.get_entity(job["buyer_username"])
+        user = await account_client.get_entity(job["buyer_username"])
         channel = _input_channel(job)
-        await _client(GetParticipantRequest(channel, user))
-        password_state = await _client(GetPasswordRequest())
+        await account_client(GetParticipantRequest(channel, user))
+        password_state = await account_client(GetPasswordRequest())
         password_check = await asyncio.to_thread(
             compute_check, password_state, password
         )
-        await _client(GetPasswordSettingsRequest(password_check))
+        await account_client(GetPasswordSettingsRequest(password_check))
         rights = ChatAdminRights(
             change_info=True,
             post_messages=True,
@@ -1580,16 +1925,16 @@ async def _transfer_owner(job_id: int, password: str) -> None:
             edit_stories=True,
             delete_stories=True,
         )
-        await _client(EditAdminRequest(channel, user, rights, rank="Владелец"))
+        await account_client(EditAdminRequest(channel, user, rights, rank="Владелец"))
         promoted = True
-        password_state = await _client(GetPasswordRequest())
+        password_state = await account_client(GetPasswordRequest())
         password_check = await asyncio.to_thread(
             compute_check, password_state, password
         )
-        await _client(EditChatCreatorRequest(channel, user, password_check))
+        await account_client(EditChatCreatorRequest(channel, user, password_check))
     except PasswordHashInvalidError:
         if promoted and channel is not None and user is not None:
-            await _revoke_admin(channel, user)
+            await _revoke_admin(channel, user, account_client)
         await _notify_owner(
             "❌ Сохранённый пароль 2FA больше не подходит. Авторизуйте Telegram-аккаунт "
             "плагина заново; передача продолжится автоматически."
@@ -1603,7 +1948,7 @@ async def _transfer_owner(job_id: int, password: str) -> None:
         return
     except Exception as exc:
         if promoted and channel is not None and user is not None:
-            await _revoke_admin(channel, user)
+            await _revoke_admin(channel, user, account_client)
         logger.exception("Не удалось передать владельца Telegram-канала")
         await _notify_owner(
             "❌ Telegram не передал владельца. Проверьте, что 2FA включена более 7 дней, "
@@ -1634,9 +1979,9 @@ async def _transfer_owner(job_id: int, password: str) -> None:
         _running_transfer_ids.discard(job_id)
 
 
-async def _revoke_admin(channel: InputChannel, user: Any) -> None:
+async def _revoke_admin(channel: InputChannel, user: Any, client: Any | None = None) -> None:
     try:
-        await _client(EditAdminRequest(channel, user, ChatAdminRights(), rank=""))
+        await (client or _client)(EditAdminRequest(channel, user, ChatAdminRights(), rank=""))
     except Exception:
         logger.exception("Не удалось отозвать временные права администратора")
 
@@ -1700,7 +2045,11 @@ def telethon_ready(cardinal: Any, client: Any) -> None:
 def telethon_disconnected(cardinal: Any, client: Any) -> None:
     global _client
     if _client is client:
-        _client = None
+        _client = next(
+            (current for _session_id, current in _telethon_accounts()
+             if current is not client),
+            None,
+        )
 
 
 def new_order(cardinal: Any, event: Any) -> None:
@@ -1714,8 +2063,21 @@ def new_order(cardinal: Any, event: Any) -> None:
         "chat_name": str(order.buyer_username or "Покупатель"),
         "buyer_id": int(order.buyer_id) if getattr(order, "buyer_id", None) else None,
         "description": str(order.description or ""),
+        "lot_id": _order_lot_id(order),
     }
     _spawn(_process_new_order(payload))
+
+
+def _order_lot_id(order: Any) -> str | None:
+    direct = getattr(order, "lot_id", None)
+    if direct is not None:
+        return str(direct)
+    widget_html = str(getattr(order, "html", "") or "")
+    for pattern in (r"(?:lots/offer\?id=|offer=|data-offer=[\"'])(\d+)",):
+        match = re.search(pattern, widget_html, re.I)
+        if match:
+            return match.group(1)
+    return None
 
 
 def new_message(cardinal: Any, event: Any) -> None:
@@ -1784,6 +2146,12 @@ def on_delete(cardinal: Any, callback: Any) -> None:
     _sync(
         _db().execute(
             "DELETE FROM telegram_channel_boost_settings WHERE telegram_id=$1",
+            _telegram_id(),
+        )
+    )
+    _sync(
+        _db().execute(
+            "DELETE FROM telegram_channel_boost_lot_rules WHERE telegram_id=$1",
             _telegram_id(),
         )
     )

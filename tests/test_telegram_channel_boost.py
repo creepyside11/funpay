@@ -86,6 +86,7 @@ def test_wrong_2fa_is_checked_before_buyer_gets_admin_rights(monkeypatch):
         "channel_access_hash": 456,
         "order_id": "ORDER-1",
         "channel_url": "https://t.me/fptestchannel",
+        "telethon_session_id": None,
     }
 
     class FakeClient:
@@ -133,6 +134,7 @@ def test_owner_transfer_validates_password_then_promotes_and_transfers(monkeypat
         "channel_access_hash": 456,
         "order_id": "ORDER-2",
         "channel_url": "https://t.me/fptestchannel",
+        "telethon_session_id": None,
     }
 
     class FakeClient:
@@ -180,6 +182,7 @@ def test_verified_buyer_is_transferred_automatically_with_saved_2fa(monkeypatch)
         "channel_access_hash": 456,
         "order_id": "ORDER-3",
         "channel_url": "https://t.me/fptestchannel",
+        "telethon_session_id": None,
     }
 
     class FakeClient:
@@ -333,6 +336,7 @@ def test_ready_inventory_is_attached_without_creating_or_boosting_channel(monkey
         "target_members": 100,
         "chat_id": "chat-1",
         "chat_name": "Buyer",
+        "rule_id": 6,
     }
     item = {
         "id": 51,
@@ -344,6 +348,7 @@ def test_ready_inventory_is_attached_without_creating_or_boosting_channel(monkey
         "smm_status": "Completed",
         "member_count": 105,
         "target_members": 100,
+        "telethon_session_id": 3,
     }
     saved_job = {**job, **item, "inventory_id": 51, "status": "awaiting_username"}
 
@@ -368,7 +373,7 @@ def test_ready_inventory_is_attached_without_creating_or_boosting_channel(monkey
     monkeypatch.setattr(plugin, "_db", lambda: FakeDatabase())
     monkeypatch.setattr(plugin, "_telegram_id", lambda: 7)
     monkeypatch.setattr(plugin, "_settings", lambda: _async_value({}))
-    monkeypatch.setattr(plugin, "_claim_ready_inventory", lambda _order: _async_value(item))
+    monkeypatch.setattr(plugin, "_claim_ready_inventory", lambda _order, _rule: _async_value(item))
     monkeypatch.setattr(plugin, "_member_count", lambda _item: _async_value(105))
     monkeypatch.setattr(plugin, "_update_job", update_job)
     monkeypatch.setattr(plugin, "_job", lambda _job_id: _async_value(saved_job))
@@ -398,12 +403,11 @@ def test_inventory_maintenance_creates_configured_minimum(monkeypatch):
     settings = {
         "api_base_url": "https://smmway.ru/api/v2",
         "api_token_enc": "encrypted",
-        "service_id": 10,
-        "quantity": 100,
-        "target_members": 100,
-        "min_ready_channels": 3,
-        "lot_id": "55",
-        "lot_title": "Telegram channel",
+    }
+    rule = {
+        "id": 8, "enabled": True, "service_id": 10, "quantity": 100,
+        "target_members": 100, "min_ready_channels": 3,
+        "lot_id": "55", "lot_title": "Telegram channel",
     }
 
     class FakeDatabase:
@@ -431,7 +435,7 @@ def test_inventory_maintenance_creates_configured_minimum(monkeypatch):
         return item
 
     monkeypatch.setattr(plugin, "_inventory_maintenance_lock", None)
-    monkeypatch.setattr(plugin, "_client", Client())
+    monkeypatch.setattr(plugin, "_telethon_accounts", lambda: [(1, Client())])
     monkeypatch.setattr(
         plugin,
         "_cardinal",
@@ -440,6 +444,7 @@ def test_inventory_maintenance_creates_configured_minimum(monkeypatch):
     monkeypatch.setattr(plugin, "_db", lambda: FakeDatabase())
     monkeypatch.setattr(plugin, "_telegram_id", lambda: 7)
     monkeypatch.setattr(plugin, "_settings", lambda: _async_value(settings))
+    monkeypatch.setattr(plugin, "_rules", lambda **_kwargs: _async_value([rule]))
     monkeypatch.setattr(plugin, "_check_ready_inventory", lambda _settings: _async_value(None))
     monkeypatch.setattr(plugin, "_assign_waiting_jobs", lambda: _async_value(None))
     monkeypatch.setattr(plugin, "_insert_inventory_item", insert)
@@ -456,22 +461,21 @@ def test_purchase_uses_prepared_inventory_instead_of_starting_boost(monkeypatch)
     settings = {
         "api_base_url": "https://smmway.ru/api/v2",
         "api_token_enc": "encrypted",
-        "service_id": 10,
-        "quantity": 100,
-        "target_members": 100,
-        "min_ready_channels": 1,
-        "lot_id": "55",
-        "lot_title": "Готовый Telegram канал",
+    }
+    rule = {
+        "id": 4, "enabled": True, "service_id": 10, "quantity": 100,
+        "target_members": 100, "min_ready_channels": 1,
+        "lot_id": "55", "lot_title": "Готовый Telegram канал",
     }
     order = {
         "id": "ORDER-STOCK",
         "chat_id": "chat-5",
         "chat_name": "Buyer",
         "buyer_id": 9,
-        "description": "Готовый Telegram канал с подписчиками",
+        "description": "Готовый Telegram канал, 1 шт.",
     }
 
-    async def insert(_order, _settings):
+    async def insert(_order, _rule):
         events.append("job")
         return {"id": 88}
 
@@ -486,6 +490,7 @@ def test_purchase_uses_prepared_inventory_instead_of_starting_boost(monkeypatch)
         raise AssertionError("boost must not start after purchase")
 
     monkeypatch.setattr(plugin, "_settings", lambda: _async_value(settings))
+    monkeypatch.setattr(plugin, "_rules", lambda **_kwargs: _async_value([rule]))
     monkeypatch.setattr(plugin, "_insert_job", insert)
     monkeypatch.setattr(plugin, "_assign_inventory_to_job", assign)
     monkeypatch.setattr(plugin, "_maintain_inventory", maintain)
@@ -494,6 +499,59 @@ def test_purchase_uses_prepared_inventory_instead_of_starting_boost(monkeypatch)
     asyncio.run(plugin._process_new_order(order))
 
     assert events == ["job", ("assign", 88), "replenish"]
+
+
+def test_unbound_telegram_lot_does_not_trigger(monkeypatch):
+    events = []
+    settings = {"api_base_url": "https://smmway.ru/api/v2", "api_token_enc": "encrypted"}
+    rule = {
+        "id": 4, "enabled": True, "service_id": 10, "quantity": 100,
+        "target_members": 100, "min_ready_channels": 1,
+        "lot_id": "55", "lot_title": "Telegram канал 100 подписчиков",
+    }
+    order = {
+        "id": "ORDER-OTHER", "chat_id": "chat", "chat_name": "Buyer",
+        "buyer_id": 9, "description": "Telegram канал 500 подписчиков, 1 шт.",
+        "lot_id": None,
+    }
+
+    monkeypatch.setattr(plugin, "_settings", lambda: _async_value(settings))
+    monkeypatch.setattr(plugin, "_rules", lambda **_kwargs: _async_value([rule]))
+    monkeypatch.setattr(plugin, "_insert_job", lambda *_args: events.append("job"))
+    monkeypatch.setattr(plugin, "_notify_owner", lambda *_args: events.append("notify"))
+
+    asyncio.run(plugin._process_new_order(order))
+
+    assert events == []
+
+
+def test_exact_lot_id_wins_over_similar_title():
+    rules = [
+        {"id": 1, "enabled": True, "lot_id": "55", "lot_title": "Telegram канал",
+         "service_id": 1, "quantity": 1, "target_members": 1, "min_ready_channels": 1},
+        {"id": 2, "enabled": True, "lot_id": "77", "lot_title": "Telegram канал VIP",
+         "service_id": 2, "quantity": 2, "target_members": 2, "min_ready_channels": 1},
+    ]
+    assert plugin._match_rule("любое описание", rules, "77")["id"] == 2
+    assert plugin._match_rule("Telegram канал VIP, 3 шт.", rules)["id"] == 2
+    assert plugin._match_rule("Telegram канал VIP extra", rules) is None
+
+
+def test_new_channels_use_least_loaded_telegram_account(monkeypatch):
+    first, second = object(), object()
+
+    class FakeDatabase:
+        async def fetch(self, _query, *_args):
+            return [
+                {"telethon_session_id": 10, "count": 4},
+                {"telethon_session_id": 11, "count": 1},
+            ]
+
+    monkeypatch.setattr(plugin, "_telethon_accounts", lambda: [(10, first), (11, second)])
+    monkeypatch.setattr(plugin, "_db", lambda: FakeDatabase())
+    monkeypatch.setattr(plugin, "_telegram_id", lambda: 7)
+
+    assert asyncio.run(plugin._select_telethon_account()) == (11, second)
 
 
 async def _async_value(value):

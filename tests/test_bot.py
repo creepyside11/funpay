@@ -1341,11 +1341,12 @@ def test_telethon_service_encrypts_session_and_bridge_runs_awaitables():
     class FakeDatabase:
         async def save_plugin_telethon_session(self, *args):
             saved["args"] = args
+            return {"id": 1}
 
-        async def delete_plugin_telethon_session(self, telegram_id, uuid):
-            saved["deleted"] = (telegram_id, uuid)
+        async def delete_plugin_telethon_session(self, telegram_id, uuid, session_id=None):
+            saved["deleted"] = (telegram_id, uuid, session_id)
 
-        async def get_plugin_telethon_session(self, _telegram_id, _uuid):
+        async def get_plugin_telethon_session(self, _telegram_id, _uuid, _session_id=None):
             return {"password_enc": saved["args"][4]}
 
     class FakeSecrets:
@@ -1407,8 +1408,22 @@ def test_telethon_service_encrypts_session_and_bridge_runs_awaitables():
         "tester",
     )
     assert password == "2fa-secret"
-    assert saved["deleted"] == (10, "plugin-uuid")
+    assert saved["deleted"] == (10, "plugin-uuid", None)
     assert client.disconnected is True
+
+
+def test_telethon_bridge_exposes_all_plugin_accounts():
+    service = PluginTelethonService(SimpleNamespace(), SimpleNamespace())
+    first = object()
+    second = object()
+    service.clients[(10, "plugin-uuid", 1)] = first
+    service.clients[(10, "plugin-uuid", 2)] = second
+    service.clients[(11, "plugin-uuid", 3)] = object()
+
+    bridge = service.bridge(10)
+
+    assert bridge.get_client("plugin-uuid") is first
+    assert bridge.get_clients("plugin-uuid") == [first, second]
 
 
 def test_disabling_telethon_plugin_dispatches_before_client_stop():
@@ -1500,8 +1515,8 @@ def test_official_plugin_seed_refreshes_already_installed_sources():
         for _query, args in refreshes
         if args[0] == TELEGRAM_CHANNEL_BOOST_PLUGIN_UUID
     )
-    assert channel_boost[3] == "1.1.0"
-    assert 'VERSION = "1.1.0"' in channel_boost[5]
+    assert channel_boost[3] == "1.2.0"
+    assert 'VERSION = "1.2.0"' in channel_boost[5]
     auto_smm = next(
         args
         for _query, args in refreshes
