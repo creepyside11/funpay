@@ -8,6 +8,7 @@ import re
 import string
 import time
 from concurrent.futures import CancelledError, Future
+from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -32,8 +33,8 @@ from telethon.tl.types import ChatAdminRights, InputChannel
 
 
 NAME = "Telegram Channel Boost"
-VERSION = "1.0.2"
-DESCRIPTION = "Создание, раскрутка и передача Telegram-каналов покупателям FunPay"
+VERSION = "1.1.0"
+DESCRIPTION = "Предварительная подготовка, хранение и передача Telegram-каналов покупателям FunPay"
 CREDITS = "FunPay aiogram bot"
 SETTINGS_PAGE = True
 TELETHON = True
@@ -43,6 +44,7 @@ CALLBACK_PREFIX = "tcb:"
 SETTINGS_CALLBACK = f"47:{UUID}:0"
 DEFAULT_API_URL = "https://smmway.ru/api/v2"
 POLL_SECONDS = 30
+INVENTORY_CHECK_SECONDS = 5 * 60
 JOB_TIMEOUT_SECONDS = 24 * 60 * 60
 
 logger = logging.getLogger("fpc_plugin.telegram_channel_boost")
@@ -54,6 +56,17 @@ _lot_cache: dict[str, str] = {}
 _futures: set[Future[Any]] = set()
 _running_job_ids: set[int] = set()
 _running_transfer_ids: set[int] = set()
+_running_inventory_ids: set[int] = set()
+_inventory_tasks: set[asyncio.Task[Any]] = set()
+_inventory_maintenance_lock: asyncio.Lock | None = None
+_inventory_loop_future: Future[Any] | None = None
+
+
+def _row_get(row: Any, key: str, default: Any = None) -> Any:
+    try:
+        return row[key]
+    except (KeyError, IndexError, TypeError):
+        return default
 
 
 def _markup(*rows: list[tuple[str, str]]) -> InlineKeyboardMarkup:
@@ -132,6 +145,7 @@ async def _ensure_schema() -> None:
             service_id BIGINT,
             quantity INTEGER NOT NULL DEFAULT 100,
             target_members INTEGER NOT NULL DEFAULT 100,
+            min_ready_channels INTEGER NOT NULL DEFAULT 1,
             lot_id TEXT,
             lot_title TEXT,
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -162,14 +176,49 @@ async def _ensure_schema() -> None:
             UNIQUE (telegram_id, order_id)
         );
 
+        CREATE TABLE IF NOT EXISTS telegram_channel_boost_inventory (
+            id BIGSERIAL PRIMARY KEY,
+            telegram_id BIGINT NOT NULL
+                REFERENCES funpay_users(telegram_id) ON DELETE CASCADE,
+            channel_id BIGINT,
+            channel_access_hash BIGINT,
+            channel_username TEXT,
+            channel_url TEXT,
+            service_id BIGINT NOT NULL,
+            quantity INTEGER NOT NULL,
+            target_members INTEGER NOT NULL,
+            smm_order_id TEXT,
+            smm_status TEXT,
+            member_count INTEGER NOT NULL DEFAULT 0,
+            refill_id TEXT,
+            refill_pending BOOLEAN NOT NULL DEFAULT FALSE,
+            last_refill_at TIMESTAMPTZ,
+            reserved_order_id TEXT,
+            status TEXT NOT NULL DEFAULT 'queued',
+            error_text TEXT,
+            ready_at TIMESTAMPTZ,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (telegram_id, channel_id),
+            UNIQUE (telegram_id, reserved_order_id)
+        );
+
         CREATE INDEX IF NOT EXISTS telegram_channel_boost_jobs_status_idx
             ON telegram_channel_boost_jobs (telegram_id, status, updated_at DESC);
+        CREATE INDEX IF NOT EXISTS telegram_channel_boost_inventory_status_idx
+            ON telegram_channel_boost_inventory
+                (telegram_id, status, ready_at, updated_at);
         """
     )
     await _db().execute(
         """
+        ALTER TABLE telegram_channel_boost_settings
+            ADD COLUMN IF NOT EXISTS min_ready_channels INTEGER NOT NULL DEFAULT 1;
         ALTER TABLE telegram_channel_boost_jobs
-            ADD COLUMN IF NOT EXISTS buyer_id BIGINT
+            ADD COLUMN IF NOT EXISTS buyer_id BIGINT;
+        ALTER TABLE telegram_channel_boost_jobs
+            ADD COLUMN IF NOT EXISTS inventory_id BIGINT
+                REFERENCES telegram_channel_boost_inventory(id) ON DELETE SET NULL
         """
     )
     await _db().execute(
@@ -197,6 +246,7 @@ async def _set_setting(column: str, value: Any) -> None:
         "service_id",
         "quantity",
         "target_members",
+        "min_ready_channels",
         "lot_id",
         "lot_title",
     }
@@ -242,6 +292,7 @@ def _settings_ready(settings: Any) -> bool:
         and settings["service_id"]
         and int(settings["quantity"] or 0) > 0
         and int(settings["target_members"] or 0) > 0
+        and int(settings["min_ready_channels"] or 0) >= 1
         and settings["lot_id"]
         and settings["lot_title"]
     )
@@ -261,8 +312,39 @@ async def _recent_jobs(limit: int = 5) -> list[Any]:
     )
 
 
+async def _inventory_counts() -> Any:
+    return await _db().fetchrow(
+        """
+        SELECT
+            COUNT(*) FILTER (WHERE status='ready') AS ready,
+            COUNT(*) FILTER (WHERE status IN ('queued', 'boosting')) AS preparing,
+            COUNT(*) FILTER (WHERE status='reserved') AS reserved,
+            COUNT(*) FILTER (WHERE status='failed') AS failed
+          FROM telegram_channel_boost_inventory
+         WHERE telegram_id=$1
+        """,
+        _telegram_id(),
+    )
+
+
+async def _recent_inventory(limit: int = 5) -> list[Any]:
+    return list(
+        await _db().fetch(
+            """
+            SELECT * FROM telegram_channel_boost_inventory
+             WHERE telegram_id=$1
+             ORDER BY created_at DESC LIMIT $2
+            """,
+            _telegram_id(),
+            limit,
+        )
+    )
+
+
 def _status_label(status: str) -> str:
     return {
+        "waiting_inventory": "ожидает готовый канал",
+        "assigning": "резервируется канал",
         "queued": "ожидает запуска",
         "boosting": "идёт накрутка",
         "awaiting_username": "ожидается @username",
@@ -275,9 +357,22 @@ def _status_label(status: str) -> str:
     }.get(status, status)
 
 
+def _inventory_status_label(status: str) -> str:
+    return {
+        "queued": "в очереди",
+        "boosting": "готовится",
+        "ready": "готов к продаже",
+        "reserved": "зарезервирован покупателю",
+        "transferred": "передан",
+        "failed": "исключён из склада",
+    }.get(status, status)
+
+
 def _show_settings(chat_id: int) -> None:
     settings = _sync(_settings())
     jobs = _sync(_recent_jobs())
+    inventory = _sync(_recent_inventory())
+    counts = _sync(_inventory_counts())
     telethon_ready = bool(
         _cardinal
         and _cardinal.telethon
@@ -292,12 +387,26 @@ def _show_settings(chat_id: int) -> None:
         f"ID услуги: <b>{settings['service_id'] or 'не задан'}</b>",
         f"Количество для SMM: <b>{settings['quantity']}</b>",
         f"Порог готовности: <b>{settings['target_members']} подписчиков</b>",
+        f"Минимум готовых каналов: <b>{settings['min_ready_channels']}</b>",
         f"Лот Telegram: <b>{html.escape(str(settings['lot_title'] or 'не выбран'))}</b>",
+        "",
+        "<b>Склад каналов</b>",
+        f"Готовы: <b>{int(counts['ready'] or 0)}</b> · готовятся: <b>{int(counts['preparing'] or 0)}</b> · "
+        f"зарезервированы: <b>{int(counts['reserved'] or 0)}</b> · исключены: <b>{int(counts['failed'] or 0)}</b>",
         "",
         f"Готовность: <b>{'✅ настроено' if _settings_ready(settings) and telethon_ready else '⚠️ требуется настройка'}</b>",
         "",
         "Пароль 2FA хранится только зашифрованно в Telethon-сессии и используется для автоматической передачи владельца.",
     ]
+    if inventory:
+        lines.extend(["", "<b>Последние каналы склада</b>"])
+        for item in inventory:
+            link = html.escape(str(item["channel_url"] or f"канал #{item['id']}"))
+            refill = " · refill" if item["refill_pending"] else ""
+            lines.append(
+                f"• {link} — {html.escape(_inventory_status_label(item['status']))}{refill}; "
+                f"{item['member_count']}/{item['target_members']}"
+            )
     if jobs:
         lines.extend(["", "<b>Последние задания</b>"])
         for job in jobs:
@@ -313,6 +422,7 @@ def _show_settings(chat_id: int) -> None:
         [("🧩 ID услуги", f"{CALLBACK_PREFIX}set:service")],
         [("📈 Количество накрутки", f"{CALLBACK_PREFIX}set:quantity")],
         [("🎯 Порог подписчиков", f"{CALLBACK_PREFIX}set:target")],
+        [("📦 Минимум готовых каналов", f"{CALLBACK_PREFIX}set:stock")],
         [("🛒 Выбрать Telegram-лот", f"{CALLBACK_PREFIX}lots")],
         [("🧪 Проверить API", f"{CALLBACK_PREFIX}api_test")],
     ]
@@ -433,6 +543,8 @@ def _on_callback(call: Any) -> None:
             _prompt(chat_id, "quantity", "Отправьте количество подписчиков для заказа в SMM API (1–1 000 000).")
         elif data == f"{CALLBACK_PREFIX}set:target":
             _prompt(chat_id, "target", "Отправьте фактическое число подписчиков канала, при котором заказ готов (1–1 000 000).")
+        elif data == f"{CALLBACK_PREFIX}set:stock":
+            _prompt(chat_id, "stock", "Сколько готовых каналов постоянно держать на складе? Отправьте число от 1 до 20.")
         elif data == f"{CALLBACK_PREFIX}lots":
             _load_telegram_lots(chat_id)
         elif data.startswith(f"{CALLBACK_PREFIX}lot:"):
@@ -443,6 +555,7 @@ def _on_callback(call: Any) -> None:
             _sync(_set_setting("lot_id", lot_id))
             _sync(_set_setting("lot_title", title))
             _bot().send_message(chat_id, f"✅ Выбран лот: <b>{html.escape(title)}</b>")
+            _spawn(_maintain_inventory())
             _show_settings(chat_id)
         elif data == f"{CALLBACK_PREFIX}api_test":
             _spawn(_api_test(chat_id))
@@ -471,19 +584,22 @@ def _on_setting_message(message: Any) -> None:
             if not 8 <= len(value) <= 1024:
                 raise ValueError("длина API-токена должна быть от 8 до 1024 символов")
             _sync(_set_setting("api_token_enc", _secret_box().encrypt(value)))
-        elif key in {"service", "quantity", "target"}:
+        elif key in {"service", "quantity", "target", "stock"}:
             if not value.isdigit():
                 raise ValueError("нужно отправить целое положительное число")
             number = int(value)
-            if not 1 <= number <= 1_000_000:
-                raise ValueError("значение должно быть от 1 до 1 000 000")
+            maximum = 20 if key == "stock" else 1_000_000
+            if not 1 <= number <= maximum:
+                raise ValueError(f"значение должно быть от 1 до {maximum}")
             column = {
                 "service": "service_id",
                 "quantity": "quantity",
                 "target": "target_members",
+                "stock": "min_ready_channels",
             }[key]
             _sync(_set_setting(column, number))
         _bot().send_message(chat_id, "✅ Настройка сохранена.")
+        _spawn(_maintain_inventory())
         _show_settings(chat_id)
     except Exception as exc:
         logger.exception("Настройка Telegram Channel Boost не сохранена")
@@ -495,8 +611,8 @@ async def _insert_job(order: dict[str, Any], settings: Any) -> Any | None:
         """
         INSERT INTO telegram_channel_boost_jobs
             (telegram_id, order_id, chat_id, chat_name, buyer_id,
-             lot_title, target_members)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
+             lot_title, target_members, status)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, 'waiting_inventory')
         ON CONFLICT (telegram_id, order_id) DO NOTHING
         RETURNING *
         """,
@@ -528,9 +644,11 @@ async def _update_job(job_id: int, **values: Any) -> None:
         "channel_access_hash",
         "channel_username",
         "channel_url",
+        "inventory_id",
         "smm_order_id",
         "smm_status",
         "member_count",
+        "target_members",
         "buyer_username",
         "status",
         "error_text",
@@ -551,6 +669,157 @@ async def _update_job(job_id: int, **values: Any) -> None:
         job_id,
         *values.values(),
     )
+
+
+async def _claim_ready_inventory(order_id: str) -> Any | None:
+    return await _db().fetchrow(
+        """
+        WITH candidate AS (
+            SELECT id
+              FROM telegram_channel_boost_inventory
+             WHERE telegram_id=$1 AND status='ready'
+             ORDER BY ready_at, id
+             FOR UPDATE SKIP LOCKED
+             LIMIT 1
+        )
+        UPDATE telegram_channel_boost_inventory AS inventory
+           SET status='reserved', reserved_order_id=$2, updated_at=NOW()
+          FROM candidate
+         WHERE inventory.id=candidate.id
+        RETURNING inventory.*
+        """,
+        _telegram_id(),
+        order_id,
+    )
+
+
+async def _assign_inventory_to_job(job_id: int) -> bool:
+    job = await _db().fetchrow(
+        """
+        UPDATE telegram_channel_boost_jobs
+           SET status='assigning', updated_at=NOW()
+         WHERE telegram_id=$1 AND id=$2 AND status='waiting_inventory'
+        RETURNING *
+        """,
+        _telegram_id(),
+        job_id,
+    )
+    if not job:
+        return False
+    claimed_item: Any | None = None
+    assignment_saved = False
+    try:
+        settings = await _settings()
+        while True:
+            item = await _claim_ready_inventory(str(job["order_id"]))
+            if not item:
+                await _update_job(job_id, status="waiting_inventory")
+                return False
+            claimed_item = item
+            try:
+                members = await _member_count(item)
+            except Exception:
+                members = int(item["member_count"] or 0)
+                logger.warning(
+                    "Не выполнена финальная проверка канала склада %s",
+                    item["id"],
+                    exc_info=True,
+                )
+            required_members = max(
+                int(item["target_members"]), int(job["target_members"])
+            )
+            if members < required_members:
+                await _update_inventory(
+                    item["id"],
+                    member_count=members,
+                    target_members=required_members,
+                    status="boosting",
+                    reserved_order_id=None,
+                )
+                item = await _inventory_item(int(item["id"]))
+                await _request_inventory_refill(item, settings)
+                _launch_inventory_item(int(item["id"]))
+                claimed_item = None
+                continue
+            assigned_job = await _db().fetchrow(
+                """
+                UPDATE telegram_channel_boost_jobs
+                   SET inventory_id=$3, channel_id=$4, channel_access_hash=$5,
+                       channel_username=$6, channel_url=$7, smm_order_id=$8,
+                       smm_status=$9, member_count=$10, target_members=$11,
+                       status='awaiting_username', error_text=NULL, updated_at=NOW()
+                 WHERE telegram_id=$1 AND id=$2 AND status='assigning'
+                RETURNING *
+                """,
+                _telegram_id(),
+                job_id,
+                int(item["id"]),
+                int(item["channel_id"]),
+                int(item["channel_access_hash"]),
+                str(item["channel_username"]),
+                str(item["channel_url"]),
+                str(item["smm_order_id"]),
+                str(item["smm_status"] or "Completed"),
+                members,
+                required_members,
+            )
+            if not assigned_job:
+                await _update_inventory(
+                    int(item["id"]), status="ready", reserved_order_id=None
+                )
+                return False
+            assignment_saved = True
+            claimed_item = None
+            job = assigned_job
+            try:
+                await _funpay_send(
+                    job,
+                    "✅ Ваш заранее подготовленный Telegram-канал готов:\n"
+                    f"{job['channel_url']}\n\n"
+                    "1. Вступите в канал.\n"
+                    "2. Отправьте сюда свой Telegram username строго в формате @username.\n"
+                    "После этого бот попросит подтвердить написание username.",
+                )
+            except Exception:
+                logger.exception("Не отправлена ссылка готового канала покупателю")
+            try:
+                await _notify_owner(
+                    "📦 <b>Готовый канал выдан со склада</b>\n\n"
+                    f"Заказ: <code>#{html.escape(str(job['order_id']))}</code>\n"
+                    f"Канал: {html.escape(str(job['channel_url']))}\n"
+                    f"Подписчики: <b>{members}/{job['target_members']}</b>"
+                )
+            except Exception:
+                logger.exception("Не отправлено уведомление о выдаче канала")
+            return True
+    except Exception as exc:
+        if assignment_saved:
+            await _update_job(job_id, status="awaiting_username", error_text=str(exc)[:1000])
+            logger.exception("Канал закреплён, но выдача завершилась с ошибкой")
+            return True
+        if claimed_item:
+            await _update_inventory(
+                int(claimed_item["id"]),
+                status="ready",
+                reserved_order_id=None,
+            )
+        await _update_job(job_id, status="waiting_inventory", error_text=str(exc)[:1000])
+        logger.exception("Не выделен канал для заказа %s", job["order_id"])
+        return False
+
+
+async def _assign_waiting_jobs() -> None:
+    rows = await _db().fetch(
+        """
+        SELECT id FROM telegram_channel_boost_jobs
+         WHERE telegram_id=$1 AND status='waiting_inventory'
+         ORDER BY created_at
+        """,
+        _telegram_id(),
+    )
+    for row in rows:
+        if not await _assign_inventory_to_job(int(row["id"])):
+            break
 
 
 async def _funpay_send(job: Any, text: str) -> None:
@@ -577,13 +846,13 @@ async def _stored_2fa_password() -> str | None:
     return await service.get_2fa_password(_telegram_id(), UUID)
 
 
-async def _create_public_channel(order_id: str) -> tuple[Any, str]:
+async def _create_public_channel(reference: str) -> tuple[Any, str]:
     if _client is None or not _client.is_connected():
         raise RuntimeError("Telethon не подключён")
     result = await _client(
         CreateChannelRequest(
-            title=f"Telegram order {order_id}",
-            about="Канал создан автоматически после заказа на FunPay.",
+            title=f"Ready Telegram channel {reference}",
+            about="Канал заранее подготовлен для автоматической выдачи на FunPay.",
             broadcast=True,
             megagroup=False,
         )
@@ -612,6 +881,314 @@ def _input_channel(job: Any) -> InputChannel:
 async def _member_count(job: Any) -> int:
     participants = await _client.get_participants(_input_channel(job), limit=0)
     return int(getattr(participants, "total", len(participants)))
+
+
+async def _inventory_item(item_id: int) -> Any | None:
+    return await _db().fetchrow(
+        """SELECT * FROM telegram_channel_boost_inventory
+            WHERE telegram_id=$1 AND id=$2""",
+        _telegram_id(),
+        item_id,
+    )
+
+
+async def _update_inventory(item_id: int, **values: Any) -> None:
+    allowed = {
+        "channel_id", "channel_access_hash", "channel_username", "channel_url",
+        "smm_order_id", "smm_status", "member_count", "target_members", "refill_id",
+        "refill_pending", "last_refill_at", "reserved_order_id", "status",
+        "error_text", "ready_at",
+    }
+    values = {key: value for key, value in values.items() if key in allowed}
+    if not values:
+        return
+    assignments = ", ".join(
+        f"{key}=${index + 3}" for index, key in enumerate(values)
+    )
+    await _db().execute(
+        f"""UPDATE telegram_channel_boost_inventory
+               SET {assignments}, updated_at=NOW()
+             WHERE telegram_id=$1 AND id=$2""",
+        _telegram_id(),
+        item_id,
+        *values.values(),
+    )
+
+
+async def _insert_inventory_item(settings: Any) -> Any:
+    return await _db().fetchrow(
+        """INSERT INTO telegram_channel_boost_inventory
+               (telegram_id, service_id, quantity, target_members, status)
+            VALUES ($1, $2, $3, $4, 'queued')
+            RETURNING *""",
+        _telegram_id(),
+        int(settings["service_id"]),
+        int(settings["quantity"]),
+        int(settings["target_members"]),
+    )
+
+
+def _refill_due(item: Any, now: datetime | None = None) -> bool:
+    if item["refill_pending"]:
+        return False
+    last = item["last_refill_at"]
+    if not last:
+        return True
+    current = now or datetime.now(timezone.utc)
+    if getattr(last, "tzinfo", None) is None:
+        last = last.replace(tzinfo=timezone.utc)
+    return (current - last).total_seconds() >= INVENTORY_CHECK_SECONDS
+
+
+async def _request_inventory_refill(item: Any, settings: Any) -> bool:
+    if not item["smm_order_id"] or not _refill_due(item):
+        return False
+    await _update_inventory(item["id"], last_refill_at=datetime.now(timezone.utc))
+    try:
+        response = await asyncio.to_thread(
+            _smm_request,
+            settings,
+            action="refill",
+            order=item["smm_order_id"],
+        )
+        refill_id = response.get("refill")
+        if refill_id is None or str(refill_id).strip() == "":
+            raise RuntimeError("SMM API не вернул ID рефилла")
+    except Exception as exc:
+        await _update_inventory(item["id"], error_text=f"Refill: {str(exc)[:700]}")
+        logger.warning("Не запрошен refill канала склада %s", item["id"], exc_info=True)
+        return False
+    await _update_inventory(
+        item["id"],
+        refill_id=str(refill_id),
+        refill_pending=True,
+        smm_status="Refill requested",
+        status="boosting",
+        error_text=None,
+    )
+    await _notify_owner(
+        "♻️ <b>Запрошен refill готового Telegram-канала</b>\n\n"
+        f"Канал: {html.escape(str(item['channel_url']))}\n"
+        f"Подписчики: <b>{item['member_count']}/{item['target_members']}</b>\n"
+        f"SMM order: <code>{html.escape(str(item['smm_order_id']))}</code>\n"
+        f"Refill: <code>{html.escape(str(refill_id))}</code>"
+    )
+    return True
+
+
+def _track_async_task(task: asyncio.Task[Any], error_label: str) -> None:
+    _inventory_tasks.add(task)
+
+    def done(completed: asyncio.Task[Any]) -> None:
+        _inventory_tasks.discard(completed)
+        if completed.cancelled():
+            return
+        try:
+            completed.result()
+        except Exception:
+            logger.exception("%s завершилась с ошибкой", error_label)
+
+    task.add_done_callback(done)
+
+
+def _launch_inventory_item(item_id: int) -> None:
+    if item_id in _running_inventory_ids:
+        return
+    _track_async_task(
+        asyncio.create_task(_run_inventory_item(item_id)),
+        "Подготовка канала склада",
+    )
+
+
+async def _run_inventory_item(item_id: int) -> None:
+    if item_id in _running_inventory_ids:
+        return
+    _running_inventory_ids.add(item_id)
+    started_at = time.monotonic()
+    try:
+        item = await _inventory_item(item_id)
+        if not item or item["status"] not in {"queued", "boosting"}:
+            return
+        settings = await _settings()
+        if not _settings_ready(settings):
+            return
+        while _client is None or not _client.is_connected():
+            if not _cardinal.plugin_manager.is_enabled(_telegram_id(), UUID):
+                return
+            if time.monotonic() - started_at > 600:
+                raise RuntimeError("Telethon не подключён в течение 10 минут")
+            await asyncio.sleep(5)
+        if not item["channel_id"]:
+            channel, username = await _create_public_channel(f"stock-{item_id}")
+            await _update_inventory(
+                item_id,
+                channel_id=int(channel.id),
+                channel_access_hash=int(channel.access_hash),
+                channel_username=username,
+                channel_url=f"https://t.me/{username}",
+                status="boosting",
+            )
+            item = await _inventory_item(item_id)
+        if not item["smm_order_id"]:
+            response = await asyncio.to_thread(
+                _smm_request,
+                settings,
+                action="add",
+                service=int(item["service_id"]),
+                link=item["channel_url"],
+                quantity=int(item["quantity"]),
+            )
+            smm_order_id = response.get("order")
+            if not smm_order_id:
+                raise RuntimeError("SMM API не вернул ID заказа")
+            await _update_inventory(
+                item_id,
+                smm_order_id=str(smm_order_id),
+                smm_status="Pending",
+                status="boosting",
+            )
+            item = await _inventory_item(item_id)
+            await _notify_owner(
+                "🚀 <b>Началась предварительная подготовка Telegram-канала</b>\n\n"
+                f"Канал: {html.escape(str(item['channel_url']))}\n"
+                f"SMM order: <code>{html.escape(str(item['smm_order_id']))}</code>\n"
+                f"Цель: <b>{item['target_members']} подписчиков</b>"
+            )
+        while True:
+            item = await _inventory_item(item_id)
+            if not item or item["status"] != "boosting":
+                return
+            if not _cardinal.plugin_manager.is_enabled(_telegram_id(), UUID):
+                return
+            smm_status = str(item["smm_status"] or "Unknown")
+            try:
+                response = await asyncio.to_thread(
+                    _smm_request,
+                    settings,
+                    action="status",
+                    order=item["smm_order_id"],
+                )
+                smm_status = str(response.get("status", smm_status))
+            except Exception:
+                logger.warning("Не проверен SMM order склада %s", item["smm_order_id"], exc_info=True)
+            try:
+                members = await _member_count(item)
+            except Exception:
+                logger.warning("Не проверены подписчики канала склада %s", item_id, exc_info=True)
+                members = int(item["member_count"] or 0)
+            await _update_inventory(item_id, smm_status=smm_status, member_count=members)
+            if members >= int(item["target_members"]):
+                await _update_inventory(
+                    item_id,
+                    status="ready",
+                    refill_pending=False,
+                    error_text=None,
+                    ready_at=datetime.now(timezone.utc),
+                )
+                await _notify_owner(
+                    "✅ <b>Telegram-канал добавлен на склад</b>\n\n"
+                    f"Канал: {html.escape(str(item['channel_url']))}\n"
+                    f"Подписчики: <b>{members}/{item['target_members']}</b>"
+                )
+                await _assign_waiting_jobs()
+                asyncio.create_task(_maintain_inventory())
+                return
+            if smm_status.casefold() in {
+                "partial", "canceled", "cancelled", "error", "refunded",
+                "completed", "complete", "done",
+            }:
+                item = await _inventory_item(item_id)
+                await _request_inventory_refill(item, settings)
+            if time.monotonic() - started_at >= JOB_TIMEOUT_SECONDS:
+                raise RuntimeError("истёк 24-часовой срок подготовки канала")
+            await asyncio.sleep(POLL_SECONDS)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.exception("Ошибка подготовки канала склада %s", item_id)
+        await _update_inventory(item_id, status="failed", error_text=str(exc)[:1000])
+        await _notify_owner(
+            "❌ <b>Не подготовлен Telegram-канал для склада</b>\n\n"
+            f"Запись: <code>#{item_id}</code>\n"
+            f"Ошибка: <code>{html.escape(str(exc)[:700])}</code>"
+        )
+        asyncio.create_task(_maintain_inventory())
+    finally:
+        _running_inventory_ids.discard(item_id)
+
+
+async def _check_ready_inventory(settings: Any) -> None:
+    rows = await _db().fetch(
+        """SELECT * FROM telegram_channel_boost_inventory
+            WHERE telegram_id=$1 AND status='ready'
+            ORDER BY ready_at, id""",
+        _telegram_id(),
+    )
+    for item in rows:
+        try:
+            members = await _member_count(item)
+        except Exception:
+            logger.warning("Не проверен готовый канал %s", item["id"], exc_info=True)
+            continue
+        await _update_inventory(item["id"], member_count=members)
+        if members >= int(item["target_members"]):
+            continue
+        await _update_inventory(item["id"], status="boosting")
+        item = await _inventory_item(int(item["id"]))
+        await _request_inventory_refill(item, settings)
+        _launch_inventory_item(int(item["id"]))
+
+
+async def _maintain_inventory() -> None:
+    global _inventory_maintenance_lock
+    if _inventory_maintenance_lock is None:
+        _inventory_maintenance_lock = asyncio.Lock()
+    async with _inventory_maintenance_lock:
+        settings = await _settings()
+        if (
+            not _settings_ready(settings)
+            or _client is None
+            or not _client.is_connected()
+            or not _cardinal.plugin_manager.is_enabled(_telegram_id(), UUID)
+        ):
+            return
+        await _check_ready_inventory(settings)
+        await _assign_waiting_jobs()
+        preparing = await _db().fetch(
+            """SELECT id FROM telegram_channel_boost_inventory
+                WHERE telegram_id=$1 AND status IN ('queued', 'boosting')
+                ORDER BY created_at""",
+            _telegram_id(),
+        )
+        for item in preparing:
+            _launch_inventory_item(int(item["id"]))
+        count = await _db().fetchrow(
+            """SELECT COUNT(*) AS count FROM telegram_channel_boost_inventory
+                WHERE telegram_id=$1
+                  AND (
+                      status IN ('ready', 'queued')
+                      OR (status='boosting' AND last_refill_at IS NULL)
+                  )""",
+            _telegram_id(),
+        )
+        shortage = max(
+            int(settings["min_ready_channels"]) - int(count["count"] if count else 0),
+            0,
+        )
+        for _ in range(shortage):
+            item = await _insert_inventory_item(settings)
+            _launch_inventory_item(int(item["id"]))
+
+
+async def _inventory_loop() -> None:
+    while True:
+        try:
+            await _maintain_inventory()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Ошибка пятиминутной проверки склада Telegram-каналов")
+        await asyncio.sleep(INVENTORY_CHECK_SECONDS)
 
 
 async def _fail_job(job: Any, reason: str) -> None:
@@ -782,16 +1359,41 @@ async def _process_new_order(order: dict[str, Any]) -> None:
     job = await _insert_job(order, settings)
     if not job:
         return
-    await _funpay_send(
-        job,
-        "🚀 Заказ принят. Создаю публичный Telegram-канал и запускаю набор подписчиков. "
-        "Ссылку и дальнейшие инструкции отправлю автоматически после достижения заданного количества.",
-    )
-    await _run_job(int(job["id"]))
+    if not await _assign_inventory_to_job(int(job["id"])):
+        job = await _job(int(job["id"]))
+        await _funpay_send(
+            job,
+            "⏳ Заказ принят. Готовый канал сейчас резервируется или склад пополняется. "
+            "Ссылка будет отправлена автоматически, как только канал достигнет заданного порога.",
+        )
+        await _notify_owner(
+            "⚠️ <b>На складе временно нет готового Telegram-канала</b>\n\n"
+            f"Заказ: <code>#{html.escape(str(job['order_id']))}</code>\n"
+            "Пополнение запущено автоматически."
+        )
+    await _maintain_inventory()
 
 
 async def _resume_jobs() -> None:
     await _ensure_schema()
+    await _db().execute(
+        """
+        UPDATE telegram_channel_boost_jobs
+           SET status='waiting_inventory', updated_at=NOW()
+         WHERE telegram_id=$1 AND status='assigning';
+        UPDATE telegram_channel_boost_inventory AS inventory
+           SET status='ready', reserved_order_id=NULL, updated_at=NOW()
+         WHERE inventory.telegram_id=$1
+           AND inventory.status='reserved'
+           AND NOT EXISTS (
+               SELECT 1 FROM telegram_channel_boost_jobs AS job
+                WHERE job.telegram_id=$1
+                  AND job.inventory_id=inventory.id
+                  AND job.status NOT IN ('completed', 'failed', 'canceled')
+           );
+        """,
+        _telegram_id(),
+    )
     rows = await _db().fetch(
         """
         SELECT id FROM telegram_channel_boost_jobs
@@ -800,10 +1402,13 @@ async def _resume_jobs() -> None:
         """,
         _telegram_id(),
     )
-    await asyncio.gather(
-        *[_run_job(int(row["id"])) for row in rows],
-        return_exceptions=True,
-    )
+    for row in rows:
+        _track_async_task(
+            asyncio.create_task(_run_job(int(row["id"]))),
+            "Восстановление старого задания Telegram Channel Boost",
+        )
+    await _assign_waiting_jobs()
+    await _maintain_inventory()
 
 
 async def _resume_transfers() -> None:
@@ -1008,6 +1613,14 @@ async def _transfer_owner(job_id: int, password: str) -> None:
         return
     else:
         await _update_job(job_id, status="completed", error_text=None)
+        inventory_id = _row_get(job, "inventory_id")
+        if inventory_id:
+            await _update_inventory(
+                int(inventory_id),
+                status="transferred",
+                refill_pending=False,
+                error_text=None,
+            )
         await _funpay_send(
             job,
             f"✅ Права владельца канала {job['channel_url']} переданы пользователю {job['buyer_username']}. "
@@ -1043,6 +1656,15 @@ async def _process_order_status(order_id: str, status: str) -> None:
     if not job:
         return
     await _update_job(job["id"], status="canceled", error_text=status)
+    inventory_id = _row_get(job, "inventory_id")
+    if inventory_id:
+        await _update_inventory(
+            int(inventory_id),
+            status="failed",
+            refill_pending=False,
+            error_text=f"FunPay order {status}",
+        )
+        asyncio.create_task(_maintain_inventory())
     await _notify_owner(
         f"⚠️ Telegram-задание <code>#{html.escape(order_id)}</code> отменено из-за статуса FunPay {status}."
     )
@@ -1066,11 +1688,13 @@ def pre_init(cardinal: Any) -> None:
 
 
 def telethon_ready(cardinal: Any, client: Any) -> None:
-    global _cardinal, _client
+    global _cardinal, _client, _inventory_loop_future
     _cardinal = cardinal
     _client = client
     _spawn(_resume_jobs())
     _spawn(_resume_transfers())
+    if _inventory_loop_future is None or _inventory_loop_future.done():
+        _inventory_loop_future = _spawn(_inventory_loop())
 
 
 def telethon_disconnected(cardinal: Any, client: Any) -> None:
@@ -1130,10 +1754,17 @@ def order_status_changed(cardinal: Any, event: Any) -> None:
 
 
 def pre_stop(cardinal: Any) -> None:
-    global _client
+    global _client, _inventory_loop_future
     _client = None
     for future in list(_futures):
         future.cancel()
+    _inventory_loop_future = None
+
+    def cancel_tasks() -> None:
+        for task in list(_inventory_tasks):
+            task.cancel()
+
+    cardinal.telegram.loop.call_soon_threadsafe(cancel_tasks)
 
 
 def on_delete(cardinal: Any, callback: Any) -> None:
@@ -1141,6 +1772,12 @@ def on_delete(cardinal: Any, callback: Any) -> None:
     _sync(
         _db().execute(
             "DELETE FROM telegram_channel_boost_jobs WHERE telegram_id=$1",
+            _telegram_id(),
+        )
+    )
+    _sync(
+        _db().execute(
+            "DELETE FROM telegram_channel_boost_inventory WHERE telegram_id=$1",
             _telegram_id(),
         )
     )

@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -269,6 +270,230 @@ def test_username_message_matches_order_when_funpay_chat_ids_differ(monkeypatch)
         for query, args in database_calls
     )
     assert sent and "#да" in sent[-1] and "#изменить" in sent[-1]
+
+
+def test_inventory_refill_is_requested_when_ready_channel_drops(monkeypatch):
+    calls = []
+    updates = []
+    notifications = []
+    item = {
+        "id": 31,
+        "smm_order_id": "SMM-500",
+        "refill_pending": False,
+        "last_refill_at": None,
+        "channel_url": "https://t.me/readychannel",
+        "member_count": 85,
+        "target_members": 100,
+    }
+
+    def smm_request(_settings, **payload):
+        calls.append(payload)
+        return {"refill": 700}
+
+    async def update_inventory(item_id, **values):
+        updates.append((item_id, values))
+
+    async def notify(text, **_kwargs):
+        notifications.append(text)
+
+    monkeypatch.setattr(plugin, "_smm_request", smm_request)
+    monkeypatch.setattr(plugin, "_update_inventory", update_inventory)
+    monkeypatch.setattr(plugin, "_notify_owner", notify)
+
+    requested = asyncio.run(plugin._request_inventory_refill(item, {}))
+
+    assert requested is True
+    assert calls == [{"action": "refill", "order": "SMM-500"}]
+    assert any(values.get("refill_pending") is True for _id, values in updates)
+    assert notifications and "refill" in notifications[-1]
+
+
+def test_inventory_refill_is_checked_every_five_minutes_without_duplicates():
+    now = datetime.now(timezone.utc)
+    base = {
+        "refill_pending": False,
+        "last_refill_at": now - timedelta(seconds=plugin.INVENTORY_CHECK_SECONDS),
+    }
+    assert plugin.INVENTORY_CHECK_SECONDS == 300
+    assert plugin._refill_due(base, now=now) is True
+    assert plugin._refill_due(
+        {**base, "last_refill_at": now - timedelta(seconds=299)}, now=now
+    ) is False
+    assert plugin._refill_due({**base, "refill_pending": True}, now=now) is False
+
+
+def test_ready_inventory_is_attached_without_creating_or_boosting_channel(monkeypatch):
+    updates = []
+    messages = []
+    notifications = []
+    database_calls = []
+    job = {
+        "id": 41,
+        "order_id": "ORDER-READY",
+        "target_members": 100,
+        "chat_id": "chat-1",
+        "chat_name": "Buyer",
+    }
+    item = {
+        "id": 51,
+        "channel_id": 123,
+        "channel_access_hash": 456,
+        "channel_username": "readychannel",
+        "channel_url": "https://t.me/readychannel",
+        "smm_order_id": "SMM-READY",
+        "smm_status": "Completed",
+        "member_count": 105,
+        "target_members": 100,
+    }
+    saved_job = {**job, **item, "inventory_id": 51, "status": "awaiting_username"}
+
+    class FakeDatabase:
+        async def fetchrow(self, query, *args):
+            database_calls.append((query, args))
+            if "SET status='assigning'" in query:
+                return job
+            if "SET inventory_id=$3" in query:
+                return saved_job
+            raise AssertionError(query)
+
+    async def update_job(job_id, **values):
+        updates.append((job_id, values))
+
+    async def funpay_send(_job, text):
+        messages.append(text)
+
+    async def notify(text, **_kwargs):
+        notifications.append(text)
+
+    monkeypatch.setattr(plugin, "_db", lambda: FakeDatabase())
+    monkeypatch.setattr(plugin, "_telegram_id", lambda: 7)
+    monkeypatch.setattr(plugin, "_settings", lambda: _async_value({}))
+    monkeypatch.setattr(plugin, "_claim_ready_inventory", lambda _order: _async_value(item))
+    monkeypatch.setattr(plugin, "_member_count", lambda _item: _async_value(105))
+    monkeypatch.setattr(plugin, "_update_job", update_job)
+    monkeypatch.setattr(plugin, "_job", lambda _job_id: _async_value(saved_job))
+    monkeypatch.setattr(plugin, "_funpay_send", funpay_send)
+    monkeypatch.setattr(plugin, "_notify_owner", notify)
+    monkeypatch.setattr(
+        plugin,
+        "_create_public_channel",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("channel must already exist")),
+    )
+
+    assigned = asyncio.run(plugin._assign_inventory_to_job(41))
+
+    assert assigned is True
+    attach = next(args for query, args in database_calls if "SET inventory_id=$3" in query)
+    assert attach[2] == 51
+    assert "status='awaiting_username'" in next(
+        query for query, _args in database_calls if "SET inventory_id=$3" in query
+    )
+    assert messages and "заранее подготовленный" in messages[-1]
+    assert notifications and "выдан со склада" in notifications[-1]
+
+
+def test_inventory_maintenance_creates_configured_minimum(monkeypatch):
+    launched = []
+    inserted = []
+    settings = {
+        "api_base_url": "https://smmway.ru/api/v2",
+        "api_token_enc": "encrypted",
+        "service_id": 10,
+        "quantity": 100,
+        "target_members": 100,
+        "min_ready_channels": 3,
+        "lot_id": "55",
+        "lot_title": "Telegram channel",
+    }
+
+    class FakeDatabase:
+        async def fetch(self, _query, *_args):
+            return []
+
+        async def fetchrow(self, query, *_args):
+            if "COUNT(*) AS count" in query:
+                return {"count": 0}
+            raise AssertionError(query)
+
+    class Client:
+        @staticmethod
+        def is_connected():
+            return True
+
+    class PluginManager:
+        @staticmethod
+        def is_enabled(_telegram_id, _uuid):
+            return True
+
+    async def insert(_settings):
+        item = {"id": 100 + len(inserted)}
+        inserted.append(item)
+        return item
+
+    monkeypatch.setattr(plugin, "_inventory_maintenance_lock", None)
+    monkeypatch.setattr(plugin, "_client", Client())
+    monkeypatch.setattr(
+        plugin,
+        "_cardinal",
+        SimpleNamespace(plugin_manager=PluginManager()),
+    )
+    monkeypatch.setattr(plugin, "_db", lambda: FakeDatabase())
+    monkeypatch.setattr(plugin, "_telegram_id", lambda: 7)
+    monkeypatch.setattr(plugin, "_settings", lambda: _async_value(settings))
+    monkeypatch.setattr(plugin, "_check_ready_inventory", lambda _settings: _async_value(None))
+    monkeypatch.setattr(plugin, "_assign_waiting_jobs", lambda: _async_value(None))
+    monkeypatch.setattr(plugin, "_insert_inventory_item", insert)
+    monkeypatch.setattr(plugin, "_launch_inventory_item", launched.append)
+
+    asyncio.run(plugin._maintain_inventory())
+
+    assert len(inserted) == 3
+    assert launched == [100, 101, 102]
+
+
+def test_purchase_uses_prepared_inventory_instead_of_starting_boost(monkeypatch):
+    events = []
+    settings = {
+        "api_base_url": "https://smmway.ru/api/v2",
+        "api_token_enc": "encrypted",
+        "service_id": 10,
+        "quantity": 100,
+        "target_members": 100,
+        "min_ready_channels": 1,
+        "lot_id": "55",
+        "lot_title": "Готовый Telegram канал",
+    }
+    order = {
+        "id": "ORDER-STOCK",
+        "chat_id": "chat-5",
+        "chat_name": "Buyer",
+        "buyer_id": 9,
+        "description": "Готовый Telegram канал с подписчиками",
+    }
+
+    async def insert(_order, _settings):
+        events.append("job")
+        return {"id": 88}
+
+    async def assign(job_id):
+        events.append(("assign", job_id))
+        return True
+
+    async def maintain():
+        events.append("replenish")
+
+    async def forbidden_run(_job_id):
+        raise AssertionError("boost must not start after purchase")
+
+    monkeypatch.setattr(plugin, "_settings", lambda: _async_value(settings))
+    monkeypatch.setattr(plugin, "_insert_job", insert)
+    monkeypatch.setattr(plugin, "_assign_inventory_to_job", assign)
+    monkeypatch.setattr(plugin, "_maintain_inventory", maintain)
+    monkeypatch.setattr(plugin, "_run_job", forbidden_run)
+
+    asyncio.run(plugin._process_new_order(order))
+
+    assert events == ["job", ("assign", 88), "replenish"]
 
 
 async def _async_value(value):
