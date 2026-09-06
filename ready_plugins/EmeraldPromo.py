@@ -18,7 +18,7 @@ from FunPayAPI.common.utils import MONTHS
 
 
 NAME = "Emerald Promo"
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 DESCRIPTION = "Автоматическая продажа, бесплатная выдача и бонусные промокоды EmeraldAI"
 CREDITS = "FunPay aiogram bot"
 SETTINGS_PAGE = True

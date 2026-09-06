@@ -40,7 +40,9 @@ from bot import (
     proxy_label,
     ready_plugin_source,
     render_template,
+    save_emerald_seller_token,
     telegram_publisher_name,
+    validate_emerald_seller_token,
     validate_catalog_description,
     within_work_hours,
 )
@@ -69,6 +71,25 @@ from tg_bot import CBT
 def test_normalize_proxy(raw, expected):
     assert normalize_proxy(raw) == expected
     assert proxy_dict(expected) == {"http": expected, "https": expected}
+
+
+def test_emerald_token_native_flow_encrypts_and_updates_settings():
+    calls = []
+
+    class FakeDatabase:
+        async def execute(self, query, *args):
+            calls.append((query, args))
+            return "UPDATE 1"
+
+    secrets = SecretBox("test-secret")
+    token = "sk-em-seller-1234567890"
+
+    assert validate_emerald_seller_token(f" {token} ") == token
+    asyncio.run(save_emerald_seller_token(FakeDatabase(), secrets, 77, token))
+
+    assert calls[0][1][0] == 77
+    assert calls[0][1][1] != token
+    assert secrets.decrypt(calls[0][1][1]) == token
 
 
 @pytest.mark.parametrize("value", ["example.org", "ftp://example.org:21", "http://example.org:nope"])
@@ -1543,8 +1564,8 @@ def test_official_plugin_seed_refreshes_already_installed_sources():
         for _query, args in refreshes
         if args[0] == EMERALD_PROMO_PLUGIN_UUID
     )
-    assert emerald_promo[3] == "1.0.1"
-    assert 'VERSION = "1.0.1"' in emerald_promo[5]
+    assert emerald_promo[3] == "1.0.2"
+    assert 'VERSION = "1.0.2"' in emerald_promo[5]
 
 
 def test_catalog_description_validation_and_publisher_name():

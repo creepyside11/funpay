@@ -204,7 +204,7 @@ READY_PLUGINS = (
         EMERALD_PROMO_PLUGIN_UUID,
         "EmeraldPromo.py",
         "Emerald Promo",
-        "1.0.1",
+        "1.0.2",
         "Продажа и бесплатная выдача промокодов EmeraldAI",
         "Подключается к Emerald Seller API, выдаёт один промокод на весь оплаченный заказ "
         "с учётом количества товара, поддерживает несколько лотов, одноразовую команду #free "
@@ -241,6 +241,32 @@ def plugin_settings_callback_data(plugin: PluginData) -> str | None:
     if ready_plugin and ready_plugin.builtin_settings:
         return f"builtin_open:{plugin.uuid}"
     return f"{PLUGIN_SETTINGS_CALLBACK_PREFIX}:{plugin.uuid}:0"
+
+
+def validate_emerald_seller_token(value: str) -> str:
+    token = value.strip()
+    if not 16 <= len(token) <= 1024:
+        raise ValueError("длина Seller API-токена должна быть от 16 до 1024 символов")
+    if not token.startswith("sk-em-seller-"):
+        raise ValueError("Seller API-токен должен начинаться с sk-em-seller-")
+    return token
+
+
+async def save_emerald_seller_token(
+    db: Any, secrets: SecretBox, telegram_id: int, value: str
+) -> None:
+    token = validate_emerald_seller_token(value)
+    result = await db.execute(
+        """UPDATE emerald_promo_settings
+              SET api_token_enc=$2, updated_at=NOW()
+            WHERE telegram_id=$1""",
+        telegram_id,
+        secrets.encrypt(token),
+    )
+    if str(result).strip().upper() == "UPDATE 0":
+        raise RuntimeError(
+            "настройки Emerald Promo не инициализированы; выключите и снова включите плагин"
+        )
 
 
 def validate_catalog_description(value: str) -> str:
@@ -4483,6 +4509,10 @@ class PluginTelethonState(StatesGroup):
     phone = State()
     code = State()
     password = State()
+
+
+class EmeraldPromoState(StatesGroup):
+    api_token = State()
 
 
 class CatalogPublishState(StatesGroup):
@@ -9500,6 +9530,68 @@ BIND_TO_NEW_MESSAGE = [on_message]
                 "Автор указал SETTINGS_PAGE=True, но не зарегистрировал обработчик настроек.",
                 show_alert=True,
             )
+
+    @router.callback_query(F.data == "emp:set:token")
+    async def emerald_api_token_start(
+        callback: CallbackQuery, state: FSMContext
+    ) -> None:
+        plugin_runtime = manager.plugins.runtimes.get(callback.from_user.id)
+        plugin = (
+            plugin_runtime.plugins.get(EMERALD_PROMO_PLUGIN_UUID)
+            if plugin_runtime else None
+        )
+        if not plugin or not plugin.enabled:
+            await callback.answer(
+                "Сначала включите Emerald Promo.", show_alert=True
+            )
+            return
+        await state.clear()
+        await state.set_state(EmeraldPromoState.api_token)
+        await callback.answer()
+        await callback.message.answer(
+            "Отправьте Seller API-токен вида <code>sk-em-seller-...</code>. "
+            "Сообщение будет удалено, токен сохранится зашифрованным."
+        )
+
+    @router.message(EmeraldPromoState.api_token, F.text)
+    async def emerald_api_token_save(
+        message: Message, state: FSMContext
+    ) -> None:
+        value = message.text or ""
+        try:
+            await message.delete()
+        except Exception:
+            logger.warning("Не удалось удалить сообщение с Emerald Seller API-токеном")
+        try:
+            await save_emerald_seller_token(
+                db, secrets, message.from_user.id, value
+            )
+        except ValueError as exc:
+            await message.answer(
+                f"❌ {html.escape(str(exc))}. Отправьте токен ещё раз или /cancel."
+            )
+            return
+        except Exception as exc:
+            logger.exception("Не удалось сохранить Emerald Seller API-токен")
+            await state.clear()
+            await message.answer(
+                "❌ Токен не сохранён: "
+                f"<code>{html.escape(clipped(exc, 500))}</code>",
+                reply_markup=keyboard([[
+                    ("⬅️ К плагину", f"plugin_info:{EMERALD_PROMO_PLUGIN_UUID}")
+                ]]),
+            )
+            return
+        await state.clear()
+        await message.answer(
+            "✅ Emerald Seller API-токен сохранён и зашифрован.",
+            reply_markup=keyboard([[
+                (
+                    "⚙️ Открыть настройки",
+                    f"{PLUGIN_SETTINGS_CALLBACK_PREFIX}:{EMERALD_PROMO_PLUGIN_UUID}:0",
+                )
+            ]]),
+        )
 
     @router.callback_query(F.data.startswith("plugin_delete_ask:"))
     async def plugin_delete_ask(callback: CallbackQuery) -> None:
