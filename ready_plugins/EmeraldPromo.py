@@ -8,7 +8,7 @@ import re
 from concurrent.futures import CancelledError, Future
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, urljoin, urlsplit
 
 import requests
 from bs4 import BeautifulSoup
@@ -18,7 +18,7 @@ from FunPayAPI.common.utils import MONTHS
 
 
 NAME = "Emerald Promo"
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 DESCRIPTION = "Автоматическая продажа, бесплатная выдача и бонусные промокоды EmeraldAI"
 CREDITS = "FunPay aiogram bot"
 SETTINGS_PAGE = True
@@ -27,7 +27,8 @@ UUID = "9ee0d7d1-2cef-45c5-b1ac-67c4c1f3ef8a"
 
 CALLBACK_PREFIX = "emp:"
 SETTINGS_CALLBACK = f"47:{UUID}:0"
-DEFAULT_API_URL = "https://emeraldai.sbs/seller/v1"
+DEFAULT_API_URL = "https://www.emeraldai.sbs/seller/v1"
+LEGACY_API_URL = "https://emeraldai.sbs/seller/v1"
 ACTIVATION_URL = "https://emeraldai.sbs"
 MIN_TOKEN_AMOUNT = 10_000
 MAX_TOKEN_AMOUNT = 1_000_000_000
@@ -125,7 +126,7 @@ async def _ensure_schema() -> None:
         CREATE TABLE IF NOT EXISTS emerald_promo_settings (
             telegram_id BIGINT PRIMARY KEY
                 REFERENCES funpay_users(telegram_id) ON DELETE CASCADE,
-            api_base_url TEXT NOT NULL DEFAULT 'https://emeraldai.sbs/seller/v1',
+            api_base_url TEXT NOT NULL DEFAULT 'https://www.emeraldai.sbs/seller/v1',
             api_token_enc TEXT,
             free_enabled BOOLEAN NOT NULL DEFAULT TRUE,
             free_token_amount BIGINT NOT NULL DEFAULT 200000,
@@ -183,6 +184,12 @@ async def _ensure_schema() -> None:
         """INSERT INTO emerald_promo_settings (telegram_id)
             VALUES ($1) ON CONFLICT (telegram_id) DO NOTHING""",
         _telegram_id(),
+    )
+    await _db().execute(
+        """UPDATE emerald_promo_settings
+              SET api_base_url=$2, updated_at=NOW()
+            WHERE telegram_id=$1 AND api_base_url=$3""",
+        _telegram_id(), DEFAULT_API_URL, LEGACY_API_URL,
     )
 
 
@@ -351,7 +358,27 @@ def _validate_api_url(value: str) -> str:
         raise ValueError("нужен HTTPS URL без логина и пароля")
     if parsed.query or parsed.fragment:
         raise ValueError("Base URL не должен содержать query или fragment")
+    if value == LEGACY_API_URL:
+        return DEFAULT_API_URL
     return value
+
+
+def _safe_redirect_url(source_url: str, location: str) -> str:
+    target_url = urljoin(source_url, location)
+    source = urlsplit(source_url)
+    target = urlsplit(target_url)
+    source_host = (source.hostname or "").casefold().removeprefix("www.")
+    target_host = (target.hostname or "").casefold().removeprefix("www.")
+    if (
+        target.scheme != "https"
+        or target.username
+        or target.password
+        or not source_host
+        or source_host != target_host
+        or target.port not in {None, 443}
+    ):
+        raise RuntimeError("Emerald API попытался перенаправить запрос на небезопасный адрес")
+    return target_url
 
 
 def _validate_token_amount(value: str | int) -> int:
@@ -382,18 +409,21 @@ def _api_request(
     token = _api_token(settings)
     if not token:
         raise RuntimeError("API-токен не задан")
+    url = f"{str(settings['api_base_url']).rstrip('/')}/{path.lstrip('/')}".rstrip("/")
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
     response = requests.request(
-        method,
-        f"{str(settings['api_base_url']).rstrip('/')}/{path.lstrip('/')}".rstrip("/"),
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        },
-        json=json_payload,
-        params=params,
-        timeout=25,
-        allow_redirects=False,
+        method, url, headers=headers, json=json_payload, params=params,
+        timeout=25, allow_redirects=False,
     )
+    if response.status_code in {307, 308} and response.headers.get("Location"):
+        url = _safe_redirect_url(url, response.headers["Location"])
+        response = requests.request(
+            method, url, headers=headers, json=json_payload, params=params,
+            timeout=25, allow_redirects=False,
+        )
     try:
         payload = response.json()
     except Exception as exc:

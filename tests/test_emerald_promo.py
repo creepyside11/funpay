@@ -91,6 +91,54 @@ def test_api_request_uses_bearer_json_and_disables_redirects(monkeypatch):
     assert captured["timeout"] == 25
 
 
+def test_api_request_follows_only_safe_www_redirect_with_bearer(monkeypatch):
+    calls = []
+
+    class Redirect:
+        status_code = 308
+        headers = {
+            "Location": "https://www.emeraldai.sbs/seller/v1/account"
+        }
+
+    class Success:
+        ok = True
+        status_code = 200
+        headers = {}
+
+        @staticmethod
+        def json():
+            return {"data": {"balance_tokens": 500_000}}
+
+    def fake_request(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        return Redirect() if len(calls) == 1 else Success()
+
+    monkeypatch.setattr(plugin, "_api_token", lambda _settings: "secret")
+    monkeypatch.setattr(plugin.requests, "request", fake_request)
+
+    result = plugin._api_request(
+        {"api_base_url": "https://emeraldai.sbs/seller/v1"},
+        "GET",
+        "account",
+    )
+
+    assert result["data"]["balance_tokens"] == 500_000
+    assert [call[1] for call in calls] == [
+        "https://emeraldai.sbs/seller/v1/account",
+        "https://www.emeraldai.sbs/seller/v1/account",
+    ]
+    assert all(call[2]["headers"]["Authorization"] == "Bearer secret" for call in calls)
+    assert all(call[2]["allow_redirects"] is False for call in calls)
+
+
+def test_api_redirect_rejects_another_domain():
+    with pytest.raises(RuntimeError, match="небезопасный"):
+        plugin._safe_redirect_url(
+            "https://emeraldai.sbs/seller/v1/account",
+            "https://evil.example/steal-token",
+        )
+
+
 def test_account_minimum_never_falls_below_new_10000_limit():
     assert plugin._server_minimum({}) == 10_000
     assert plugin._server_minimum({"pricing": {"minimum_token_promo": 5_000}}) == 10_000
