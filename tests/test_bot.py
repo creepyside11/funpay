@@ -11,6 +11,7 @@ import bot as bot_module
 from bot import (
     AI_ASSISTANT_PLUGIN_UUID,
     AUTO_SMM_PLUGIN_UUID,
+    EMERALD_PROMO_PLUGIN_UUID,
     PLAYEROK_PLUGIN_DOCUMENTATION_PATH,
     PLUGIN_CATALOG_DESCRIPTION_MAX,
     PLUGIN_CATALOG_DESCRIPTION_MIN,
@@ -1497,6 +1498,12 @@ def test_ready_plugins_have_valid_cardinal_sources(tmp_path):
     assert ai_assistant.hooks["BIND_TO_INIT_ORDER"]
     assert ai_assistant.hooks["BIND_TO_NEW_ORDER"]
     assert ai_assistant.hooks["BIND_TO_NEW_MESSAGE"]
+    emerald_promo = next(
+        plugin for plugin in loaded if plugin.uuid == EMERALD_PROMO_PLUGIN_UUID
+    )
+    assert emerald_promo.telethon_enabled is False
+    assert emerald_promo.hooks["BIND_TO_NEW_ORDER"]
+    assert emerald_promo.hooks["BIND_TO_NEW_MESSAGE"]
 
 
 def test_official_plugin_seed_refreshes_already_installed_sources():
@@ -1531,6 +1538,13 @@ def test_official_plugin_seed_refreshes_already_installed_sources():
     )
     assert ai_assistant[3] == "1.0.0"
     assert 'VERSION = "1.0.0"' in ai_assistant[5]
+    emerald_promo = next(
+        args
+        for _query, args in refreshes
+        if args[0] == EMERALD_PROMO_PLUGIN_UUID
+    )
+    assert emerald_promo[3] == "1.0.0"
+    assert 'VERSION = "1.0.0"' in emerald_promo[5]
 
 
 def test_catalog_description_validation_and_publisher_name():
