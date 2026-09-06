@@ -204,7 +204,7 @@ READY_PLUGINS = (
         EMERALD_PROMO_PLUGIN_UUID,
         "EmeraldPromo.py",
         "Emerald Promo",
-        "1.0.0",
+        "1.0.1",
         "Продажа и бесплатная выдача промокодов EmeraldAI",
         "Подключается к Emerald Seller API, выдаёт один промокод на весь оплаченный заказ "
         "с учётом количества товара, поддерживает несколько лотов, одноразовую команду #free "
@@ -9465,7 +9465,9 @@ BIND_TO_NEW_MESSAGE = [on_message]
     @router.callback_query(
         F.data.startswith(f"{PLUGIN_SETTINGS_CALLBACK_PREFIX}:")
     )
-    async def external_plugin_settings(callback: CallbackQuery) -> None:
+    async def external_plugin_settings(
+        callback: CallbackQuery, state: FSMContext
+    ) -> None:
         parts = callback.data.split(":", 2)
         uuid = parts[1] if len(parts) == 3 else ""
         plugin_runtime = manager.plugins.runtimes.get(callback.from_user.id)
@@ -9479,6 +9481,9 @@ BIND_TO_NEW_MESSAGE = [on_message]
                 show_alert=True,
             )
             return
+        # Настройки Cardinal-плагинов используют собственные мастера ввода.
+        # Старое aiogram-состояние не должно перехватывать их сообщения.
+        await state.clear()
         try:
             handled = await manager.plugins.dispatch_telegram_callback(
                 callback.from_user.id, callback

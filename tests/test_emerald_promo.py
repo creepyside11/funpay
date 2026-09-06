@@ -128,6 +128,44 @@ def test_repeated_free_command_resends_saved_code_without_new_api_call(monkeypat
     assert "один раз" in sent[0]
 
 
+def test_seller_token_is_saved_even_if_temporary_wizard_state_was_lost(monkeypatch):
+    saved = []
+    messages = []
+
+    class Bot:
+        @staticmethod
+        def delete_message(*_args):
+            return None
+
+        @staticmethod
+        def send_message(_chat_id, text, **_kwargs):
+            messages.append(text)
+
+    class Secrets:
+        @staticmethod
+        def encrypt(value):
+            return f"encrypted:{value}"
+
+    def sync(value):
+        saved.append(value)
+
+    monkeypatch.setattr(plugin, "_pending_input", None)
+    monkeypatch.setattr(plugin, "_bot", lambda: Bot())
+    monkeypatch.setattr(plugin, "_secret_box", lambda: Secrets())
+    monkeypatch.setattr(plugin, "_set_setting", lambda column, value: (column, value))
+    monkeypatch.setattr(plugin, "_sync", sync)
+    monkeypatch.setattr(plugin, "_show_settings", lambda _chat_id: None)
+
+    plugin._on_setting_message(SimpleNamespace(
+        text="sk-em-seller-1234567890",
+        chat=SimpleNamespace(id=10),
+        message_id=20,
+    ))
+
+    assert saved == [("api_token_enc", "encrypted:sk-em-seller-1234567890")]
+    assert messages == ["✅ Настройка сохранена."]
+
+
 def test_review_bonus_is_reserved_only_for_actual_five_star_review(monkeypatch):
     reserved = []
     fulfilled = []

@@ -18,7 +18,7 @@ from FunPayAPI.common.utils import MONTHS
 
 
 NAME = "Emerald Promo"
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 DESCRIPTION = "Автоматическая продажа, бесплатная выдача и бонусные промокоды EmeraldAI"
 CREDITS = "FunPay aiogram bot"
 SETTINGS_PAGE = True
@@ -1137,10 +1137,16 @@ def _on_callback(call: Any) -> None:
 def _on_setting_message(message: Any) -> None:
     global _pending_input
     if _pending_input is None:
-        return
-    key, context = _pending_input
+        value = str(message.text or "").strip()
+        if not value.startswith("sk-em-seller-"):
+            return
+        # После перезапуска runtime временный мастер может потеряться. Seller-
+        # ключ имеет однозначный префикс, поэтому безопасно восстанавливаем шаг.
+        key, context = "token", None
+    else:
+        key, context = _pending_input
+        value = str(message.text or "").strip()
     _pending_input = None
-    value = str(message.text or "").strip()
     chat_id = int(message.chat.id)
     try:
         if key == "token":
@@ -1196,7 +1202,8 @@ def pre_init(cardinal: Any) -> None:
     bot.register_message_handler(
         _on_setting_message,
         content_types=["text"],
-        func=lambda _message: _pending_input is not None,
+        func=lambda message: _pending_input is not None
+        or str(message.text or "").strip().startswith("sk-em-seller-"),
     )
 
 
