@@ -40,9 +40,14 @@ from bot import (
     proxy_label,
     ready_plugin_source,
     render_template,
+    save_emerald_setting,
     save_emerald_seller_token,
     telegram_publisher_name,
+    update_emerald_lot_rule,
+    upsert_emerald_lot_rule,
+    validate_emerald_api_base_url,
     validate_emerald_seller_token,
+    validate_emerald_token_amount,
     validate_catalog_description,
     within_work_hours,
 )
@@ -90,6 +95,45 @@ def test_emerald_token_native_flow_encrypts_and_updates_settings():
     assert calls[0][1][0] == 77
     assert calls[0][1][1] != token
     assert secrets.decrypt(calls[0][1][1]) == token
+
+
+def test_emerald_native_input_validation():
+    assert (
+        validate_emerald_api_base_url(" https://emeraldai.sbs/seller/v1/ ")
+        == "https://www.emeraldai.sbs/seller/v1"
+    )
+    assert validate_emerald_token_amount("200 000") == 200_000
+
+    with pytest.raises(ValueError):
+        validate_emerald_api_base_url("http://emeraldai.sbs/seller/v1")
+    with pytest.raises(ValueError):
+        validate_emerald_api_base_url("https://user:pass@emeraldai.sbs/seller/v1")
+    with pytest.raises(ValueError):
+        validate_emerald_token_amount("9999")
+
+
+def test_emerald_native_lot_and_setting_writes_keep_full_title():
+    calls = []
+
+    class FakeDatabase:
+        async def execute(self, query, *args):
+            calls.append((query, args))
+            return "UPDATE 1"
+
+    database = FakeDatabase()
+    full_title = "Очень длинное полное название лота " * 8
+
+    asyncio.run(save_emerald_setting(database, 77, "free_token_amount", 20_000))
+    asyncio.run(
+        upsert_emerald_lot_rule(database, 77, "lot-42", full_title, 50_000)
+    )
+    asyncio.run(
+        update_emerald_lot_rule(database, 77, 9, "tokens_per_unit", 60_000)
+    )
+
+    assert calls[0][1] == (77, 20_000)
+    assert calls[1][1] == (77, "lot-42", full_title, 50_000)
+    assert calls[2][1] == (77, 9, 60_000)
 
 
 @pytest.mark.parametrize("value", ["example.org", "ftp://example.org:21", "http://example.org:nope"])
@@ -1564,8 +1608,8 @@ def test_official_plugin_seed_refreshes_already_installed_sources():
         for _query, args in refreshes
         if args[0] == EMERALD_PROMO_PLUGIN_UUID
     )
-    assert emerald_promo[3] == "1.0.3"
-    assert 'VERSION = "1.0.3"' in emerald_promo[5]
+    assert emerald_promo[3] == "1.0.4"
+    assert 'VERSION = "1.0.4"' in emerald_promo[5]
 
 
 def test_catalog_description_validation_and_publisher_name():

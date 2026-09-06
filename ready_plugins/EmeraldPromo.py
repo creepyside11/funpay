@@ -18,7 +18,7 @@ from FunPayAPI.common.utils import MONTHS
 
 
 NAME = "Emerald Promo"
-VERSION = "1.0.3"
+VERSION = "1.0.4"
 DESCRIPTION = "Автоматическая продажа, бесплатная выдача и бонусные промокоды EmeraldAI"
 CREDITS = "FunPay aiogram bot"
 SETTINGS_PAGE = True
@@ -1115,7 +1115,14 @@ def _on_callback(call: Any) -> None:
                 raise RuntimeError("список лотов устарел; откройте его повторно")
             _draft_rule.clear()
             _draft_rule.update(lot_id=selected[0], lot_title=selected[1])
-            _prompt(chat_id, "new_tokens", "Отправьте количество токенов за одну купленную единицу (минимум 10 000).")
+            _prompt(
+                chat_id,
+                "new_tokens",
+                "🛒 <b>Выбранный лот</b>\n\n"
+                f"{html.escape(selected[1])}\n\n"
+                "Теперь отправьте количество токенов за одну купленную "
+                "единицу (минимум 10 000).",
+            )
         elif data.startswith(f"{CALLBACK_PREFIX}r:"):
             _show_rule(chat_id, int(data.rsplit(":", 1)[1]))
         elif data.startswith(f"{CALLBACK_PREFIX}rt:"):

@@ -30,6 +30,34 @@ def test_paid_amount_is_multiplied_and_stays_one_nominal():
     assert plugin._calculate_total(200_000, None) == 200_000
 
 
+def test_lot_selection_shows_full_title_before_requesting_amount(monkeypatch):
+    sent = []
+
+    class FakeBot:
+        @staticmethod
+        def answer_callback_query(_callback_id):
+            return None
+
+        @staticmethod
+        def send_message(_chat_id, text, **_kwargs):
+            sent.append(text)
+
+    full_title = "Полное название лота " * 12
+    monkeypatch.setattr(plugin, "_bot", lambda: FakeBot())
+    monkeypatch.setattr(plugin, "_lot_cache", {"1": ("lot-1", full_title)})
+    monkeypatch.setattr(plugin, "_pending_input", None)
+
+    plugin._on_callback(SimpleNamespace(
+        data="emp:lot:1",
+        id="callback-1",
+        message=SimpleNamespace(chat=SimpleNamespace(id=77)),
+    ))
+
+    assert plugin._pending_input == ("new_tokens", None)
+    assert full_title in sent[-1]
+    assert "Теперь отправьте количество токенов" in sent[-1]
+
+
 def test_lot_matching_is_exact_and_prefers_event_lot_id():
     rules = [
         {"lot_id": "10", "lot_title": "Telegram Premium", "enabled": True},

@@ -204,7 +204,7 @@ READY_PLUGINS = (
         EMERALD_PROMO_PLUGIN_UUID,
         "EmeraldPromo.py",
         "Emerald Promo",
-        "1.0.3",
+        "1.0.4",
         "Продажа и бесплатная выдача промокодов EmeraldAI",
         "Подключается к Emerald Seller API, выдаёт один промокод на весь оплаченный заказ "
         "с учётом количества товара, поддерживает несколько лотов, одноразовую команду #free "
@@ -267,6 +267,75 @@ async def save_emerald_seller_token(
         raise RuntimeError(
             "настройки Emerald Promo не инициализированы; выключите и снова включите плагин"
         )
+
+
+def validate_emerald_api_base_url(value: str) -> str:
+    url = value.strip().rstrip("/")
+    parsed = urlsplit(url)
+    if parsed.scheme != "https" or not parsed.hostname or parsed.username:
+        raise ValueError("нужен HTTPS URL без логина и пароля")
+    if parsed.query or parsed.fragment:
+        raise ValueError("Base URL не должен содержать query или fragment")
+    if url == "https://emeraldai.sbs/seller/v1":
+        return "https://www.emeraldai.sbs/seller/v1"
+    return url
+
+
+def validate_emerald_token_amount(value: str) -> int:
+    raw = value.replace(" ", "").strip()
+    if not raw.isdigit():
+        raise ValueError("нужно отправить целое количество токенов")
+    amount = int(raw)
+    if not 10_000 <= amount <= 1_000_000_000:
+        raise ValueError("количество должно быть от 10 000 до 1 000 000 000")
+    return amount
+
+
+async def save_emerald_setting(
+    db: Any, telegram_id: int, column: str, value: Any
+) -> None:
+    if column not in {
+        "api_base_url", "free_token_amount", "min_account_age_days"
+    }:
+        raise ValueError("неизвестная настройка Emerald Promo")
+    result = await db.execute(
+        f"""UPDATE emerald_promo_settings
+               SET {column}=$2, updated_at=NOW()
+             WHERE telegram_id=$1""",
+        telegram_id, value,
+    )
+    if str(result).strip().upper() == "UPDATE 0":
+        raise RuntimeError("настройки Emerald Promo не инициализированы")
+
+
+async def upsert_emerald_lot_rule(
+    db: Any, telegram_id: int, lot_id: str, lot_title: str, amount: int
+) -> None:
+    await db.execute(
+        """INSERT INTO emerald_promo_lot_rules
+               (telegram_id, lot_id, lot_title, tokens_per_unit)
+            VALUES ($1,$2,$3,$4)
+            ON CONFLICT (telegram_id, lot_id) DO UPDATE SET
+                lot_title=EXCLUDED.lot_title,
+                tokens_per_unit=EXCLUDED.tokens_per_unit,
+                enabled=TRUE, updated_at=NOW()""",
+        telegram_id, lot_id, lot_title, amount,
+    )
+
+
+async def update_emerald_lot_rule(
+    db: Any, telegram_id: int, rule_id: int, column: str, amount: int
+) -> None:
+    if column not in {"tokens_per_unit", "review_bonus_tokens"}:
+        raise ValueError("неизвестное поле привязки Emerald Promo")
+    result = await db.execute(
+        f"""UPDATE emerald_promo_lot_rules
+               SET {column}=$3, updated_at=NOW()
+             WHERE telegram_id=$1 AND id=$2""",
+        telegram_id, rule_id, amount,
+    )
+    if str(result).strip().upper() == "UPDATE 0":
+        raise RuntimeError("привязка лота не найдена")
 
 
 def validate_catalog_description(value: str) -> str:
@@ -4513,6 +4582,12 @@ class PluginTelethonState(StatesGroup):
 
 class EmeraldPromoState(StatesGroup):
     api_token = State()
+    api_base_url = State()
+    free_token_amount = State()
+    min_account_age = State()
+    new_lot_tokens = State()
+    edit_lot_tokens = State()
+    edit_review_tokens = State()
 
 
 class CatalogPublishState(StatesGroup):
@@ -9531,26 +9606,161 @@ BIND_TO_NEW_MESSAGE = [on_message]
                 show_alert=True,
             )
 
-    @router.callback_query(F.data == "emp:set:token")
-    async def emerald_api_token_start(
-        callback: CallbackQuery, state: FSMContext
-    ) -> None:
-        plugin_runtime = manager.plugins.runtimes.get(callback.from_user.id)
+    def active_emerald_plugin(telegram_id: int) -> PluginData | None:
+        plugin_runtime = manager.plugins.runtimes.get(telegram_id)
         plugin = (
             plugin_runtime.plugins.get(EMERALD_PROMO_PLUGIN_UUID)
             if plugin_runtime else None
         )
-        if not plugin or not plugin.enabled:
+        return plugin if plugin and plugin.enabled else None
+
+    async def start_emerald_input(
+        callback: CallbackQuery,
+        state: FSMContext,
+        next_state: State,
+        prompt: str,
+        **data: Any,
+    ) -> bool:
+        plugin = active_emerald_plugin(callback.from_user.id)
+        if not plugin:
+            await callback.answer(
+                "Сначала включите Emerald Promo.", show_alert=True
+            )
+            return False
+        # Cardinal-обработчик оставляем как совместимый fallback, но ввод в
+        # основном боте ведём через FSM: так состояние не теряется между
+        # callback и следующим сообщением пользователя.
+        setattr(plugin.module, "_pending_input", None)
+        await state.clear()
+        if data:
+            await state.update_data(**data)
+        await state.set_state(next_state)
+        await callback.answer()
+        await callback.message.answer(prompt)
+        return True
+
+    def emerald_settings_keyboard() -> InlineKeyboardMarkup:
+        return keyboard([[
+            (
+                "⚙️ Открыть настройки",
+                f"{PLUGIN_SETTINGS_CALLBACK_PREFIX}:"
+                f"{EMERALD_PROMO_PLUGIN_UUID}:0",
+            )
+        ]])
+
+    @router.callback_query(F.data == "emp:set:token")
+    async def emerald_api_token_start(
+        callback: CallbackQuery, state: FSMContext
+    ) -> None:
+        await start_emerald_input(
+            callback,
+            state,
+            EmeraldPromoState.api_token,
+            "Отправьте Seller API-токен вида <code>sk-em-seller-...</code>. "
+            "Сообщение будет удалено, токен сохранится зашифрованным.",
+        )
+
+    @router.callback_query(F.data == "emp:set:base")
+    async def emerald_api_base_url_start(
+        callback: CallbackQuery, state: FSMContext
+    ) -> None:
+        await start_emerald_input(
+            callback,
+            state,
+            EmeraldPromoState.api_base_url,
+            "Отправьте HTTPS Base URL Emerald Seller API.\n"
+            "По умолчанию: <code>https://www.emeraldai.sbs/seller/v1</code>",
+        )
+
+    @router.callback_query(F.data == "emp:set:free")
+    async def emerald_free_amount_start(
+        callback: CallbackQuery, state: FSMContext
+    ) -> None:
+        await start_emerald_input(
+            callback,
+            state,
+            EmeraldPromoState.free_token_amount,
+            "Отправьте номинал промокода #free: от 10 000 до "
+            "1 000 000 000 токенов.",
+        )
+
+    @router.callback_query(F.data == "emp:set:age")
+    async def emerald_min_account_age_start(
+        callback: CallbackQuery, state: FSMContext
+    ) -> None:
+        await start_emerald_input(
+            callback,
+            state,
+            EmeraldPromoState.min_account_age,
+            "Отправьте минимальный возраст FunPay-аккаунта в днях: "
+            "целое число от 0 до 3650.",
+        )
+
+    @router.callback_query(F.data.startswith("emp:lot:"))
+    async def emerald_new_lot_tokens_start(
+        callback: CallbackQuery, state: FSMContext
+    ) -> None:
+        plugin = active_emerald_plugin(callback.from_user.id)
+        if not plugin:
             await callback.answer(
                 "Сначала включите Emerald Promo.", show_alert=True
             )
             return
-        await state.clear()
-        await state.set_state(EmeraldPromoState.api_token)
-        await callback.answer()
-        await callback.message.answer(
-            "Отправьте Seller API-токен вида <code>sk-em-seller-...</code>. "
-            "Сообщение будет удалено, токен сохранится зашифрованным."
+        lot_key = callback.data.rsplit(":", 1)[-1]
+        selected = getattr(plugin.module, "_lot_cache", {}).get(lot_key)
+        if not selected:
+            await callback.answer(
+                "Список лотов устарел. Откройте выбор лота ещё раз.",
+                show_alert=True,
+            )
+            return
+        lot_id, lot_title = str(selected[0]), str(selected[1])
+        await start_emerald_input(
+            callback,
+            state,
+            EmeraldPromoState.new_lot_tokens,
+            "🛒 <b>Выбранный лот</b>\n\n"
+            f"{html.escape(lot_title)}\n\n"
+            "Теперь отправьте количество токенов за одну купленную "
+            "единицу (минимум 10 000).",
+            lot_id=lot_id,
+            lot_title=lot_title,
+        )
+
+    @router.callback_query(F.data.startswith("emp:rt:"))
+    async def emerald_edit_lot_tokens_start(
+        callback: CallbackQuery, state: FSMContext
+    ) -> None:
+        try:
+            rule_id = int(callback.data.rsplit(":", 1)[-1])
+        except (TypeError, ValueError):
+            await callback.answer("Некорректная привязка лота.", show_alert=True)
+            return
+        await start_emerald_input(
+            callback,
+            state,
+            EmeraldPromoState.edit_lot_tokens,
+            "Отправьте новый номинал за одну единицу: от 10 000 до "
+            "1 000 000 000 токенов.",
+            rule_id=rule_id,
+        )
+
+    @router.callback_query(F.data.startswith("emp:rbt:"))
+    async def emerald_edit_review_tokens_start(
+        callback: CallbackQuery, state: FSMContext
+    ) -> None:
+        try:
+            rule_id = int(callback.data.rsplit(":", 1)[-1])
+        except (TypeError, ValueError):
+            await callback.answer("Некорректная привязка лота.", show_alert=True)
+            return
+        await start_emerald_input(
+            callback,
+            state,
+            EmeraldPromoState.edit_review_tokens,
+            "Отправьте новый бонус за отзыв 5★: от 10 000 до "
+            "1 000 000 000 токенов.",
+            rule_id=rule_id,
         )
 
     @router.message(EmeraldPromoState.api_token, F.text)
@@ -9585,12 +9795,185 @@ BIND_TO_NEW_MESSAGE = [on_message]
         await state.clear()
         await message.answer(
             "✅ Emerald Seller API-токен сохранён и зашифрован.",
-            reply_markup=keyboard([[
-                (
-                    "⚙️ Открыть настройки",
-                    f"{PLUGIN_SETTINGS_CALLBACK_PREFIX}:{EMERALD_PROMO_PLUGIN_UUID}:0",
+            reply_markup=emerald_settings_keyboard(),
+        )
+
+    @router.message(EmeraldPromoState.api_base_url, F.text)
+    async def emerald_api_base_url_save(
+        message: Message, state: FSMContext
+    ) -> None:
+        try:
+            value = validate_emerald_api_base_url(message.text or "")
+        except ValueError as exc:
+            await message.answer(
+                f"❌ {html.escape(str(exc))}. Отправьте URL ещё раз или /cancel."
+            )
+            return
+        try:
+            await save_emerald_setting(
+                db, message.from_user.id, "api_base_url", value
+            )
+        except Exception as exc:
+            logger.exception("Не удалось сохранить Emerald API Base URL")
+            await state.clear()
+            await message.answer(
+                "❌ Base URL не сохранён: "
+                f"<code>{html.escape(clipped(exc, 500))}</code>",
+                reply_markup=emerald_settings_keyboard(),
+            )
+            return
+        await state.clear()
+        await message.answer(
+            f"✅ Base URL сохранён: <code>{html.escape(value)}</code>",
+            reply_markup=emerald_settings_keyboard(),
+        )
+
+    async def save_emerald_amount_message(
+        message: Message,
+        state: FSMContext,
+        *,
+        setting_column: str | None = None,
+        rule_column: str | None = None,
+        success_text: str,
+    ) -> None:
+        try:
+            amount = validate_emerald_token_amount(message.text or "")
+        except ValueError as exc:
+            await message.answer(
+                f"❌ {html.escape(str(exc))}. Отправьте число ещё раз или /cancel."
+            )
+            return
+        try:
+            if setting_column:
+                await save_emerald_setting(
+                    db, message.from_user.id, setting_column, amount
                 )
-            ]]),
+            elif rule_column:
+                data = await state.get_data()
+                rule_id = int(data["rule_id"])
+                await update_emerald_lot_rule(
+                    db, message.from_user.id, rule_id, rule_column, amount
+                )
+            else:
+                raise RuntimeError("не указан тип настройки")
+        except Exception as exc:
+            logger.exception("Не удалось сохранить числовую настройку Emerald Promo")
+            await state.clear()
+            await message.answer(
+                "❌ Настройка не сохранена: "
+                f"<code>{html.escape(clipped(exc, 500))}</code>",
+                reply_markup=emerald_settings_keyboard(),
+            )
+            return
+        await state.clear()
+        await message.answer(
+            f"✅ {success_text}: <b>{amount:,}</b> токенов.".replace(",", " "),
+            reply_markup=emerald_settings_keyboard(),
+        )
+
+    @router.message(EmeraldPromoState.free_token_amount, F.text)
+    async def emerald_free_amount_save(
+        message: Message, state: FSMContext
+    ) -> None:
+        await save_emerald_amount_message(
+            message,
+            state,
+            setting_column="free_token_amount",
+            success_text="Номинал #free сохранён",
+        )
+
+    @router.message(EmeraldPromoState.min_account_age, F.text)
+    async def emerald_min_account_age_save(
+        message: Message, state: FSMContext
+    ) -> None:
+        value = (message.text or "").strip()
+        if not value.isdigit() or not 0 <= int(value) <= 3650:
+            await message.answer(
+                "❌ Возраст должен быть целым числом от 0 до 3650 дней. "
+                "Отправьте число ещё раз или /cancel."
+            )
+            return
+        try:
+            await save_emerald_setting(
+                db, message.from_user.id, "min_account_age_days", int(value)
+            )
+        except Exception as exc:
+            logger.exception("Не удалось сохранить возраст Emerald Promo")
+            await state.clear()
+            await message.answer(
+                "❌ Возраст аккаунта не сохранён: "
+                f"<code>{html.escape(clipped(exc, 500))}</code>",
+                reply_markup=emerald_settings_keyboard(),
+            )
+            return
+        await state.clear()
+        await message.answer(
+            f"✅ Минимальный возраст сохранён: <b>{int(value)}</b> дн.",
+            reply_markup=emerald_settings_keyboard(),
+        )
+
+    @router.message(EmeraldPromoState.new_lot_tokens, F.text)
+    async def emerald_new_lot_tokens_save(
+        message: Message, state: FSMContext
+    ) -> None:
+        try:
+            amount = validate_emerald_token_amount(message.text or "")
+        except ValueError as exc:
+            await message.answer(
+                f"❌ {html.escape(str(exc))}. Отправьте число ещё раз или /cancel."
+            )
+            return
+        data = await state.get_data()
+        lot_id = str(data.get("lot_id") or "")
+        lot_title = str(data.get("lot_title") or "")
+        if not lot_id or not lot_title:
+            await state.clear()
+            await message.answer(
+                "❌ Выбор лота устарел. Откройте список лотов и выберите его заново.",
+                reply_markup=emerald_settings_keyboard(),
+            )
+            return
+        try:
+            await upsert_emerald_lot_rule(
+                db, message.from_user.id, lot_id, lot_title, amount
+            )
+        except Exception as exc:
+            logger.exception("Не удалось привязать лот Emerald Promo")
+            await state.clear()
+            await message.answer(
+                "❌ Лот не привязан: "
+                f"<code>{html.escape(clipped(exc, 500))}</code>",
+                reply_markup=emerald_settings_keyboard(),
+            )
+            return
+        await state.clear()
+        await message.answer(
+            "✅ Лот привязан.\n\n"
+            f"<b>{html.escape(lot_title)}</b>\n"
+            f"Номинал за единицу: <b>{amount:,}</b> токенов.".replace(",", " "),
+            reply_markup=emerald_settings_keyboard(),
+        )
+
+    @router.message(EmeraldPromoState.edit_lot_tokens, F.text)
+    async def emerald_edit_lot_tokens_save(
+        message: Message, state: FSMContext
+    ) -> None:
+        await save_emerald_amount_message(
+            message,
+            state,
+            rule_column="tokens_per_unit",
+            success_text="Номинал лота сохранён",
+        )
+
+    @router.message(EmeraldPromoState.edit_review_tokens, F.text)
+    async def emerald_edit_review_tokens_save(
+        message: Message, state: FSMContext
+    ) -> None:
+        await save_emerald_amount_message(
+            message,
+            state,
+            rule_column="review_bonus_tokens",
+            success_text="Бонус за отзыв сохранён",
         )
 
     @router.callback_query(F.data.startswith("plugin_delete_ask:"))
