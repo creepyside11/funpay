@@ -1,37 +1,60 @@
 from __future__ import annotations
 
 import asyncio
-import logging
-import time
+from typing import Any
 
 import bot
 
 
-logger = logging.getLogger("funpay_bot.supervisor")
-RESTART_DELAY_SECONDS = 5
+PLAYEROK_DISABLED_MESSAGE = "Playerok временно отключён"
+
+
+async def _start_saved_without_playerok(self: Any) -> None:
+    """Restore only FunPay accounts while Playerok is stubbed out."""
+    self.loop = asyncio.get_running_loop()
+    try:
+        rows = list(await self.db.active_users())
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        bot.logger.exception(
+            "Не удалось получить сохранённые FunPay-аккаунты; бот продолжит запуск"
+        )
+        rows = []
+
+    for row in rows:
+        try:
+            self.start_account_in_background(
+                int(row["telegram_id"]), "funpay", row, notify=True
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            bot.logger.exception(
+                "Не удалось запланировать восстановление FunPay-аккаунта; "
+                "остальные аккаунты продолжат запуск"
+            )
+
+    bot.logger.warning(
+        "%s: сохранённые аккаунты Playerok не запускаются и сеть Playerok не вызывается",
+        PLAYEROK_DISABLED_MESSAGE,
+    )
+
+
+async def _disabled_start_playerok(self: Any, *args: Any, **kwargs: Any) -> Any:
+    raise RuntimeError(PLAYEROK_DISABLED_MESSAGE)
+
+
+def _disabled_create_playerok_account(*args: Any, **kwargs: Any) -> Any:
+    raise RuntimeError(PLAYEROK_DISABLED_MESSAGE)
 
 
 def main() -> None:
-    """Run the bot and recover from unexpected top-level failures.
-
-    Account-specific connection failures (for example a Playerok proxy/cookie
-    timing out) should normally be handled inside bot.py. This supervisor is a
-    final safety net: if one of those failures ever reaches the process entry
-    point, the container stays alive and starts a fresh bot loop instead of
-    terminating permanently.
-    """
-    while True:
-        try:
-            asyncio.run(bot.main())
-            return
-        except KeyboardInterrupt:
-            return
-        except Exception:
-            logger.exception(
-                "Основной цикл бота аварийно завершился; перезапуск через %s сек.",
-                RESTART_DELAY_SECONDS,
-            )
-            time.sleep(RESTART_DELAY_SECONDS)
+    # Temporary hard stub: do not restore, connect to, or validate Playerok.
+    bot.RuntimeManager.start_saved = _start_saved_without_playerok
+    bot.RuntimeManager.start_playerok = _disabled_start_playerok
+    bot.create_playerok_account = _disabled_create_playerok_account
+    asyncio.run(bot.main())
 
 
 if __name__ == "__main__":
