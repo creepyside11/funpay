@@ -286,3 +286,65 @@ def test_review_bonus_is_reserved_only_for_actual_five_star_review(monkeypatch):
     assert reserved[0]["source_id"] == "ABCD1234"
     assert reserved[0]["token_amount"] == 1_000_000
     assert fulfilled == [8]
+
+
+def test_account_selector_uses_global_funpay_switch_callback(monkeypatch):
+    sent = []
+    accounts = [
+        {"id": 7, "label": "Основной", "username": "seller1", "external_id": "101"},
+        {"id": 8, "label": "Резерв", "username": "seller2", "external_id": "202"},
+    ]
+
+    class Bot:
+        @staticmethod
+        def send_message(_chat_id, text, **kwargs):
+            sent.append((text, kwargs))
+
+    def sync(awaitable):
+        name = awaitable.cr_code.co_name
+        awaitable.close()
+        if name == "_funpay_accounts":
+            return accounts
+        if name == "_active_funpay_account_id":
+            return 7
+        raise AssertionError(name)
+
+    monkeypatch.setattr(plugin, "_bot", lambda: Bot())
+    monkeypatch.setattr(plugin, "_sync", sync)
+
+    plugin._show_accounts(77)
+
+    markup = sent[-1][1]["reply_markup"]
+    callbacks = [
+        button.callback_data
+        for row in markup.keyboard
+        for button in row
+        if button.callback_data
+    ]
+    labels = [button.text for row in markup.keyboard for button in row]
+
+    assert "account_select:funpay:7" in callbacks
+    assert "account_select:funpay:8" in callbacks
+    assert any(label.startswith("✅") and "seller1" in label for label in labels)
+
+
+def test_funpay_send_restores_numeric_chat_id_before_delivery(monkeypatch):
+    calls = []
+
+    class Account:
+        @staticmethod
+        def send_message(chat_id, text, chat_name):
+            calls.append((chat_id, text, chat_name))
+
+    monkeypatch.setattr(
+        plugin,
+        "_cardinal",
+        SimpleNamespace(account=Account()),
+    )
+
+    asyncio.run(plugin._funpay_send(
+        {"chat_id": "123456", "chat_name": "buyer"},
+        "PROMO-CODE",
+    ))
+
+    assert calls == [(123456, "PROMO-CODE", "buyer")]
