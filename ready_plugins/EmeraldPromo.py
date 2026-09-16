@@ -215,6 +215,49 @@ async def _set_setting(column: str, value: Any) -> None:
     )
 
 
+async def _funpay_accounts() -> list[Any]:
+    return list(await _db().fetch(
+        """SELECT id, label, username, external_id
+             FROM marketplace_accounts
+            WHERE telegram_id=$1 AND marketplace='funpay' AND enabled=TRUE
+            ORDER BY created_at, id""",
+        _telegram_id(),
+    ))
+
+
+async def _active_funpay_account_id() -> int | None:
+    row = await _db().fetchrow(
+        "SELECT active_funpay_account_id FROM funpay_users WHERE telegram_id=$1",
+        _telegram_id(),
+    )
+    value = _row_get(row, "active_funpay_account_id")
+    return int(value) if value is not None else None
+
+
+def _account_title(account: Any) -> str:
+    label = str(_row_get(account, "label", "") or "").strip()
+    username = str(_row_get(account, "username", "") or "").strip()
+    external_id = str(_row_get(account, "external_id", "") or "").strip()
+    if label and username and label.casefold() != username.casefold():
+        return f"{label} · {username}"
+    return username or label or external_id or f"Аккаунт {_row_get(account, 'id', '?')}"
+
+
+def _current_account_title() -> str:
+    label = str(getattr(_cardinal.runtime, "account_label", "") or "").strip()
+    username = str(getattr(_cardinal.account, "username", "") or "").strip()
+    if label and username and label.casefold() != username.casefold():
+        return f"{label} · {username}"
+    return username or label or "текущий аккаунт"
+
+
+def _funpay_chat_id(value: Any) -> int | str:
+    if isinstance(value, int):
+        return value
+    raw = str(value or "").strip()
+    return int(raw) if raw.isdigit() else raw
+
+
 async def _rules() -> list[Any]:
     await _ensure_schema()
     return list(await _db().fetch(
@@ -577,7 +620,7 @@ def _issue_message(issue: Any, *, repeated: bool = False) -> str:
 async def _funpay_send(issue: Any, text: str) -> None:
     await asyncio.to_thread(
         _cardinal.account.send_message,
-        issue["chat_id"], text, issue["chat_name"],
+        _funpay_chat_id(issue["chat_id"]), text, issue["chat_name"],
     )
 
 
@@ -731,7 +774,6 @@ def _registration_date(profile: Any) -> datetime | None:
         if month is None:
             continue
         try:
-            # FunPay показывает даты профиля по московскому времени.
             local = datetime(
                 int(match.group(3)), month, int(match.group(1)),
                 tzinfo=timezone(timedelta(hours=3)),
@@ -819,7 +861,7 @@ async def _process_free(message: dict[str, Any]) -> None:
     if not bool(settings["free_enabled"]):
         await asyncio.to_thread(
             _cardinal.account.send_message,
-            message["chat_id"],
+            _funpay_chat_id(message["chat_id"]),
             "ℹ️ Бесплатный тестовый промокод сейчас недоступен.",
             message.get("chat_name"),
         )
@@ -834,7 +876,7 @@ async def _process_free(message: dict[str, Any]) -> None:
     if age_days is None:
         await asyncio.to_thread(
             _cardinal.account.send_message,
-            message["chat_id"],
+            _funpay_chat_id(message["chat_id"]),
             "❌ Не удалось подтвердить дату регистрации FunPay-аккаунта. "
             "Промокод не выдан; попробуйте позже.",
             message.get("chat_name"),
@@ -844,7 +886,7 @@ async def _process_free(message: dict[str, Any]) -> None:
         wait_days = minimum_days - age_days
         await asyncio.to_thread(
             _cardinal.account.send_message,
-            message["chat_id"],
+            _funpay_chat_id(message["chat_id"]),
             "⏳ Бесплатный тест доступен аккаунтам FunPay старше "
             f"{minimum_days} дней. Попробуйте примерно через {wait_days} дн.",
             message.get("chat_name"),
@@ -928,9 +970,11 @@ def _show_settings(chat_id: int) -> None:
     stats = _sync(_issue_stats())
     active = sum(1 for rule in rules if rule["enabled"])
     free_state = "включена" if settings["free_enabled"] else "выключена"
+    account_title = _current_account_title()
     lines = [
         "⚙️ <b>Emerald Promo</b>",
         "",
+        f"FunPay-аккаунт: <b>{html.escape(account_title)}</b>",
         f"Base URL: <code>{html.escape(str(settings['api_base_url']))}</code>",
         f"API-токен: <b>{html.escape(_token_label(settings))}</b>",
         f"Команда #free: <b>{free_state}</b>",
@@ -956,6 +1000,7 @@ def _show_settings(chat_id: int) -> None:
                 f"   {_format_tokens(rule['tokens_per_unit'])} токенов за 1 шт.{bonus}"
             )
     rows: list[list[tuple[str, str]]] = [
+        [("👤 Выбрать FunPay-аккаунт", f"{CALLBACK_PREFIX}accounts")],
         [("🌐 Base URL API", f"{CALLBACK_PREFIX}set:base")],
         [("🔑 API-токен", f"{CALLBACK_PREFIX}set:token")],
         [("🎁 Вкл/выкл #free", f"{CALLBACK_PREFIX}free")],
@@ -969,6 +1014,36 @@ def _show_settings(chat_id: int) -> None:
         rows.append([("🔁 Повторить ошибки", f"{CALLBACK_PREFIX}retry")])
     rows.append([("🔄 Обновить", SETTINGS_CALLBACK)])
     _bot().send_message(chat_id, "\n".join(lines), reply_markup=_markup(*rows))
+
+
+def _show_accounts(chat_id: int) -> None:
+    accounts = _sync(_funpay_accounts())
+    active_id = _sync(_active_funpay_account_id())
+    if not accounts:
+        _bot().send_message(
+            chat_id,
+            "❌ Нет сохранённых FunPay-аккаунтов. Сначала добавьте аккаунт в основном меню бота.",
+            reply_markup=_markup([("⬅️ Настройки", SETTINGS_CALLBACK)]),
+        )
+        return
+    rows: list[list[tuple[str, str]]] = []
+    for account in accounts:
+        account_id = int(account["id"])
+        marker = "✅" if active_id == account_id else "👤"
+        title = _account_title(account)
+        rows.append([(
+            f"{marker} {title[:48]}",
+            f"account_select:funpay:{account_id}",
+        )])
+    rows.append([("⬅️ Настройки", SETTINGS_CALLBACK)])
+    _bot().send_message(
+        chat_id,
+        "👤 <b>Аккаунт FunPay для Emerald Promo</b>\n\n"
+        "Плагин работает на активном FunPay-runtime. Выбор ниже переключит "
+        "активный FunPay-аккаунт бота, после чего Emerald Promo автоматически "
+        "будет слушать #free, заказы и отзывы именно на нём.",
+        reply_markup=_markup(*rows),
+    )
 
 
 def _show_rules(chat_id: int) -> None:
@@ -1093,6 +1168,8 @@ def _on_callback(call: Any) -> None:
         _bot().answer_callback_query(call.id)
         if data == SETTINGS_CALLBACK or data == f"{CALLBACK_PREFIX}open":
             _show_settings(chat_id)
+        elif data == f"{CALLBACK_PREFIX}accounts":
+            _show_accounts(chat_id)
         elif data == f"{CALLBACK_PREFIX}set:base":
             _prompt(chat_id, "base", f"Отправьте HTTPS Base URL API. По умолчанию: <code>{DEFAULT_API_URL}</code>")
         elif data == f"{CALLBACK_PREFIX}set:token":
@@ -1177,8 +1254,6 @@ def _on_setting_message(message: Any) -> None:
         value = str(message.text or "").strip()
         if not value.startswith("sk-em-seller-"):
             return
-        # После перезапуска runtime временный мастер может потеряться. Seller-
-        # ключ имеет однозначный префикс, поэтому безопасно восстанавливаем шаг.
         key, context = "token", None
     else:
         key, context = _pending_input
