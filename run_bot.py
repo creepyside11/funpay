@@ -7,6 +7,7 @@ import bot
 
 
 PLAYEROK_DISABLED_MESSAGE = "Playerok временно отключён"
+_ORIGINAL_FUNPAY_SEND_MESSAGE = bot.Account.send_message
 
 
 async def _start_saved_without_playerok(self: Any) -> None:
@@ -49,11 +50,36 @@ def _disabled_create_playerok_account(*args: Any, **kwargs: Any) -> Any:
     raise RuntimeError(PLAYEROK_DISABLED_MESSAGE)
 
 
+def _send_message_with_private_node(
+    self: Any, chat_id: Any, *args: Any, **kwargs: Any
+) -> Any:
+    """Resolve numeric private chat IDs to FunPay's canonical users-A-B node.
+
+    Order delivery already uses the canonical users-A-B node. Incoming message
+    events, including Emerald Promo #free, expose a numeric bookmark chat ID.
+    Runner keeps the corresponding interlocutor ID in users_ids, so translate
+    that numeric ID before sending to make both delivery paths identical.
+    """
+    runner = getattr(self, "runner", None)
+    account_id = getattr(self, "id", None)
+    if isinstance(chat_id, int) and runner is not None and account_id is not None:
+        interlocutor_id = getattr(runner, "users_ids", {}).get(chat_id)
+        if interlocutor_id is not None:
+            first, second = sorted((int(account_id), int(interlocutor_id)))
+            chat_id = f"users-{first}-{second}"
+    return _ORIGINAL_FUNPAY_SEND_MESSAGE(self, chat_id, *args, **kwargs)
+
+
 def main() -> None:
     # Temporary hard stub: do not restore, connect to, or validate Playerok.
     bot.RuntimeManager.start_saved = _start_saved_without_playerok
     bot.RuntimeManager.start_playerok = _disabled_start_playerok
     bot.create_playerok_account = _disabled_create_playerok_account
+
+    # FunPay private replies from incoming message events must use the same
+    # canonical node format as order delivery.
+    bot.Account.send_message = _send_message_with_private_node
+
     asyncio.run(bot.main())
 
 
