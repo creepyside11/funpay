@@ -10,6 +10,12 @@ PLAYEROK_DISABLED_MESSAGE = "Playerok временно отключён"
 _ORIGINAL_FUNPAY_SEND_MESSAGE = bot.Account.send_message
 
 
+async def _database_fetchval(self: Any, query: str, *args: Any) -> Any:
+    """Compatibility helper matching asyncpg's fetchval API for plugins."""
+    row = await self.fetchrow(query, *args)
+    return None if row is None else row[0]
+
+
 async def _start_saved_without_playerok(self: Any) -> None:
     """Restore only FunPay accounts while Playerok is stubbed out."""
     self.loop = asyncio.get_running_loop()
@@ -71,6 +77,9 @@ def _send_message_with_private_node(
 
 
 def main() -> None:
+    # Provide the asyncpg-style scalar query API expected by some plugins.
+    bot.Database.fetchval = _database_fetchval
+
     # Temporary hard stub: do not restore, connect to, or validate Playerok.
     bot.RuntimeManager.start_saved = _start_saved_without_playerok
     bot.RuntimeManager.start_playerok = _disabled_start_playerok
