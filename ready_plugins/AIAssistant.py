@@ -18,7 +18,7 @@ except ImportError:  # Зависимость устанавливается и�
 
 
 NAME = "AI Assistant"
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 DESCRIPTION = "AI-помощник Anthropic для покупателей выбранных лотов"
 CREDITS = "FunPay aiogram bot"
 SETTINGS_PAGE = True
@@ -306,16 +306,19 @@ async def _delete_rule(rule_id: int) -> None:
 
 
 async def _active_sessions_count() -> int:
-    return int(
-        await _db().fetchval(
-            """
-            SELECT COUNT(*) FROM ai_assistant_sessions
-             WHERE telegram_id=$1 AND active=TRUE
-            """,
-            _telegram_id(),
-        )
-        or 0
+    row = await _db().fetchrow(
+        """
+        SELECT COUNT(*) AS count FROM ai_assistant_sessions
+         WHERE telegram_id=$1 AND active=TRUE
+        """,
+        _telegram_id(),
     )
+    if row is None:
+        return 0
+    try:
+        return int(row["count"] or 0)
+    except (KeyError, IndexError, TypeError):
+        return int(row[0] or 0)
 
 
 def _api_token(settings: Any) -> str:
