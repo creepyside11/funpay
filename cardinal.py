@@ -30,6 +30,15 @@ def _ensure_database_compat(cardinal: CardinalAdapter) -> None:
     db.fetchval = fetchval
 
 
+def _pending_input_handler(module: Any) -> Any:
+    """Return the conventional settings-input handler used by a plugin."""
+    for name in ("_on_setting_message", "_on_setting_msg"):
+        handler = getattr(module, name, None)
+        if callable(handler):
+            return handler
+    return None
+
+
 async def _dispatch_telegram_message_with_pending_input(
     self: PluginManager, telegram_id: int, message: Any
 ) -> bool:
@@ -48,7 +57,7 @@ async def _dispatch_telegram_message_with_pending_input(
                 continue
             module = plugin.module
             pending = getattr(module, "_pending_input", None)
-            handler = getattr(module, "_on_setting_message", None)
+            handler = _pending_input_handler(module)
             if pending is None or not callable(handler):
                 continue
 
