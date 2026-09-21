@@ -6276,7 +6276,16 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
             await callback.answer("Категория не найдена", show_alert=True)
             return
         await callback.answer()
-        subcategories = list(getattr(category, "subcategories", []) or [])
+        subcategories = []
+        if hasattr(category, "get_subcategories"):
+            subcategories = category.get_subcategories()
+        elif hasattr(category, "subcategories"):
+            subcategories = getattr(category, "subcategories", []) or []
+        if not subcategories:
+            # Fallback: поиск по всем известным подкатегориям аккаунта
+            all_subs = getattr(runtime.account, "subcategories", []) or []
+            subcategories = [s for s in all_subs if getattr(getattr(s, "category", None), "id", None) == cat_id]
+
         # Оставляем стандартные подкатегории лотов
         common_subs = [s for s in subcategories if getattr(s, "type", None) == types.SubCategoryTypes.COMMON]
         target_subs = common_subs if common_subs else subcategories
