@@ -637,6 +637,15 @@ class Database:
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
 
+            CREATE TABLE IF NOT EXISTS funpay_lot_ai_settings (
+                telegram_id BIGINT PRIMARY KEY
+                    REFERENCES funpay_users(telegram_id) ON DELETE CASCADE,
+                api_base_url TEXT NOT NULL DEFAULT '',
+                api_token_enc TEXT,
+                model_id TEXT NOT NULL DEFAULT '',
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+
             CREATE INDEX IF NOT EXISTS funpay_plugin_catalog_order_idx
                 ON funpay_plugin_catalog (is_official DESC, install_count DESC, updated_at DESC);
 
@@ -1264,6 +1273,46 @@ class Database:
         await self.execute(
             f"""
             UPDATE funpay_plugin_builder_settings
+               SET {key}=$2, updated_at=NOW()
+             WHERE telegram_id=$1
+            """,
+            telegram_id,
+            value,
+        )
+
+    async def get_lot_ai_settings(self, telegram_id: int) -> dict:
+        await self.execute(
+            """
+            INSERT INTO funpay_lot_ai_settings (telegram_id)
+            VALUES ($1)
+            ON CONFLICT (telegram_id) DO NOTHING
+            """,
+            telegram_id,
+        )
+        row = await self.fetchrow(
+            "SELECT * FROM funpay_lot_ai_settings WHERE telegram_id=$1",
+            telegram_id,
+        )
+        if row is None:
+            return {"api_base_url": "", "api_token_enc": None, "model_id": ""}
+        return dict(row)
+
+    async def set_lot_ai_setting(
+        self, telegram_id: int, key: str, value: str | None
+    ) -> None:
+        if key not in {"api_base_url", "api_token_enc", "model_id"}:
+            raise ValueError("неизвестная настройка AI-перевода")
+        await self.execute(
+            """
+            INSERT INTO funpay_lot_ai_settings (telegram_id)
+            VALUES ($1)
+            ON CONFLICT (telegram_id) DO NOTHING
+            """,
+            telegram_id,
+        )
+        await self.execute(
+            f"""
+            UPDATE funpay_lot_ai_settings
                SET {key}=$2, updated_at=NOW()
              WHERE telegram_id=$1
             """,
@@ -4521,6 +4570,9 @@ class FunPayLotCreateState(StatesGroup):
     payment_msg = State()
     title_en_edit = State()
     desc_en_edit = State()
+    ai_base_url = State()
+    ai_token = State()
+    ai_model = State()
 
 
 class PlayerokPluginState(StatesGroup):
@@ -4650,11 +4702,12 @@ def main_keyboard(
         switch,
         account_switch,
         [("👤 Подробный профиль", "profile"), ("💰 Баланс", "balance")],
-        [("➕ Выставить лот", "fp_lot_create"), ("📤 Автовыдача", "delivery")],
-        [("🔔 Уведомления", "notifications"), ("🤖 Автоответчик", "autoreply")],
-        [("💬 Последние чаты", "chats"), ("📦 Заказ по ID", "order_lookup")],
-        [("🆙 Автоподнятие", "auto_raise"), ("⌨️ Команды", "command_replies")],
-        [("🧩 Плагины", "plugins"), ("⚙️ Аккаунт", "account")],
+        [("➕ Выставить лот", "fp_lot_create"), ("⚙️ Настройки AI", "fp_lot_ai_settings")],
+        [("📤 Автовыдача", "delivery"), ("🤖 Автоответчик", "autoreply")],
+        [("🔔 Уведомления", "notifications"), ("💬 Последние чаты", "chats")],
+        [("📦 Заказ по ID", "order_lookup"), ("🆙 Автоподнятие", "auto_raise")],
+        [("⌨️ Команды", "command_replies"), ("🧩 Плагины", "plugins")],
+        [("⚙️ Аккаунт", "account")],
     ])
 
 
@@ -4670,6 +4723,61 @@ def conversation_actions_keyboard(chat_id: int | str) -> InlineKeyboardMarkup:
 
 def bool_icon(value: bool) -> str:
     return "✅" if value else "❌"
+
+
+def call_custom_ai_translate(base_url: str, api_token: str, model_id: str, prompt: str) -> str:
+    """Выполняет перевод через указанную в настройках модель ИИ."""
+    url = (base_url or "").strip().rstrip("/")
+    if not url:
+        raise ValueError("Не указан Base URL")
+
+    # 1. Anthropic API
+    if "anthropic.com" in url:
+        endpoint = f"{url}/v1/messages" if not url.endswith("/v1/messages") else url
+        headers = {
+            "x-api-key": api_token,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+        payload = {
+            "model": model_id or "claude-3-5-haiku-20241022",
+            "max_tokens": 1500,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": f"Translate this Russian text for a gaming marketplace lot into fluent English. Return ONLY the translation, without quotes or additional text:\n\n{prompt}",
+                }
+            ],
+        }
+        req = urllib.request.Request(endpoint, data=json.dumps(payload).encode("utf-8"), headers=headers)
+        with urllib.request.urlopen(req, timeout=25) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return data["content"][0]["text"].strip()
+
+    # 2. OpenAI-совместимый API (Emerald, Groq, Together, OpenAI, OpenRouter, etc.)
+    endpoint = f"{url}/chat/completions" if not url.endswith("/chat/completions") else url
+    if not url.endswith("/chat/completions") and not url.endswith("/v1") and "/v1/" not in url:
+        endpoint = f"{url}/v1/chat/completions"
+
+    headers = {
+        "Authorization": f"Bearer {api_token}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": model_id or "gpt-4o-mini",
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are a professional translator for a gaming marketplace. Translate the user's text into clear, engaging English. Output ONLY the translated text, no quotes, no markdown wrappers, no commentary.",
+            },
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.3,
+    }
+    req = urllib.request.Request(endpoint, data=json.dumps(payload).encode("utf-8"), headers=headers)
+    with urllib.request.urlopen(req, timeout=25) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+        return data["choices"][0]["message"]["content"].strip()
 
 
 def translate_to_en(text: str) -> str:
@@ -6228,11 +6336,129 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
 
     # ------------------ Выставление лотов FunPay с автопереводом ------------------
 
+    async def translate_text_for_lot(user_id: int, text: str) -> str:
+        cleaned = str(text or "").strip()
+        if not cleaned:
+            return ""
+        if not re.search(r"[а-яёА-ЯЁ]", cleaned):
+            return cleaned
+
+        # Проверяем пользовательские настройки ИИ-переводчика
+        try:
+            ai_set = await db.get_lot_ai_settings(user_id)
+            base_url = (ai_set.get("api_base_url") or "").strip()
+            token_enc = ai_set.get("api_token_enc")
+            model_id = (ai_set.get("model_id") or "").strip()
+
+            if base_url and token_enc:
+                token = secrets.decrypt(token_enc)
+                if token:
+                    res = await asyncio.to_thread(
+                        call_custom_ai_translate,
+                        base_url,
+                        token,
+                        model_id,
+                        cleaned,
+                    )
+                    if res and len(res.strip()) > 0:
+                        return res.strip()
+        except Exception as exc:
+            logger.warning("Ошибка перевода через кастомную модель ИИ: %s", exc)
+
+        # Fallback на системный быстрый перевод
+        return await asyncio.to_thread(translate_to_en, cleaned)
+
+    async def show_funpay_lot_ai_settings(target: Message, user_id: int) -> None:
+        settings = await db.get_lot_ai_settings(user_id)
+        base_url = settings.get("api_base_url") or "не задан (по умолчанию Google Translate)"
+        has_token = bool(settings.get("api_token_enc"))
+        model_id = settings.get("model_id") or "авто (gpt-4o-mini / haiku)"
+
+        text = (
+            "🤖 <b>Настройки ИИ-переводчика для лотов FunPay</b>\n\n"
+            f"🌐 <b>Base URL:</b> <code>{html.escape(str(base_url))}</code>\n"
+            f"🔑 <b>API-токен:</b> <code>{'••••••••' if has_token else 'не задан'}</code>\n"
+            f"🧠 <b>ID модели:</b> <code>{html.escape(str(model_id))}</code>\n\n"
+            "<i>Поддерживаются как OpenAI-совместимые API (Emerald, Groq, Together, OpenRouter), так и официальный Anthropic. "
+            "Если параметры не заданы, используется автоматический Google Translate.</i>"
+        )
+        markup = keyboard([
+            [("🌐 Изменить Base URL", "fp_lot_ai_set:base")],
+            [("🔑 Изменить API-токен", "fp_lot_ai_set:token")],
+            [("🧠 Изменить ID модели", "fp_lot_ai_set:model")],
+            [("➕ Выставить лот", "fp_lot_create"), ("⬅️ Меню", "menu")],
+        ])
+        await target.answer(text, reply_markup=markup)
+
+    @router.callback_query(F.data == "fp_lot_ai_settings")
+    async def funpay_lot_ai_settings_menu(callback: CallbackQuery, state: FSMContext) -> None:
+        await callback.answer()
+        await state.clear()
+        await show_funpay_lot_ai_settings(callback.message, callback.from_user.id)
+
+    @router.callback_query(F.data.startswith("fp_lot_ai_set:"))
+    async def funpay_lot_ai_setting_pick(callback: CallbackQuery, state: FSMContext) -> None:
+        key = callback.data.split(":", 1)[1]
+        await callback.answer()
+        if key == "base":
+            await state.set_state(FunPayLotCreateState.ai_base_url)
+            await callback.message.answer(
+                "🌐 <b>Введите Base URL API:</b>\n\n"
+                "Например:\n"
+                "• <code>https://api.openai.com/v1</code>\n"
+                "• <code>https://api.anthropic.com</code>\n"
+                "• <code>https://emeraldai.beer/v1</code>"
+            )
+        elif key == "token":
+            await state.set_state(FunPayLotCreateState.ai_token)
+            await callback.message.answer(
+                "🔑 <b>Введите API-токен:</b>\n"
+                "<i>(Токен будет сохранён в зашифрованном виде)</i>"
+            )
+        elif key == "model":
+            await state.set_state(FunPayLotCreateState.ai_model)
+            await callback.message.answer(
+                "🧠 <b>Введите ID модели:</b>\n\n"
+                "Например: <code>gpt-4o-mini</code>, <code>claude-3-5-haiku-20241022</code>, <code>meta-llama/llama-3.3-70b-instruct</code>"
+            )
+
+    @router.message(FunPayLotCreateState.ai_base_url, F.text)
+    async def funpay_lot_ai_base_url_save(message: Message, state: FSMContext) -> None:
+        val = message.text.strip()
+        await db.set_lot_ai_setting(message.from_user.id, "api_base_url", val)
+        await state.clear()
+        await message.answer("✅ Base URL успешно сохранён!")
+        await show_funpay_lot_ai_settings(message, message.from_user.id)
+
+    @router.message(FunPayLotCreateState.ai_token, F.text)
+    async def funpay_lot_ai_token_save(message: Message, state: FSMContext) -> None:
+        val = message.text.strip()
+        enc = secrets.encrypt(val)
+        await db.set_lot_ai_setting(message.from_user.id, "api_token_enc", enc)
+        await state.clear()
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        await message.answer("✅ API-токен успешно зашифрован и сохранён!")
+        await show_funpay_lot_ai_settings(message, message.from_user.id)
+
+    @router.message(FunPayLotCreateState.ai_model, F.text)
+    async def funpay_lot_ai_model_save(message: Message, state: FSMContext) -> None:
+        val = message.text.strip()
+        await db.set_lot_ai_setting(message.from_user.id, "model_id", val)
+        await state.clear()
+        await message.answer("✅ ID модели успешно сохранён!")
+        await show_funpay_lot_ai_settings(message, message.from_user.id)
+
     def parse_funpay_lot_edit_form(html_str: str) -> dict:
         soup = BeautifulSoup(html_str, "lxml")
-        form = soup.find("form", class_="form-offer-editor")
-        if not form:
-            return {"has_amount": True, "params": []}
+        form = soup.find("form", class_="form-offer-editor") or soup.find("div", class_="lot-fields")
+        has_amount = True
+        if soup.find("input", {"name": "amount"}):
+            has_amount = True
+        elif soup.find("div", class_="lot-fields") and not soup.find("input", {"name": "amount"}):
+            has_amount = False
 
         standard_names = {
             "csrf_token", "offer_id", "node_id", "deleted", "active",
@@ -6240,66 +6466,128 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
             "fields[summary][ru]", "fields[summary][en]",
             "fields[desc][ru]", "fields[desc][en]",
             "fields[payment_msg][ru]", "fields[payment_msg][en]",
-            "fields[images]", "secrets", "query",
+            "fields[images]", "secrets", "query", "online", "auto", "desc",
         }
 
-        has_amount = form.find("input", {"name": "amount"}) is not None
-
         params = []
-        for g in form.find_all("div", class_="form-group"):
+
+        # 1. Поиск по lot-fields (специфичные поля категорий: номинал, способ, регион и т.д.)
+        lot_fields_div = soup.find("div", class_="lot-fields")
+        seen_names = set()
+
+        if lot_fields_div:
+            for g in lot_fields_div.find_all("div", class_="form-group"):
+                fid = g.get("data-id") or ""
+                lbl = g.find("label")
+                label_text = lbl.text.strip() if lbl else ""
+                target_name = f"fields[{fid}]" if fid else ""
+
+                # Кнопки radio-box (например, номинал токенов / подписка)
+                rbox = g.find("div", class_="lot-field-radio-box") or g.find("div", class_="btn-group")
+                if rbox:
+                    options = []
+                    for b in rbox.find_all("button"):
+                        val = b.get("value", "").strip()
+                        txt = b.text.strip()
+                        if not val or val.lower() == "все":
+                            continue
+                        options.append({"value": val, "label": txt or val})
+                    if options:
+                        inferred_label = label_text or (
+                            "Номинал / Количество"
+                            if any("кк" in o["value"].lower() or "токен" in o["value"].lower() for o in options)
+                            else ("Тип предложения" if any("подписк" in o["value"].lower() for o in options) else (fid.title() if fid else "Параметр"))
+                        )
+                        final_name = target_name or f"fields[{fid or 'quantity'}]"
+                        seen_names.add(final_name)
+                        params.append({
+                            "name": final_name,
+                            "label": inferred_label,
+                            "options": options,
+                            "selected": options[0]["value"],
+                        })
+                        continue
+
+                # Выпадающие списки (select)
+                sel = g.find("select")
+                if sel:
+                    s_name = sel.get("name") or ""
+                    if s_name.startswith("f-"):
+                        s_name = f"fields[{s_name[2:]}]"
+                    elif not s_name.startswith("fields[") and fid:
+                        s_name = f"fields[{fid}]"
+
+                    options = []
+                    placeholder = ""
+                    for opt in sel.find_all("option"):
+                        v = opt.get("value", "").strip()
+                        t = opt.text.strip()
+                        if not v:
+                            placeholder = t
+                            continue
+                        options.append({"value": v, "label": t or v})
+                    if options:
+                        final_name = s_name or target_name
+                        seen_names.add(final_name)
+                        params.append({
+                            "name": final_name,
+                            "label": label_text or placeholder or (fid.title() if fid else "Параметр"),
+                            "options": options,
+                            "selected": options[0]["value"],
+                        })
+                    continue
+
+        # 2. Дополнительный обход form-group, если не всё было в lot-fields
+        search_root = form if form else soup
+        for g in search_root.find_all("div", class_="form-group"):
             if "hidden" in g.get("class", []):
                 continue
-
             lbl = g.find("label", class_="control-label") or g.find("label")
             label_text = lbl.text.strip() if lbl else ""
 
             sel = g.find("select")
-            if sel and sel.get("name") and sel.get("name") not in standard_names:
-                name = sel.get("name")
-                options = []
-                selected_val = None
-                for opt in sel.find_all("option"):
-                    v = opt.get("value", "")
-                    t = opt.text.strip()
-                    if not v and not t:
-                        continue
-                    if opt.has_attr("selected"):
-                        selected_val = v
-                    options.append({"value": v, "label": t})
-                if options:
-                    non_empty = [o for o in options if o["value"]]
-                    valid_options = non_empty if non_empty else options
-                    if selected_val is None or selected_val == "":
-                        selected_val = valid_options[0]["value"]
-                    params.append({
-                        "name": name,
-                        "label": label_text or name,
-                        "options": valid_options,
-                        "selected": selected_val,
-                    })
+            if sel:
+                raw_name = sel.get("name") or ""
+                clean_name = f"fields[{raw_name[2:]}]" if raw_name.startswith("f-") else raw_name
+                if clean_name and clean_name not in standard_names and clean_name not in seen_names:
+                    seen_names.add(clean_name)
+                    options = []
+                    placeholder = ""
+                    for opt in sel.find_all("option"):
+                        v = opt.get("value", "").strip()
+                        t = opt.text.strip()
+                        if not v:
+                            placeholder = t
+                            continue
+                        options.append({"value": v, "label": t or v})
+                    if options:
+                        params.append({
+                            "name": clean_name,
+                            "label": label_text or placeholder or clean_name,
+                            "options": options,
+                            "selected": options[0]["value"],
+                        })
                 continue
 
             radios = g.find_all("input", {"type": "radio"})
             if radios:
-                name = radios[0].get("name")
-                if name and name not in standard_names:
+                raw_name = radios[0].get("name") or ""
+                clean_name = f"fields[{raw_name[2:]}]" if raw_name.startswith("f-") else raw_name
+                if clean_name and clean_name not in standard_names and clean_name not in seen_names:
+                    seen_names.add(clean_name)
                     options = []
-                    selected_val = None
                     for r in radios:
-                        v = r.get("value", "")
+                        v = r.get("value", "").strip()
                         r_lbl = r.find_parent("label") or r.find_next_sibling("span") or r.find_next_sibling(text=True)
                         t = (r_lbl.text if hasattr(r_lbl, "text") else str(r_lbl)).strip() if r_lbl else v
-                        if r.has_attr("checked"):
-                            selected_val = v
-                        options.append({"value": v, "label": t})
+                        if v:
+                            options.append({"value": v, "label": t or v})
                     if options:
-                        if selected_val is None:
-                            selected_val = options[0]["value"]
                         params.append({
-                            "name": name,
-                            "label": label_text or name,
+                            "name": clean_name,
+                            "label": label_text or clean_name,
                             "options": options,
-                            "selected": selected_val,
+                            "selected": options[0]["value"],
                         })
 
         return {"has_amount": has_amount, "params": params}
@@ -6467,7 +6755,7 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
             f"⏳ <i>Загружаю форму для раздела «{html.escape(sub_name)}»…</i>"
         )
 
-        # Парсим форму offerEdit для данной подкатегории
+        # Парсим форму offerEdit для данной подкатегории, а также публичную страницу подкатегории
         has_amount = True
         params = []
         try:
@@ -6484,6 +6772,24 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
             params = parsed.get("params", [])
         except Exception as exc:
             logger.warning("Не удалось спарсить форму FunPay offerEdit: %s", exc)
+
+        # Если в offerEdit параметры не нашлись или их мало, пробуем публичную страницу раздела lots/{sub_id}/
+        if not params:
+            try:
+                resp_pub = await asyncio.to_thread(
+                    runtime.account.method,
+                    "get",
+                    f"lots/{sub_id}/",
+                    {},
+                    {},
+                    raise_not_200=True,
+                )
+                parsed_pub = parse_funpay_lot_edit_form(resp_pub.content.decode("utf-8", errors="ignore"))
+                if parsed_pub.get("params"):
+                    params = parsed_pub["params"]
+                    has_amount = parsed_pub.get("has_amount", has_amount)
+            except Exception as exc:
+                logger.warning("Не удалось спарсить публичную страницу FunPay lots/%s: %s", sub_id, exc)
 
         try:
             await loading_msg.delete()
@@ -6616,8 +6922,8 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
         title_ru = data.get("fp_title_ru", "")
         desc_ru = data.get("fp_desc_ru", "")
 
-        title_en = await asyncio.to_thread(translate_to_en, title_ru)
-        desc_en = await asyncio.to_thread(translate_to_en, desc_ru)
+        title_en = await translate_text_for_lot(message.from_user.id, title_ru)
+        desc_en = await translate_text_for_lot(message.from_user.id, desc_ru)
 
         await state.update_data(fp_title_en=title_en, fp_desc_en=desc_en)
         try:
