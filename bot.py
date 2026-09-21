@@ -4513,6 +4513,7 @@ class PlayerokItemCreateState(StatesGroup):
 
 class FunPayLotCreateState(StatesGroup):
     game_search = State()
+    param_pick = State()
     title_ru = State()
     desc_ru = State()
     price = State()
@@ -4672,27 +4673,36 @@ def bool_icon(value: bool) -> str:
 
 
 def translate_to_en(text: str) -> str:
-    """Автоперевод текста на английский язык с fallback."""
+    """Автоперевод текста на английский язык с несколькими надёжными источниками."""
     cleaned = str(text or "").strip()
     if not cleaned:
         return ""
     # Если текст уже полностью латинский или не содержит кириллицы
     if not re.search(r"[а-яёА-ЯЁ]", cleaned):
         return cleaned
+
+    # 1. Google Translate clients5 (dict-chrome-ex) - быстрый и надёжный перевод
     try:
         url = (
-            "https://api.mymemory.translated.net/get?q="
-            + quote(cleaned[:500])
-            + "&langpair=ru|en"
+            "https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl=auto&tl=en&q="
+            + quote(cleaned)
         )
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+        )
         with urllib.request.urlopen(req, timeout=8) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-            res = data.get("responseData", {}).get("translatedText")
-            if res and isinstance(res, str) and not res.startswith("MYMEMORY WARNING"):
-                return res.strip()
+            if isinstance(data, list) and data and isinstance(data[0], list):
+                res = data[0][0]
+                if res and isinstance(res, str):
+                    return res.strip()
+            elif isinstance(data, str) and data:
+                return data.strip()
     except Exception:
         pass
+
+    # 2. Google Translate single gtx
     try:
         url = (
             "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=en&dt=t&q="
@@ -4707,6 +4717,30 @@ def translate_to_en(text: str) -> str:
                     return res.strip()
     except Exception:
         pass
+
+    # 3. MyMemory fallback (с разбивкой на части при длинном тексте)
+    try:
+        chunks = [cleaned[i:i + 450] for i in range(0, len(cleaned), 450)]
+        trans_chunks = []
+        for ch in chunks:
+            url = (
+                "https://api.mymemory.translated.net/get?q="
+                + quote(ch)
+                + "&langpair=ru|en"
+            )
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                res = data.get("responseData", {}).get("translatedText")
+                if res and isinstance(res, str) and not res.startswith("MYMEMORY WARNING"):
+                    trans_chunks.append(res.strip())
+                else:
+                    trans_chunks.append(ch)
+        if trans_chunks:
+            return " ".join(trans_chunks)
+    except Exception:
+        pass
+
     return cleaned
 
 
@@ -6194,6 +6228,110 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
 
     # ------------------ Выставление лотов FunPay с автопереводом ------------------
 
+    def parse_funpay_lot_edit_form(html_str: str) -> dict:
+        soup = BeautifulSoup(html_str, "lxml")
+        form = soup.find("form", class_="form-offer-editor")
+        if not form:
+            return {"has_amount": True, "params": []}
+
+        standard_names = {
+            "csrf_token", "offer_id", "node_id", "deleted", "active",
+            "deactivate_after_sale", "auto_delivery", "price", "amount",
+            "fields[summary][ru]", "fields[summary][en]",
+            "fields[desc][ru]", "fields[desc][en]",
+            "fields[payment_msg][ru]", "fields[payment_msg][en]",
+            "fields[images]", "secrets", "query",
+        }
+
+        has_amount = form.find("input", {"name": "amount"}) is not None
+
+        params = []
+        for g in form.find_all("div", class_="form-group"):
+            if "hidden" in g.get("class", []):
+                continue
+
+            lbl = g.find("label", class_="control-label") or g.find("label")
+            label_text = lbl.text.strip() if lbl else ""
+
+            sel = g.find("select")
+            if sel and sel.get("name") and sel.get("name") not in standard_names:
+                name = sel.get("name")
+                options = []
+                selected_val = None
+                for opt in sel.find_all("option"):
+                    v = opt.get("value", "")
+                    t = opt.text.strip()
+                    if not v and not t:
+                        continue
+                    if opt.has_attr("selected"):
+                        selected_val = v
+                    options.append({"value": v, "label": t})
+                if options:
+                    non_empty = [o for o in options if o["value"]]
+                    valid_options = non_empty if non_empty else options
+                    if selected_val is None or selected_val == "":
+                        selected_val = valid_options[0]["value"]
+                    params.append({
+                        "name": name,
+                        "label": label_text or name,
+                        "options": valid_options,
+                        "selected": selected_val,
+                    })
+                continue
+
+            radios = g.find_all("input", {"type": "radio"})
+            if radios:
+                name = radios[0].get("name")
+                if name and name not in standard_names:
+                    options = []
+                    selected_val = None
+                    for r in radios:
+                        v = r.get("value", "")
+                        r_lbl = r.find_parent("label") or r.find_next_sibling("span") or r.find_next_sibling(text=True)
+                        t = (r_lbl.text if hasattr(r_lbl, "text") else str(r_lbl)).strip() if r_lbl else v
+                        if r.has_attr("checked"):
+                            selected_val = v
+                        options.append({"value": v, "label": t})
+                    if options:
+                        if selected_val is None:
+                            selected_val = options[0]["value"]
+                        params.append({
+                            "name": name,
+                            "label": label_text or name,
+                            "options": options,
+                            "selected": selected_val,
+                        })
+
+        return {"has_amount": has_amount, "params": params}
+
+    async def ask_next_funpay_param(target: Message, state: FSMContext) -> None:
+        data = await state.get_data()
+        params = data.get("fp_params", [])
+        idx = int(data.get("fp_param_index", 0))
+
+        if idx >= len(params):
+            await state.set_state(FunPayLotCreateState.title_ru)
+            sub_name = data.get("fp_subcat_name", "")
+            await target.answer(
+                f"Раздел: <b>{html.escape(sub_name)}</b>\n\n"
+                "✍️ <b>Краткое описание (название) лота на русском:</b>\n"
+                "<i>(Оно автоматически переведётся на английский язык)</i>"
+            )
+            return
+
+        param = params[idx]
+        await state.set_state(FunPayLotCreateState.param_pick)
+        rows = []
+        for opt in param.get("options", []):
+            rows.append([(clipped(opt["label"], 40), f"fp_new_pval:{idx}:{opt['value']}")])
+        rows.append([("❌ Отмена", "menu")])
+
+        await target.answer(
+            f"⚙️ <b>Выберите параметр ({idx + 1}/{len(params)}):</b>\n\n"
+            f"<b>{html.escape(param.get('label', 'Параметр'))}</b>",
+            reply_markup=keyboard(rows),
+        )
+
     async def show_funpay_lot_preview(target: Message, state: FSMContext) -> None:
         data = await state.get_data()
         title_ru = data.get("fp_title_ru", "")
@@ -6201,20 +6339,29 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
         desc_ru = data.get("fp_desc_ru", "")
         desc_en = data.get("fp_desc_en", "")
         price = data.get("fp_price", 0.0)
+        has_amount = data.get("fp_has_amount", True)
         amount = data.get("fp_amount", 1)
         cat_name = data.get("fp_cat_name", "")
         subcat_name = data.get("fp_subcat_name", "")
+        chosen_params = data.get("fp_chosen_params_labels", {})
+
+        params_info = ""
+        if chosen_params:
+            params_info = "\n".join(f"• <b>{html.escape(k)}:</b> {html.escape(v)}" for k, v in chosen_params.items()) + "\n\n"
+
+        amount_str = f" | Наличие: <b>{amount} шт.</b>" if has_amount and amount is not None else ""
 
         preview_text = (
             "📋 <b>Предпросмотр нового лота FunPay</b>\n\n"
             f"🎮 Игра/раздел: <b>{html.escape(cat_name)}</b> · <b>{html.escape(subcat_name)}</b>\n"
-            f"💰 Цена: <b>{price}</b> | Наличие: <b>{amount} шт.</b>\n\n"
+            f"{params_info}"
+            f"💰 Цена: <b>{price}</b>{amount_str}\n\n"
             "🇷🇺 <b>Русская версия:</b>\n"
             f"<b>Краткое описание:</b> {html.escape(title_ru)}\n"
-            f"<b>Подробное описание:</b>\n{html.escape(desc_ru[:300])}{'...' if len(desc_ru) > 300 else ''}\n\n"
+            f"<b>Подробное описание:</b>\n{html.escape(desc_ru[:400])}{'...' if len(desc_ru) > 400 else ''}\n\n"
             "🇬🇧 <b>Английская версия (автоперевод):</b>\n"
             f"<b>Title:</b> {html.escape(title_en)}\n"
-            f"<b>Description:</b>\n{html.escape(desc_en[:300])}{'...' if len(desc_en) > 300 else ''}\n"
+            f"<b>Description:</b>\n{html.escape(desc_en[:400])}{'...' if len(desc_en) > 400 else ''}\n"
         )
         markup = keyboard([
             [("🚀 Опубликовать лот", "fp_new_publish")],
@@ -6314,14 +6461,88 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
         sub_id = int(sub_id_raw)
         subcat = runtime.account.get_subcategory(types.SubCategoryTypes.COMMON, sub_id)
         sub_name = str(subcat.name if subcat else f"Раздел {sub_id}")
-        await callback.answer()
-        await state.update_data(fp_subcat_id=sub_id, fp_subcat_name=sub_name)
-        await state.set_state(FunPayLotCreateState.title_ru)
-        await callback.message.answer(
-            f"Выбран раздел: <b>{html.escape(sub_name)}</b>\n\n"
-            "✍️ <b>Шаг 1 из 5: Краткое описание (название) лота на русском:</b>\n"
-            "<i>(Оно автоматически переведётся на английский язык)</i>"
+        await callback.answer("Загружаю форму раздела…")
+
+        loading_msg = await callback.message.answer(
+            f"⏳ <i>Загружаю форму для раздела «{html.escape(sub_name)}»…</i>"
         )
+
+        # Парсим форму offerEdit для данной подкатегории
+        has_amount = True
+        params = []
+        try:
+            resp = await asyncio.to_thread(
+                runtime.account.method,
+                "get",
+                f"lots/offerEdit?node={sub_id}",
+                {},
+                {},
+                raise_not_200=True,
+            )
+            parsed = parse_funpay_lot_edit_form(resp.content.decode("utf-8", errors="ignore"))
+            has_amount = parsed.get("has_amount", True)
+            params = parsed.get("params", [])
+        except Exception as exc:
+            logger.warning("Не удалось спарсить форму FunPay offerEdit: %s", exc)
+
+        try:
+            await loading_msg.delete()
+        except Exception:
+            pass
+
+        await state.update_data(
+            fp_subcat_id=sub_id,
+            fp_subcat_name=sub_name,
+            fp_has_amount=has_amount,
+            fp_params=params,
+            fp_param_index=0,
+            fp_chosen_params={},
+            fp_chosen_params_labels={},
+        )
+
+        if params:
+            await ask_next_funpay_param(callback.message, state)
+        else:
+            await state.set_state(FunPayLotCreateState.title_ru)
+            await callback.message.answer(
+                f"Выбран раздел: <b>{html.escape(sub_name)}</b>\n\n"
+                "✍️ <b>Краткое описание (название) лота на русском:</b>\n"
+                "<i>(Оно автоматически переведётся на английский язык)</i>"
+            )
+
+    @router.callback_query(F.data.startswith("fp_new_pval:"))
+    async def funpay_lot_param_picked(callback: CallbackQuery, state: FSMContext) -> None:
+        parts = callback.data.split(":", 2)
+        idx = int(parts[1])
+        chosen_val = parts[2]
+        data = await state.get_data()
+        params = data.get("fp_params", [])
+
+        if idx >= len(params):
+            await callback.answer()
+            await ask_next_funpay_param(callback.message, state)
+            return
+
+        param = params[idx]
+        chosen_label = chosen_val
+        for opt in param.get("options", []):
+            if opt["value"] == chosen_val:
+                chosen_label = opt["label"]
+                break
+
+        chosen_params = dict(data.get("fp_chosen_params", {}))
+        chosen_params[param["name"]] = chosen_val
+
+        chosen_labels = dict(data.get("fp_chosen_params_labels", {}))
+        chosen_labels[param.get("label", param["name"])] = chosen_label
+
+        await callback.answer(f"Выбрано: {chosen_label}")
+        await state.update_data(
+            fp_param_index=idx + 1,
+            fp_chosen_params=chosen_params,
+            fp_chosen_params_labels=chosen_labels,
+        )
+        await ask_next_funpay_param(callback.message, state)
 
     @router.message(FunPayLotCreateState.title_ru, F.text)
     async def funpay_lot_title_ru_handler(message: Message, state: FSMContext) -> None:
@@ -6332,7 +6553,7 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
         await state.update_data(fp_title_ru=val)
         await state.set_state(FunPayLotCreateState.desc_ru)
         await message.answer(
-            "📝 <b>Шаг 2 из 5: Полное описание лота:</b>\n"
+            "📝 <b>Шаг 2: Полное описание лота:</b>\n"
             "<i>(Расскажите подробно о товаре, условиях, гарантиях. Оно также переведётся)</i>"
         )
 
@@ -6344,7 +6565,7 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
             return
         await state.update_data(fp_desc_ru=val)
         await state.set_state(FunPayLotCreateState.price)
-        await message.answer("💰 <b>Шаг 3 из 5: Цена за единицу:</b>\n<i>(Например: 150 или 49.90)</i>")
+        await message.answer("💰 <b>Шаг 3: Цена за единицу:</b>\n<i>(Например: 150 или 49.90)</i>")
 
     @router.message(FunPayLotCreateState.price, F.text)
     async def funpay_lot_price_handler(message: Message, state: FSMContext) -> None:
@@ -6357,8 +6578,19 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
             await message.answer("Введите положительное число цены (например: 150 или 99.5).")
             return
         await state.update_data(fp_price=price_val)
-        await state.set_state(FunPayLotCreateState.amount)
-        await message.answer("📦 <b>Шаг 4 из 5: Количество товара в наличии:</b>\n<i>(Например: 1 или 10)</i>")
+        data = await state.get_data()
+        has_amount = data.get("fp_has_amount", True)
+
+        if has_amount:
+            await state.set_state(FunPayLotCreateState.amount)
+            await message.answer("📦 <b>Шаг 4: Количество товара в наличии:</b>\n<i>(Например: 1 или 10)</i>")
+        else:
+            await state.update_data(fp_amount=None)
+            await state.set_state(FunPayLotCreateState.payment_msg)
+            await message.answer(
+                "✉️ <b>Шаг 4: Сообщение покупателю после оплаты (опционально):</b>\n"
+                "<i>(Отправьте текст сообщения или напишите <b>-</b> или <b>пропустить</b>, чтобы оставить пустым)</i>"
+            )
 
     @router.message(FunPayLotCreateState.amount, F.text)
     async def funpay_lot_amount_handler(message: Message, state: FSMContext) -> None:
@@ -6369,7 +6601,7 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
         await state.update_data(fp_amount=int(raw))
         await state.set_state(FunPayLotCreateState.payment_msg)
         await message.answer(
-            "✉️ <b>Шаг 5 из 5: Сообщение покупателю после оплаты (опционально):</b>\n"
+            "✉️ <b>Шаг 5: Сообщение покупателю после оплаты (опционально):</b>\n"
             "<i>(Отправьте текст сообщения или напишите <b>-</b> или <b>пропустить</b>, чтобы оставить пустым)</i>"
         )
 
@@ -6444,8 +6676,14 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
             lot_fields.payment_msg_ru = data.get("fp_payment_msg", "")
             lot_fields.payment_msg_en = data.get("fp_payment_msg", "")
             lot_fields.price = float(data.get("fp_price", 1.0))
-            lot_fields.amount = int(data.get("fp_amount", 1))
+            if data.get("fp_amount") is not None:
+                lot_fields.amount = int(data.get("fp_amount"))
             lot_fields.active = True
+
+            # Применяем выбранные параметры категории (способ передачи, регион, тип и т.д.)
+            chosen_params = data.get("fp_chosen_params", {})
+            if chosen_params:
+                lot_fields.edit_fields(chosen_params)
 
             await asyncio.to_thread(runtime.account.save_lot, lot_fields)
         except Exception as exc:

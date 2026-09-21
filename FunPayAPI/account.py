@@ -1795,11 +1795,12 @@ class Account:
         result.update(
             {field["name"]: field.get("value") or "" for field in bs.find_all("input")})
         result.update({field["name"]: field.text or "" for field in bs.find_all("textarea")})
-        result.update({
-            field["name"]: field.find("option", selected=True)["value"]
-            for field in bs.find_all("select") if
-            "hidden" not in field.find_parent(class_="form-group").get("class", [])
-        })
+        for field in bs.find_all("select"):
+            parent = field.find_parent(class_="form-group")
+            if parent and "hidden" in parent.get("class", []):
+                continue
+            opt = field.find("option", selected=True) or field.find("option")
+            result[field["name"]] = opt["value"] if opt else ""
         result.update({field["name"]: "on" for field in bs.find_all("input", {"type": "checkbox"}, checked=True)})
         subcategory = self.get_subcategory(enums.SubCategoryTypes.COMMON, int(result.get("node_id", 0)))
         self.csrf_token = result.get("csrf_token") or self.csrf_token
