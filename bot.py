@@ -4511,6 +4511,17 @@ class PlayerokItemCreateState(StatesGroup):
     field_value = State()
 
 
+class FunPayLotCreateState(StatesGroup):
+    game_search = State()
+    title_ru = State()
+    desc_ru = State()
+    price = State()
+    amount = State()
+    payment_msg = State()
+    title_en_edit = State()
+    desc_en_edit = State()
+
+
 class PlayerokPluginState(StatesGroup):
     file = State()
     setting_value = State()
@@ -4638,11 +4649,11 @@ def main_keyboard(
         switch,
         account_switch,
         [("👤 Подробный профиль", "profile"), ("💰 Баланс", "balance")],
+        [("➕ Выставить лот", "fp_lot_create"), ("📤 Автовыдача", "delivery")],
         [("🔔 Уведомления", "notifications"), ("🤖 Автоответчик", "autoreply")],
         [("💬 Последние чаты", "chats"), ("📦 Заказ по ID", "order_lookup")],
-        [("📤 Автовыдача", "delivery"), ("⌨️ Команды", "command_replies")],
-        [("🆙 Автоподнятие", "auto_raise"), ("🧩 Плагины", "plugins")],
-        [("⚙️ Аккаунт", "account")],
+        [("🆙 Автоподнятие", "auto_raise"), ("⌨️ Команды", "command_replies")],
+        [("🧩 Плагины", "plugins"), ("⚙️ Аккаунт", "account")],
     ])
 
 
@@ -4658,6 +4669,45 @@ def conversation_actions_keyboard(chat_id: int | str) -> InlineKeyboardMarkup:
 
 def bool_icon(value: bool) -> str:
     return "✅" if value else "❌"
+
+
+def translate_to_en(text: str) -> str:
+    """Автоперевод текста на английский язык с fallback."""
+    cleaned = str(text or "").strip()
+    if not cleaned:
+        return ""
+    # Если текст уже полностью латинский или не содержит кириллицы
+    if not re.search(r"[а-яёА-ЯЁ]", cleaned):
+        return cleaned
+    try:
+        url = (
+            "https://api.mymemory.translated.net/get?q="
+            + quote(cleaned[:500])
+            + "&langpair=ru|en"
+        )
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            res = data.get("responseData", {}).get("translatedText")
+            if res and isinstance(res, str) and not res.startswith("MYMEMORY WARNING"):
+                return res.strip()
+    except Exception:
+        pass
+    try:
+        url = (
+            "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=en&dt=t&q="
+            + quote(cleaned[:500])
+        )
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            if isinstance(data, list) and data and isinstance(data[0], list):
+                res = "".join(part[0] for part in data[0] if part and len(part) > 0)
+                if res:
+                    return res.strip()
+    except Exception:
+        pass
+    return cleaned
 
 
 def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> Router:
@@ -6141,6 +6191,284 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
             f"ID: <code>{html.escape(str(item.id))}</code>",
             reply_markup=keyboard([[("📢 Объявления", "po_items"), ("➕ Создать ещё", "po_item_create")]]),
         )
+
+    # ------------------ Выставление лотов FunPay с автопереводом ------------------
+
+    async def show_funpay_lot_preview(target: Message, state: FSMContext) -> None:
+        data = await state.get_data()
+        title_ru = data.get("fp_title_ru", "")
+        title_en = data.get("fp_title_en", "")
+        desc_ru = data.get("fp_desc_ru", "")
+        desc_en = data.get("fp_desc_en", "")
+        price = data.get("fp_price", 0.0)
+        amount = data.get("fp_amount", 1)
+        cat_name = data.get("fp_cat_name", "")
+        subcat_name = data.get("fp_subcat_name", "")
+
+        preview_text = (
+            "📋 <b>Предпросмотр нового лота FunPay</b>\n\n"
+            f"🎮 Игра/раздел: <b>{html.escape(cat_name)}</b> · <b>{html.escape(subcat_name)}</b>\n"
+            f"💰 Цена: <b>{price}</b> | Наличие: <b>{amount} шт.</b>\n\n"
+            "🇷🇺 <b>Русская версия:</b>\n"
+            f"<b>Краткое описание:</b> {html.escape(title_ru)}\n"
+            f"<b>Подробное описание:</b>\n{html.escape(desc_ru[:300])}{'...' if len(desc_ru) > 300 else ''}\n\n"
+            "🇬🇧 <b>Английская версия (автоперевод):</b>\n"
+            f"<b>Title:</b> {html.escape(title_en)}\n"
+            f"<b>Description:</b>\n{html.escape(desc_en[:300])}{'...' if len(desc_en) > 300 else ''}\n"
+        )
+        markup = keyboard([
+            [("🚀 Опубликовать лот", "fp_new_publish")],
+            [("✏️ Изменить Title (EN)", "fp_new_edit_title_en"), ("✏️ Изменить Desc (EN)", "fp_new_edit_desc_en")],
+            [("❌ Отмена", "menu")],
+        ])
+        await target.answer(preview_text, reply_markup=markup)
+
+    @router.callback_query(F.data == "fp_lot_create")
+    async def funpay_lot_create_start(callback: CallbackQuery, state: FSMContext) -> None:
+        await callback.answer()
+        runtime = await require_runtime(callback.message, callback.from_user.id)
+        if not runtime:
+            return
+        await state.clear()
+        await state.set_state(FunPayLotCreateState.game_search)
+        await callback.message.answer(
+            "➕ <b>Создание нового лота FunPay</b>\n\n"
+            "Введите название игры или категории для поиска (например: <code>Brawl Stars</code>, <code>Steam</code>, <code>Telegram</code>):"
+        )
+
+    @router.message(FunPayLotCreateState.game_search, F.text)
+    async def funpay_lot_game_search(message: Message, state: FSMContext) -> None:
+        query = message.text.strip().casefold()
+        if len(query) < 2:
+            await message.answer("Введите минимум 2 символа для поиска.")
+            return
+        runtime = await require_runtime(message, message.from_user.id)
+        if not runtime:
+            await state.clear()
+            return
+
+        categories = getattr(runtime.account, "categories", []) or []
+        matches = [cat for cat in categories if query in str(getattr(cat, "name", "")).casefold()]
+
+        if not matches:
+            await message.answer("❌ Игра не найдена. Попробуйте написать по-другому (например, на русском или английском):")
+            return
+
+        rows = []
+        for cat in matches[:25]:
+            rows.append([(clipped(str(cat.name), 42), f"fp_new_cat:{cat.id}")])
+        rows.append([("❌ Отмена", "menu")])
+
+        await message.answer(
+            "🎮 <b>Выберите игру / категорию:</b>",
+            reply_markup=keyboard(rows),
+        )
+
+    @router.callback_query(F.data.startswith("fp_new_cat:"))
+    async def funpay_lot_cat_pick(callback: CallbackQuery, state: FSMContext) -> None:
+        cat_id_raw = callback.data.split(":", 1)[1]
+        runtime = await require_runtime(callback.message, callback.from_user.id)
+        if not runtime:
+            return
+        cat_id = int(cat_id_raw)
+        category = runtime.account.get_category(cat_id)
+        if not category:
+            await callback.answer("Категория не найдена", show_alert=True)
+            return
+        await callback.answer()
+        subcategories = list(getattr(category, "subcategories", []) or [])
+        # Оставляем стандартные подкатегории лотов
+        common_subs = [s for s in subcategories if getattr(s, "type", None) == types.SubCategoryTypes.COMMON]
+        target_subs = common_subs if common_subs else subcategories
+
+        if not target_subs:
+            await callback.answer("У категории нет доступных разделов для лотов", show_alert=True)
+            return
+
+        await state.update_data(fp_cat_id=cat_id, fp_cat_name=str(category.name))
+        rows = [
+            [(clipped(str(sub.name), 45), f"fp_new_sub:{sub.id}")]
+            for sub in target_subs[:30]
+        ]
+        rows.append([("❌ Отмена", "menu")])
+        await callback.message.answer(
+            f"📁 <b>{html.escape(str(category.name))}</b>\n\nВыберите нужный раздел/подкатегорию:",
+            reply_markup=keyboard(rows),
+        )
+
+    @router.callback_query(F.data.startswith("fp_new_sub:"))
+    async def funpay_lot_sub_pick(callback: CallbackQuery, state: FSMContext) -> None:
+        sub_id_raw = callback.data.split(":", 1)[1]
+        runtime = await require_runtime(callback.message, callback.from_user.id)
+        if not runtime:
+            return
+        sub_id = int(sub_id_raw)
+        subcat = runtime.account.get_subcategory(types.SubCategoryTypes.COMMON, sub_id)
+        sub_name = str(subcat.name if subcat else f"Раздел {sub_id}")
+        await callback.answer()
+        await state.update_data(fp_subcat_id=sub_id, fp_subcat_name=sub_name)
+        await state.set_state(FunPayLotCreateState.title_ru)
+        await callback.message.answer(
+            f"Выбран раздел: <b>{html.escape(sub_name)}</b>\n\n"
+            "✍️ <b>Шаг 1 из 5: Краткое описание (название) лота на русском:</b>\n"
+            "<i>(Оно автоматически переведётся на английский язык)</i>"
+        )
+
+    @router.message(FunPayLotCreateState.title_ru, F.text)
+    async def funpay_lot_title_ru_handler(message: Message, state: FSMContext) -> None:
+        val = message.text.strip()
+        if not 2 <= len(val) <= 120:
+            await message.answer("Краткое описание должно быть от 2 до 120 символов.")
+            return
+        await state.update_data(fp_title_ru=val)
+        await state.set_state(FunPayLotCreateState.desc_ru)
+        await message.answer(
+            "📝 <b>Шаг 2 из 5: Полное описание лота:</b>\n"
+            "<i>(Расскажите подробно о товаре, условиях, гарантиях. Оно также переведётся)</i>"
+        )
+
+    @router.message(FunPayLotCreateState.desc_ru, F.text)
+    async def funpay_lot_desc_ru_handler(message: Message, state: FSMContext) -> None:
+        val = message.text.strip()
+        if not 2 <= len(val) <= 2500:
+            await message.answer("Описание должно быть от 2 до 2500 символов.")
+            return
+        await state.update_data(fp_desc_ru=val)
+        await state.set_state(FunPayLotCreateState.price)
+        await message.answer("💰 <b>Шаг 3 из 5: Цена за единицу:</b>\n<i>(Например: 150 или 49.90)</i>")
+
+    @router.message(FunPayLotCreateState.price, F.text)
+    async def funpay_lot_price_handler(message: Message, state: FSMContext) -> None:
+        raw = message.text.replace(",", ".").strip()
+        try:
+            price_val = float(raw)
+            if price_val <= 0:
+                raise ValueError
+        except ValueError:
+            await message.answer("Введите положительное число цены (например: 150 или 99.5).")
+            return
+        await state.update_data(fp_price=price_val)
+        await state.set_state(FunPayLotCreateState.amount)
+        await message.answer("📦 <b>Шаг 4 из 5: Количество товара в наличии:</b>\n<i>(Например: 1 или 10)</i>")
+
+    @router.message(FunPayLotCreateState.amount, F.text)
+    async def funpay_lot_amount_handler(message: Message, state: FSMContext) -> None:
+        raw = message.text.strip()
+        if not raw.isdigit() or int(raw) < 1:
+            await message.answer("Введите целое положительное число наличия (например, 1).")
+            return
+        await state.update_data(fp_amount=int(raw))
+        await state.set_state(FunPayLotCreateState.payment_msg)
+        await message.answer(
+            "✉️ <b>Шаг 5 из 5: Сообщение покупателю после оплаты (опционально):</b>\n"
+            "<i>(Отправьте текст сообщения или напишите <b>-</b> или <b>пропустить</b>, чтобы оставить пустым)</i>"
+        )
+
+    @router.message(FunPayLotCreateState.payment_msg, F.text)
+    async def funpay_lot_payment_msg_handler(message: Message, state: FSMContext) -> None:
+        val = message.text.strip()
+        msg_val = "" if val.casefold() in {"-", "нет", "пропустить", "none", "skip"} else val
+        await state.update_data(fp_payment_msg=msg_val)
+
+        loading = await message.answer("⏳ <i>Перевожу название и описание на английский язык…</i>")
+        data = await state.get_data()
+        title_ru = data.get("fp_title_ru", "")
+        desc_ru = data.get("fp_desc_ru", "")
+
+        title_en = await asyncio.to_thread(translate_to_en, title_ru)
+        desc_en = await asyncio.to_thread(translate_to_en, desc_ru)
+
+        await state.update_data(fp_title_en=title_en, fp_desc_en=desc_en)
+        try:
+            await loading.delete()
+        except Exception:
+            pass
+
+        await show_funpay_lot_preview(message, state)
+
+    @router.callback_query(F.data == "fp_new_edit_title_en")
+    async def funpay_lot_edit_title_en_click(callback: CallbackQuery, state: FSMContext) -> None:
+        await callback.answer()
+        await state.set_state(FunPayLotCreateState.title_en_edit)
+        await callback.message.answer("Введите отредактированное английское название (Title EN):")
+
+    @router.message(FunPayLotCreateState.title_en_edit, F.text)
+    async def funpay_lot_edit_title_en_save(message: Message, state: FSMContext) -> None:
+        val = message.text.strip()
+        await state.update_data(fp_title_en=val)
+        await show_funpay_lot_preview(message, state)
+
+    @router.callback_query(F.data == "fp_new_edit_desc_en")
+    async def funpay_lot_edit_desc_en_click(callback: CallbackQuery, state: FSMContext) -> None:
+        await callback.answer()
+        await state.set_state(FunPayLotCreateState.desc_en_edit)
+        await callback.message.answer("Введите отредактированное английское описание (Description EN):")
+
+    @router.message(FunPayLotCreateState.desc_en_edit, F.text)
+    async def funpay_lot_edit_desc_en_save(message: Message, state: FSMContext) -> None:
+        val = message.text.strip()
+        await state.update_data(fp_desc_en=val)
+        await show_funpay_lot_preview(message, state)
+
+    @router.callback_query(F.data == "fp_new_publish")
+    async def funpay_lot_publish(callback: CallbackQuery, state: FSMContext) -> None:
+        runtime = await require_runtime(callback.message, callback.from_user.id)
+        if not runtime:
+            return
+        data = await state.get_data()
+        subcat_id = data.get("fp_subcat_id")
+        if not subcat_id:
+            await callback.answer("Сессия создания устарела", show_alert=True)
+            await state.clear()
+            return
+        await callback.answer("Публикую лот на FunPay…")
+        msg_loading = await callback.message.answer("🚀 <i>Отправка лота на FunPay…</i>")
+
+        try:
+            # Получаем форму редактирования для нового лота в данной подкатегории
+            lot_fields = await asyncio.to_thread(runtime.account.get_lot_fields, lot_id=0, node_id=int(subcat_id))
+
+            lot_fields.title_ru = data.get("fp_title_ru", "")
+            lot_fields.title_en = data.get("fp_title_en", "")
+            lot_fields.description_ru = data.get("fp_desc_ru", "")
+            lot_fields.description_en = data.get("fp_desc_en", "")
+            lot_fields.payment_msg_ru = data.get("fp_payment_msg", "")
+            lot_fields.payment_msg_en = data.get("fp_payment_msg", "")
+            lot_fields.price = float(data.get("fp_price", 1.0))
+            lot_fields.amount = int(data.get("fp_amount", 1))
+            lot_fields.active = True
+
+            await asyncio.to_thread(runtime.account.save_lot, lot_fields)
+        except Exception as exc:
+            logger.exception("Ошибка публикации лота на FunPay")
+            try:
+                await msg_loading.delete()
+            except Exception:
+                pass
+            await callback.message.answer(
+                "❌ Не удалось опубликовать лот на FunPay.\n"
+                f"Ошибка: <code>{html.escape(clipped(exc, 700))}</code>"
+            )
+            return
+
+        try:
+            await msg_loading.delete()
+        except Exception:
+            pass
+
+        await state.clear()
+        cat_name = data.get("fp_cat_name", "")
+        title_ru = data.get("fp_title_ru", "")
+        await callback.message.answer(
+            "🎉 <b>Лот успешно опубликован на FunPay!</b>\n\n"
+            f"🎮 Игра: <b>{html.escape(cat_name)}</b>\n"
+            f"📦 Название: <b>{html.escape(title_ru)}</b>\n"
+            f"💰 Цена: <b>{data.get('fp_price')}</b> · Наличие: <b>{data.get('fp_amount')} шт.</b>\n"
+            "🌐 Английская версия автоматически заполнена и сохранена.",
+            reply_markup=keyboard([[("➕ Выставить ещё лот", "fp_lot_create"), ("⬅️ Меню", "menu")]]),
+        )
+
+    # -----------------------------------------------------------------------------
 
     async def show_playerok_items(target: Message, user_id: int) -> None:
         runtime = await require_playerok_runtime(target, user_id)
