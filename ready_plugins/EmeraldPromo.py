@@ -18,8 +18,8 @@ from FunPayAPI.common.utils import MONTHS
 
 
 NAME = "Emerald Promo"
-VERSION = "1.0.4"
-DESCRIPTION = "Автоматическая продажа, бесплатная выдача и бонусные промокоды EmeraldAI"
+VERSION = "1.1.0"
+DESCRIPTION = "Автоматическая выдача API-ключей и промокодов EmeraldAI для gateway emeraldai.beer"
 CREDITS = "FunPay aiogram bot"
 SETTINGS_PAGE = True
 TELETHON = False
@@ -29,7 +29,9 @@ CALLBACK_PREFIX = "emp:"
 SETTINGS_CALLBACK = f"47:{UUID}:0"
 DEFAULT_API_URL = "https://www.emeraldai.sbs/seller/v1"
 LEGACY_API_URL = "https://emeraldai.sbs/seller/v1"
-ACTIVATION_URL = "https://emeraldai.sbs"
+ACTIVATION_URL = "https://emeraldai.beer"
+BEER_ACCOUNT_URL = "https://www.emeraldai.beer/v1/account"
+BEER_BASE_URL = "https://emeraldai.beer"
 MIN_TOKEN_AMOUNT = 10_000
 MAX_TOKEN_AMOUNT = 1_000_000_000
 DEFAULT_FREE_TOKENS = 200_000
@@ -131,8 +133,15 @@ async def _ensure_schema() -> None:
             free_enabled BOOLEAN NOT NULL DEFAULT TRUE,
             free_token_amount BIGINT NOT NULL DEFAULT 200000,
             min_account_age_days INTEGER NOT NULL DEFAULT 7,
+            issue_type TEXT NOT NULL DEFAULT 'api_key',
+            key_target TEXT NOT NULL DEFAULT 'funpay_shared',
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
+
+        ALTER TABLE emerald_promo_settings
+            ADD COLUMN IF NOT EXISTS issue_type TEXT NOT NULL DEFAULT 'api_key';
+        ALTER TABLE emerald_promo_settings
+            ADD COLUMN IF NOT EXISTS key_target TEXT NOT NULL DEFAULT 'funpay_shared';
 
         CREATE TABLE IF NOT EXISTS emerald_promo_lot_rules (
             id BIGSERIAL PRIMARY KEY,
@@ -205,6 +214,7 @@ async def _set_setting(column: str, value: Any) -> None:
     if column not in {
         "api_base_url", "api_token_enc", "free_enabled",
         "free_token_amount", "min_account_age_days",
+        "issue_type", "key_target",
     }:
         raise ValueError("неизвестная настройка")
     await _ensure_schema()
@@ -498,6 +508,57 @@ def _server_minimum(account_data: dict[str, Any]) -> int:
         return MIN_TOKEN_AMOUNT
 
 
+def _create_client_api_key(settings: Any, amount: int, name: str) -> dict[str, Any]:
+    account = _account_data(settings)
+    balance = int(account.get("balance_tokens") or 0)
+    if balance < amount:
+        raise RuntimeError(
+            f"недостаточно баланса Emerald: доступно {_format_tokens(balance)}, требуется {_format_tokens(amount)}"
+        )
+    target = str(_row_get(settings, "key_target", "funpay_shared") or "funpay_shared")
+    payload = _api_request(
+        settings, "POST", "api-keys",
+        json_payload={
+            "name": name[:64],
+            "token_amount": amount,
+            "quantity": 1,
+            "target": target,
+        },
+    )
+    data = payload.get("data")
+    if not isinstance(data, list) or len(data) != 1 or not isinstance(data[0], dict):
+        raise RuntimeError("Emerald API не вернул созданный API-ключ")
+    key = str(data[0].get("api_key") or data[0].get("prefix") or "").strip()
+    if not key:
+        raise RuntimeError("Emerald API вернул ключ без значения api_key")
+    return data[0]
+
+
+def _check_key_balance(key: str) -> dict[str, Any]:
+    key = key.strip()
+    if not key:
+        raise ValueError("API-ключ не указан")
+    url = BEER_ACCOUNT_URL
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+    }
+    response = requests.get(url, headers=headers, timeout=20, allow_redirects=False)
+    if response.status_code in {307, 308} and response.headers.get("Location"):
+        redirect_url = _safe_redirect_url(url, response.headers["Location"])
+        response = requests.get(redirect_url, headers=headers, timeout=20, allow_redirects=False)
+    try:
+        payload = response.json()
+    except Exception as exc:
+        raise RuntimeError(f"Сервер проверки баланса вернул HTTP {response.status_code} без JSON") from exc
+    if not response.ok:
+        err = payload.get("error", {}) if isinstance(payload, dict) else {}
+        msg = str(err.get("message") or f"HTTP {response.status_code}")
+        raise RuntimeError(msg)
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    return data if isinstance(data, dict) else {}
+
+
 def _create_promo_code(settings: Any, amount: int, prefix: str) -> dict[str, Any]:
     account = _account_data(settings)
     minimum = _server_minimum(account)
@@ -561,60 +622,95 @@ def _format_tokens(value: int) -> str:
     return f"{int(value):,}".replace(",", " ")
 
 
-def _free_message(issue: Any, *, repeated: bool = False) -> str:
-    heading = "ВАШ БЕСПЛАТНЫЙ ДОСТУП" if not repeated else "ВАШ ТЕСТОВЫЙ КОД"
-    return (
-        "╔══════════════════════════╗\n"
-        f"║  🎁 {heading}\n"
-        "╚══════════════════════════╝\n\n"
-        f"🔑 Промокод: {issue['promo_code']}\n"
-        f"🪙 Номинал: {_format_tokens(issue['token_amount'])} токенов\n\n"
+def _is_api_key_mode(settings: Any) -> bool:
+    return str(_row_get(settings, "issue_type", "api_key") or "api_key").casefold() == "api_key"
+
+
+def _free_message(issue: Any, *, repeated: bool = False, is_key: bool = False) -> str:
+    heading = "ВАШ БЕСПЛАТНЫЙ ДОСТУП" if not repeated else "ВАШ ТЕСТОВЫЙ ДОСТУП"
+    item_label = "🔑 API-ключ" if is_key else "🔑 Промокод"
+    item_hint = (
+        f"🌐 Инструкция и проверка баланса: {ACTIVATION_URL}\n"
+        f"⚙️ Base URL для клиентов/SDK: {ACTIVATION_URL}/v1\n\n"
+        "Ключ уже готов к использованию без регистрации на сайте! "
+        "Для проверки остатка напишите в этот чат: #баланс"
+        if is_key else
         f"🌐 Активировать: {ACTIVATION_URL}\n\n"
         "Промокод одноразовый и предназначен для тестирования моделей EmeraldAI. "
         "Бесплатный доступ выдаётся одному FunPay-аккаунту только один раз."
     )
-
-
-def _sale_message(issue: Any) -> str:
-    text = (
+    return (
         "╔══════════════════════════╗\n"
-        "║  💎 ПРОМОКОД EMERALDAI\n"
+        f"║  🎁 {heading}\n"
         "╚══════════════════════════╝\n\n"
-        f"🔑 Промокод: {issue['promo_code']}\n"
-        f"🪙 Номинал: {_format_tokens(issue['token_amount'])} токенов\n"
-        f"📦 Куплено единиц: {issue['purchased_units']}\n\n"
+        f"{item_label}: {issue['promo_code']}\n"
+        f"🪙 Номинал: {_format_tokens(issue['token_amount'])} токенов\n\n"
+        f"{item_hint}"
+    )
+
+
+def _sale_message(issue: Any, *, is_key: bool = False) -> str:
+    title = "💎 КЛЮЧ EMERALDAI" if is_key else "💎 ПРОМОКОД EMERALDAI"
+    item_label = "🔑 Ваш API-ключ" if is_key else "🔑 Промокод"
+    instructions = (
+        f"🌐 Портал и проверка баланса: {ACTIVATION_URL}\n"
+        f"⚙️ Base URL: {ACTIVATION_URL}/v1\n\n"
+        "Ключ активен сразу! Вы можете использовать его в любых OpenAI/Anthropic клиентах.\n"
+        "💡 Для проверки баланса ключа прямо в этом чате отправьте команду:\n"
+        "#баланс"
+        if is_key else
         f"🌐 Активировать: {ACTIVATION_URL}\n\n"
         "Код можно активировать один раз. Никому не передавайте его до активации."
     )
+    text = (
+        "╔══════════════════════════╗\n"
+        f"║  {title}\n"
+        "╚══════════════════════════╝\n\n"
+        f"{item_label}: {issue['promo_code']}\n"
+        f"🪙 Баланс токенов: {_format_tokens(issue['token_amount'])}\n"
+        f"📦 Куплено единиц: {issue['purchased_units']}\n\n"
+        f"{instructions}"
+    )
     if issue["review_bonus_enabled"] and int(issue["review_bonus_tokens"] or 0) > 0:
+        bonus_type = "API-ключ" if is_key else "промокод"
         text += (
             "\n\n┏━━━━━━━━ 🎁 БОНУС ЗА ОТЗЫВ ━━━━━━━━┓\n"
             "Оставьте этому заказу отзыв ровно на 5 звёзд — бот автоматически "
-            f"выдаст ещё один промокод на {_format_tokens(issue['review_bonus_tokens'])} токенов.\n"
+            f"выдаст ещё один {bonus_type} на {_format_tokens(issue['review_bonus_tokens'])} токенов.\n"
             "┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛"
         )
     return text
 
 
-def _review_message(issue: Any) -> str:
+def _review_message(issue: Any, *, is_key: bool = False) -> str:
+    item_label = "🔑 Ваш бонусный API-ключ" if is_key else "🔑 Бонусный промокод"
+    hint = (
+        f"🌐 Проверка баланса: {ACTIVATION_URL}\n"
+        f"⚙️ Base URL: {ACTIVATION_URL}/v1\n"
+        "Для быстрой проверки баланса напишите: #баланс"
+        if is_key else
+        f"🌐 Активировать: {ACTIVATION_URL}\n"
+        "Промокод одноразовый."
+    )
     return (
         "╔══════════════════════════╗\n"
         "║  ⭐ БОНУС ЗА ОТЗЫВ 5★\n"
         "╚══════════════════════════╝\n\n"
         "Спасибо за отличную оценку!\n"
-        f"🔑 Промокод: {issue['promo_code']}\n"
+        f"{item_label}: {issue['promo_code']}\n"
         f"🪙 Номинал: {_format_tokens(issue['token_amount'])} токенов\n\n"
-        f"🌐 Активировать: {ACTIVATION_URL}\n"
-        "Промокод одноразовый."
+        f"{hint}"
     )
 
 
-def _issue_message(issue: Any, *, repeated: bool = False) -> str:
+def _issue_message(issue: Any, *, repeated: bool = False, settings: Any = None) -> str:
+    code = str(issue.get("promo_code") or "")
+    is_key = code.startswith("sk-em-") or (settings is not None and _is_api_key_mode(settings))
     if issue["kind"] == "free":
-        return _free_message(issue, repeated=repeated)
+        return _free_message(issue, repeated=repeated, is_key=is_key)
     if issue["kind"] == "review":
-        return _review_message(issue)
-    return _sale_message(issue)
+        return _review_message(issue, is_key=is_key)
+    return _sale_message(issue, is_key=is_key)
 
 
 async def _funpay_send(issue: Any, text: str) -> None:
@@ -638,48 +734,70 @@ async def _fulfill_issue(issue_id: int) -> None:
         if not issue or issue["status"] == "sent":
             return
         settings = await _settings()
-        promo: dict[str, Any] | None = None
+        item_data: dict[str, Any] | None = None
+        is_key_mode = _is_api_key_mode(settings)
+
         if issue["promo_code"]:
-            promo = {
+            item_data = {
                 "code": issue["promo_code"], "id": issue["api_promo_id"],
                 "status": issue["api_status"] or "available",
             }
         else:
-            try:
-                promo = await asyncio.to_thread(
-                    _recover_promo_code, settings,
-                    int(issue["token_amount"]), str(issue["prefix"]),
+            if is_key_mode:
+                name = f"FP {issue['kind'].upper()} {issue['source_id']}"
+                key_obj = await asyncio.to_thread(
+                    _create_client_api_key, settings,
+                    int(issue["token_amount"]), name,
                 )
-            except Exception:
-                logger.warning("Не выполнено предварительное восстановление Emerald-кода", exc_info=True)
-            if promo is None:
+                item_data = {
+                    "code": str(key_obj.get("api_key") or key_obj.get("prefix")),
+                    "id": str(key_obj.get("id") or ""),
+                    "status": "active" if key_obj.get("is_active") else "available",
+                }
+            else:
                 try:
                     promo = await asyncio.to_thread(
-                        _create_promo_code, settings,
+                        _recover_promo_code, settings,
                         int(issue["token_amount"]), str(issue["prefix"]),
                     )
                 except Exception:
+                    logger.warning("Не выполнено предварительное восстановление Emerald-кода", exc_info=True)
+                    promo = None
+                if promo is None:
                     try:
                         promo = await asyncio.to_thread(
-                            _recover_promo_code, settings,
+                            _create_promo_code, settings,
                             int(issue["token_amount"]), str(issue["prefix"]),
                         )
                     except Exception:
-                        promo = None
-                    if promo is None:
-                        raise
+                        try:
+                            promo = await asyncio.to_thread(
+                                _recover_promo_code, settings,
+                                int(issue["token_amount"]), str(issue["prefix"]),
+                            )
+                        except Exception:
+                            promo = None
+                        if promo is None:
+                            raise
+                item_data = {
+                    "code": str(promo["code"]),
+                    "id": str(promo.get("id") or ""),
+                    "status": str(promo.get("status") or "available"),
+                }
+
             await _update_issue(
                 issue_id,
-                promo_code=str(promo["code"]),
-                api_promo_id=str(promo.get("id") or "") or None,
-                api_status=str(promo.get("status") or "available"),
+                promo_code=str(item_data["code"]),
+                api_promo_id=str(item_data.get("id") or "") or None,
+                api_status=str(item_data.get("status") or "available"),
                 status="created", error_text=None,
             )
             issue = await _issue(issue_id)
-        await _funpay_send(issue, _issue_message(issue))
+        await _funpay_send(issue, _issue_message(issue, settings=settings))
         await _update_issue(issue_id, status="sent", error_text=None)
+        item_kind_label = "API-ключ" if str(issue["promo_code"]).startswith("sk-em-") else "промокод"
         await _notify_owner(
-            "✅ <b>Emerald Promo выдал промокод</b>\n\n"
+            f"✅ <b>Emerald Promo выдал {item_kind_label}</b>\n\n"
             f"Тип: <b>{html.escape(str(issue['kind']))}</b>\n"
             f"Заказ/источник: <code>{html.escape(str(issue['source_id']))}</code>\n"
             f"Номинал: <b>{_format_tokens(issue['token_amount'])}</b> токенов"
@@ -687,13 +805,13 @@ async def _fulfill_issue(issue_id: int) -> None:
     except asyncio.CancelledError:
         raise
     except Exception as exc:
-        logger.exception("Не выдан Emerald-промокод для issue %s", issue_id)
+        logger.exception("Не выдан Emerald-промокод/ключ для issue %s", issue_id)
         await _update_issue(issue_id, status="failed", error_text=str(exc)[:1000])
         if issue:
             try:
                 await _funpay_send(
                     issue,
-                    "❌ Промокод пока не удалось выпустить. Продавец уже уведомлён; "
+                    "❌ Доступ пока не удалось выпустить. Продавец уже уведомлён; "
                     "повторная попытка не создаст второй код.",
                 )
             except Exception:
@@ -970,13 +1088,18 @@ def _show_settings(chat_id: int) -> None:
     stats = _sync(_issue_stats())
     active = sum(1 for rule in rules if rule["enabled"])
     free_state = "включена" if settings["free_enabled"] else "выключена"
+    issue_mode = "🔑 API-ключ (emeraldai.beer)" if _is_api_key_mode(settings) else "🎟 Промокод"
+    target_mode = str(_row_get(settings, "key_target", "funpay_shared") or "funpay_shared")
     account_title = _current_account_title()
     lines = [
         "⚙️ <b>Emerald Promo</b>",
         "",
         f"FunPay-аккаунт: <b>{html.escape(account_title)}</b>",
-        f"Base URL: <code>{html.escape(str(settings['api_base_url']))}</code>",
-        f"API-токен: <b>{html.escape(_token_label(settings))}</b>",
+        f"Клиентский портал: <code>{ACTIVATION_URL}</code>",
+        f"Base URL API: <code>{html.escape(str(settings['api_base_url']))}</code>",
+        f"API-токен продавца: <b>{html.escape(_token_label(settings))}</b>",
+        f"Режим выдачи: <b>{issue_mode}</b>",
+        f"Target ключей: <code>{html.escape(target_mode)}</code>",
         f"Команда #free: <b>{free_state}</b>",
         f"Бесплатный номинал: <b>{_format_tokens(settings['free_token_amount'])}</b>",
         f"Мин. возраст FunPay: <b>{settings['min_account_age_days']} дн.</b>",
@@ -984,8 +1107,7 @@ def _show_settings(chat_id: int) -> None:
         f"Выдано: <b>{int(_row_get(stats, 'sent', 0) or 0)}</b> · "
         f"ошибок: <b>{int(_row_get(stats, 'failed', 0) or 0)}</b>",
         "",
-        "Допустимый номинал: от 10 000 до 1 000 000 000 токенов. "
-        "Для лота задаётся номинал за одну купленную единицу.",
+        "💡 Покупатели могут проверить баланс ключа командой <code>#баланс</code> в чате заказа.",
     ]
     if rules:
         lines.extend(["", "<b>Лоты</b>"])
@@ -1001,6 +1123,12 @@ def _show_settings(chat_id: int) -> None:
             )
     rows: list[list[tuple[str, str]]] = [
         [("👤 Выбрать FunPay-аккаунт", f"{CALLBACK_PREFIX}accounts")],
+        [
+            ("📦 Режим: Ключ ➔ Промокод" if _is_api_key_mode(settings)
+             else "📦 Режим: Промокод ➔ Ключ",
+             f"{CALLBACK_PREFIX}toggle:mode")
+        ],
+        [("🎯 Target ключа (funpay_shared/auto)", f"{CALLBACK_PREFIX}set:target")],
         [("🌐 Base URL API", f"{CALLBACK_PREFIX}set:base")],
         [("🔑 API-токен", f"{CALLBACK_PREFIX}set:token")],
         [("🎁 Вкл/выкл #free", f"{CALLBACK_PREFIX}free")],
@@ -1008,7 +1136,7 @@ def _show_settings(chat_id: int) -> None:
         [("📅 Возраст для #free", f"{CALLBACK_PREFIX}set:age")],
         [("➕ Добавить лот", f"{CALLBACK_PREFIX}lots")],
         [("🧩 Управление лотами", f"{CALLBACK_PREFIX}rules")],
-        [("🧪 Проверить API", f"{CALLBACK_PREFIX}api")],
+        [("🧪 Проверить API и баланс", f"{CALLBACK_PREFIX}api")],
     ]
     if int(_row_get(stats, "failed", 0) or 0):
         rows.append([("🔁 Повторить ошибки", f"{CALLBACK_PREFIX}retry")])
@@ -1174,6 +1302,13 @@ def _on_callback(call: Any) -> None:
             _prompt(chat_id, "base", f"Отправьте HTTPS Base URL API. По умолчанию: <code>{DEFAULT_API_URL}</code>")
         elif data == f"{CALLBACK_PREFIX}set:token":
             _prompt(chat_id, "token", "Отправьте Seller API-токен. Сообщение будет удалено, токен сохранится зашифрованным.")
+        elif data == f"{CALLBACK_PREFIX}toggle:mode":
+            settings = _sync(_settings())
+            new_mode = "promo" if _is_api_key_mode(settings) else "api_key"
+            _sync(_set_setting("issue_type", new_mode))
+            _show_settings(chat_id)
+        elif data == f"{CALLBACK_PREFIX}set:target":
+            _prompt(chat_id, "key_target", "Отправьте target для создания API-ключей (обычно <code>funpay_shared</code> для emeraldai.beer, либо <code>auto</code>, <code>public</code>).")
         elif data == f"{CALLBACK_PREFIX}free":
             settings = _sync(_settings())
             _sync(_set_setting("free_enabled", not bool(settings["free_enabled"])))
@@ -1280,6 +1415,11 @@ def _on_setting_message(message: Any) -> None:
             if not value.isdigit() or not 0 <= int(value) <= 3650:
                 raise ValueError("возраст должен быть целым числом от 0 до 3650 дней")
             _sync(_set_setting("min_account_age_days", int(value)))
+        elif key == "key_target":
+            target = value.strip().lower()
+            if target not in {"funpay_shared", "auto", "public", "seller_site"}:
+                raise ValueError("target должен быть одним из: funpay_shared, auto, public, seller_site")
+            _sync(_set_setting("key_target", target))
         elif key == "new_tokens":
             required = {"lot_id", "lot_title"}
             if not required.issubset(_draft_rule):
@@ -1341,6 +1481,79 @@ def new_order(cardinal: Any, event: Any) -> None:
     }))
 
 
+async def _process_balance(message: dict[str, Any], explicit_key: str | None = None) -> None:
+    chat_id = message["chat_id"]
+    chat_name = message.get("chat_name")
+    buyer_id = message.get("buyer_id")
+    target_key = (explicit_key or "").strip()
+
+    if not target_key and buyer_id:
+        row = await _db().fetchrow(
+            """SELECT promo_code FROM emerald_promo_issues
+                WHERE telegram_id=$1 AND buyer_id=$2 AND status='sent'
+                ORDER BY created_at DESC LIMIT 1""",
+            _telegram_id(), int(buyer_id),
+        )
+        if row and row["promo_code"]:
+            target_key = str(row["promo_code"]).strip()
+
+    if not target_key:
+        await asyncio.to_thread(
+            _cardinal.account.send_message,
+            _funpay_chat_id(chat_id),
+            "ℹ️ Для проверки баланса ключа отправьте:\n"
+            "<code>#баланс sk-em-...</code>\n\n"
+            f"Или проверьте ключ на сайте: {ACTIVATION_URL}#balance",
+            chat_name,
+        )
+        return
+
+    try:
+        data = await asyncio.to_thread(_check_key_balance, target_key)
+        balance = data.get("balance_tokens") or data.get("tokens") or data.get("balance")
+        key_limits = data.get("api_key_limits") if isinstance(data.get("api_key_limits"), dict) else {}
+        usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+
+        lines = [
+            "╔══════════════════════════╗",
+            "║  💎 БАЛАНС EMERALDAI",
+            "╚══════════════════════════╝",
+            "",
+            f"🔑 Ключ: {target_key[:12]}••••{target_key[-4:] if len(target_key) > 16 else ''}",
+        ]
+        if balance is not None:
+            lines.append(f"🪙 Остаток токенов: <b>{_format_tokens(balance)}</b>")
+        if key_limits:
+            if "day_requests" in key_limits:
+                lines.append(f"📅 Запросов за день: {key_limits['day_requests']}")
+            if "month_tokens" in key_limits:
+                lines.append(f"📊 Токенов за месяц: {_format_tokens(key_limits['month_tokens'])}")
+        elif usage:
+            if "total_tokens" in usage:
+                lines.append(f"📈 Использовано: {_format_tokens(usage['total_tokens'])}")
+
+        lines.extend([
+            "",
+            f"🌐 Шлюз: {ACTIVATION_URL}/v1",
+            f"🔍 Проверка на сайте: {ACTIVATION_URL}#balance",
+        ])
+        await asyncio.to_thread(
+            _cardinal.account.send_message,
+            _funpay_chat_id(chat_id),
+            "\n".join(lines),
+            chat_name,
+        )
+    except Exception as exc:
+        logger.exception("Ошибка проверки баланса ключа %s", target_key[:10])
+        await asyncio.to_thread(
+            _cardinal.account.send_message,
+            _funpay_chat_id(chat_id),
+            f"❌ Не удалось получить баланс: {html.escape(str(exc)[:200])}\n"
+            f"Вы можете проверить ключ вручную: {ACTIVATION_URL}#balance",
+            chat_name,
+        )
+
+
 def new_message(cardinal: Any, event: Any) -> None:
     message = event.message
     type_name = getattr(getattr(message, "type", None), "name", "")
@@ -1351,13 +1564,30 @@ def new_message(cardinal: Any, event: Any) -> None:
         getattr(message, "author_id", None) in {0, cardinal.account.id}
         or getattr(message, "by_bot", False)
         or getattr(message, "by_vertex", False)
-        or str(getattr(message, "text", "") or "").strip().casefold() != "#free"
     ):
         return
+
+    text = str(getattr(message, "text", "") or "").strip()
+    lowered = text.casefold()
+
     buyer_id = (
         int(message.interlocutor_id)
         if getattr(message, "interlocutor_id", None) else None
     )
+
+    if lowered.startswith("#баланс") or lowered.startswith("#balance"):
+        parts = text.split(maxsplit=1)
+        explicit_key = parts[1].strip() if len(parts) > 1 else None
+        _spawn(_process_balance({
+            "chat_id": str(message.chat_id),
+            "chat_name": str(message.chat_name or ""),
+            "buyer_id": buyer_id,
+        }, explicit_key=explicit_key))
+        return
+
+    if lowered != "#free":
+        return
+
     _spawn(_process_free({
         "chat_id": str(message.chat_id),
         "chat_name": str(message.chat_name or ""),

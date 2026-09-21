@@ -348,3 +348,75 @@ def test_funpay_send_restores_numeric_chat_id_before_delivery(monkeypatch):
     ))
 
     assert calls == [(123456, "PROMO-CODE", "buyer")]
+
+
+def test_activation_url_is_emeraldai_beer():
+    assert "emeraldai.beer" in plugin.ACTIVATION_URL
+
+
+def test_create_client_api_key(monkeypatch):
+    captured = {}
+
+    def fake_api_request(settings, method, path, json_payload=None, params=None):
+        captured.update(settings=settings, method=method, path=path, json_payload=json_payload)
+        return {
+            "data": [{
+                "id": 100,
+                "name": "test",
+                "api_key": "sk-em-client-test-key",
+                "is_active": True,
+            }]
+        }
+
+    monkeypatch.setattr(plugin, "_account_data", lambda s: {"balance_tokens": 1_000_000})
+    monkeypatch.setattr(plugin, "_api_request", fake_api_request)
+
+    res = plugin._create_client_api_key({"key_target": "funpay_shared"}, 100_000, "test-name")
+    assert res["api_key"] == "sk-em-client-test-key"
+    assert captured["method"] == "POST"
+    assert captured["path"] == "api-keys"
+    assert captured["json_payload"]["target"] == "funpay_shared"
+    assert captured["json_payload"]["token_amount"] == 100_000
+
+
+def test_check_key_balance(monkeypatch):
+    class FakeResponse:
+        ok = True
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {
+                "balance_tokens": 450_000,
+                "api_key_limits": {"day_requests": 15, "month_tokens": 1_000_000}
+            }
+
+    def fake_get(url, headers=None, timeout=None, allow_redirects=None):
+        assert headers["Authorization"] == "Bearer sk-em-test"
+        return FakeResponse()
+
+    monkeypatch.setattr(plugin.requests, "get", fake_get)
+    data = plugin._check_key_balance("sk-em-test")
+    assert data["balance_tokens"] == 450_000
+    assert data["api_key_limits"]["day_requests"] == 15
+
+
+def test_process_balance_command(monkeypatch):
+    sent = []
+
+    class FakeAccount:
+        @staticmethod
+        def send_message(chat_id, text, chat_name):
+            sent.append((chat_id, text, chat_name))
+
+    monkeypatch.setattr(plugin, "_cardinal", SimpleNamespace(account=FakeAccount()))
+    monkeypatch.setattr(plugin, "_check_key_balance", lambda k: {"balance_tokens": 500_000})
+
+    asyncio.run(plugin._process_balance(
+        {"chat_id": "123", "chat_name": "buyer", "buyer_id": 999},
+        explicit_key="sk-em-test-123",
+    ))
+
+    assert len(sent) == 1
+    assert "500 000" in sent[0][1]
+    assert "emeraldai.beer" in sent[0][1]
