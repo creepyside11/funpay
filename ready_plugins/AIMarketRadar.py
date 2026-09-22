@@ -295,7 +295,10 @@ def _call_ai_parser(prompt: str, settings: dict[str, Any]) -> dict[str, Any]:
         res_json = json.loads(resp.read().decode("utf-8"))
 
     content = res_json["choices"][0]["message"]["content"].strip()
-    if content.startswith("```"):
+    match = re.search(r"(\{.*\})", content, re.DOTALL)
+    if match:
+        content = match.group(1)
+    elif content.startswith("```"):
         content = re.sub(r"^```[a-zA-Z]*\n?", "", content)
         content = re.sub(r"\n?```$", "", content)
     return json.loads(content)
