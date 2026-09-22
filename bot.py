@@ -118,6 +118,9 @@ PLAYEROK_POLL_SECONDS = 20
 PLAYEROK_AUTO_PUBLISH_SECONDS = 300
 PLUGIN_STOP_TIMEOUT = 10
 PLUGIN_LOAD_TIMEOUT = 20
+FUNPAY_CONNECT_TIMEOUT = 45
+FUNPAY_CONNECT_ATTEMPTS = 3
+FUNPAY_CONNECT_RETRY_SECONDS = 5
 
 
 @dataclass(frozen=True, slots=True)
@@ -2460,8 +2463,32 @@ def masked_phone(phone: str) -> str:
     return f"+{digits[:2]}{'•' * max(3, len(digits) - 4)}{digits[-2:]}"
 
 
+class FunPayConnectionError(RuntimeError):
+    """Expected FunPay connection failure without worker-thread traceback noise."""
+
+    def __init__(self, message: str, original: BaseException | None = None):
+        super().__init__(message)
+        self.original = original
+
+
+def _probe_funpay_account(account: Account) -> BaseException | None:
+    """Run Account.get() inside a worker and return failures as data.
+
+    Returning the exception instead of raising it prevents asyncio.to_thread()
+    and concurrent.futures internals from becoming the visible traceback root.
+    """
+    try:
+        account.get()
+    except Exception as exc:  # FunPay/requests can raise several exception types.
+        return exc
+    return None
+
+
 def funpay_connection_error_message(exc: BaseException) -> str:
     """Возвращает безопасную подсказку без вывода прокси-логина и пароля."""
+    if isinstance(exc, FunPayConnectionError) and exc.original is not None:
+        exc = exc.original
+
     chain: list[BaseException] = []
     current: BaseException | None = exc
     seen: set[int] = set()
@@ -3824,7 +3851,15 @@ class RuntimeManager:
                 proxy=proxy_dict(proxy),
                 locale="ru",
             )
-            await asyncio.wait_for(asyncio.to_thread(account.get), timeout=45)
+            probe_error = await asyncio.wait_for(
+                asyncio.to_thread(_probe_funpay_account, account),
+                timeout=FUNPAY_CONNECT_TIMEOUT,
+            )
+            if probe_error is not None:
+                raise FunPayConnectionError(
+                    funpay_connection_error_message(probe_error),
+                    original=probe_error,
+                ) from None
         settings = await self.db.get_user(telegram_id)
         runner = Runner(account)
         runtime = AccountRuntime(
