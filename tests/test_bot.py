@@ -171,7 +171,7 @@ def test_funpay_429_retries_are_bounded(monkeypatch):
             raise_not_200=True,
         )
 
-    assert len(calls) == 10
+    assert len(calls) == 2
 
 
 def test_funpay_407_has_actionable_proxy_message():
@@ -187,6 +187,23 @@ def test_funpay_407_has_actionable_proxy_message():
     assert "407" in message
     assert "логин" in message
     assert "пароль" in message
+
+
+def test_funpay_proxy_error_has_actionable_message():
+    message = bot_module.funpay_connection_error_message(
+        requests.exceptions.ProxyError("proxy unavailable")
+    )
+
+    assert "прокси" in message.lower()
+    assert "порт" in message.lower()
+
+
+def test_funpay_timeout_has_actionable_message():
+    message = bot_module.funpay_connection_error_message(
+        requests.exceptions.ConnectTimeout("timeout")
+    )
+
+    assert "тайм-аут" in message.lower()
 
 
 def test_secret_box_round_trip_and_no_plaintext():
