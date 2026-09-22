@@ -2462,11 +2462,59 @@ def masked_phone(phone: str) -> str:
 
 def funpay_connection_error_message(exc: BaseException) -> str:
     """Возвращает безопасную подсказку без вывода прокси-логина и пароля."""
-    if getattr(exc, "status_code", None) == 407 or "407" in str(exc):
+    chain: list[BaseException] = []
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        chain.append(current)
+        current = current.__cause__ or current.__context__
+
+    status_codes = {
+        int(status)
+        for item in chain
+        if (status := getattr(item, "status_code", None)) is not None
+        and str(status).isdigit()
+    }
+    type_names = {type(item).__name__ for item in chain}
+
+    if 407 in status_codes:
         return (
             "Прокси отклонил авторизацию (ошибка 407). Проверьте логин, пароль, "
             "тип прокси и разрешённый IP у провайдера."
         )
+    if 429 in status_codes:
+        return (
+            "FunPay временно ограничил запросы (ошибка 429). "
+            "Бот повторит подключение позже; не запускайте много переподключений подряд."
+        )
+    if 403 in status_codes or "UnauthorizedError" in type_names:
+        return (
+            "FunPay отклонил авторизацию. Проверьте актуальность golden_key "
+            "и не истекла ли сессия."
+        )
+    if "ProxyError" in type_names:
+        return (
+            "Не удалось подключиться через прокси. Проверьте адрес, порт, логин/пароль "
+            "и доступность прокси с сервера."
+        )
+    if type_names & {"ConnectTimeout", "ReadTimeout", "Timeout", "TimeoutError"}:
+        return (
+            "Истёк тайм-аут подключения к FunPay. Чаще всего это медленный/мёртвый "
+            "прокси или временная недоступность FunPay."
+        )
+    if "SSLError" in type_names:
+        return (
+            "Ошибка TLS/SSL при подключении через прокси. Проверьте тип прокси "
+            "и его поддержку HTTPS."
+        )
+    if "ConnectionError" in type_names:
+        return (
+            "Сетевая ошибка при подключении к FunPay. Проверьте прокси, DNS "
+            "и доступность FunPay с сервера."
+        )
+    if any(code >= 500 for code in status_codes):
+        return "FunPay временно отвечает серверной ошибкой. Повторите подключение позже."
     return "FunPay не принял данные. Проверьте доступность прокси и актуальность golden_key."
 
 
