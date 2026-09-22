@@ -100,7 +100,7 @@ def convert_markup(value: Any) -> Any:
                 AiogramButton(
                     text=button.text,
                     url=button.url,
-                    callback_data=button.callback_data,
+                    callback_data=button.callback_data if not button.url else None,
                 )
                 for button in row
             ]

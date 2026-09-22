@@ -453,7 +453,6 @@ async def _run_radar_scan() -> None:
                             msg_text,
                             parse_mode="HTML",
                             reply_markup=kb,
-                            disable_web_page_preview=False,
                         )
                     except Exception as e:
                         logger.warning("Не удалось отправить уведомление по лоту %s: %s", off["offer_id"], e)
@@ -756,7 +755,7 @@ def _on_callback(call: Any) -> None:
                         f"  (Продавец: {html.escape(m_lot['seller'])}, Автовыдача: {'Да' if m_lot['auto'] else 'Нет'})\n"
                         f"  👉 <a href=\"{m_lot['url']}\">Купить</a>"
                     )
-                _bot().send_message(chat_id, "\n\n".join(lines), parse_mode="HTML", disable_web_page_preview=True)
+                _bot().send_message(chat_id, "\n\n".join(lines), parse_mode="HTML")
         except Exception as e:
             _bot().send_message(chat_id, f"❌ Ошибка проверки: {e}")
 
