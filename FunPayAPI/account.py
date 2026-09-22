@@ -228,11 +228,7 @@ class Account:
                 self.last_429_err_time = time.time()
                 if attempt == 10:
                     break
-                # Keep rate-limit backoff below the outer account.get() timeout.
-                # asyncio.wait_for() cannot kill a worker thread that is already running,
-                # so long sleeps here would leave orphaned workers and can exhaust the
-                # default executor after repeated reconnect attempts.
-                wait = min(2 ** (attempt - 1), 4)
+                wait = min(2 ** attempt, 30)
                 logger.warning(f"Получен код $YELLOW429 (Too Many Requests)$RESET от FunPay "
                                f"($YELLOW{link}$RESET). Попытка $YELLOW{attempt}$RESET, жду $YELLOW{wait}$RESET сек.")
                 time.sleep(wait)
