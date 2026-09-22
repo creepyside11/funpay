@@ -3004,7 +3004,7 @@ def format_chat_history(chat: Any, account_id: int) -> list[str]:
         if item.text:
             body = html.escape(clipped(body, 2600))
         message_block = (
-            f"<pre>{body}</pre>"
+            f"<code>{body}</code>"
             if incoming and item.text
             else f"<blockquote>{body}</blockquote>"
         )
@@ -4429,7 +4429,7 @@ class RuntimeManager:
                     "💬 <b>Новое сообщение</b>\n\n"
                     f"👤 От: <b>{chat_name}</b>\n"
                     f"🆔 Чат: <code>{html.escape(chat_id)}</code>\n\n"
-                    f"<pre>{body}</pre>",
+                    f"<code>{body}</code>",
                     account_runtime=runtime,
                     reply_markup=message_buttons,
                 )
@@ -4718,7 +4718,7 @@ def main_keyboard(
         [("➕ Выставить лот", "fp_lot_create"), ("⚙️ Настройки AI", "fp_lot_ai_settings")],
         [("📤 Автовыдача", "delivery"), ("🤖 Автоответчик", "autoreply")],
         [("🔔 Уведомления", "notifications"), ("💬 Последние чаты", "chats")],
-        [("📦 Заказ по ID", "order_lookup"), ("🆙 Автоподнятие", "auto_raise")],
+        [("📦 Незавершённые заказы", "pending_orders"), ("🆙 Автоподнятие", "auto_raise")],
         [("⌨️ Команды", "command_replies"), ("🧩 Плагины", "plugins")],
         [("⚙️ Аккаунт", "account")],
     ])
@@ -6696,20 +6696,46 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
             await state.clear()
             return
 
+        # 1. Сначала ищем по локальному кэшу категорий аккаунта
         categories = getattr(runtime.account, "categories", []) or []
         matches = [cat for cat in categories if query in str(getattr(cat, "name", "")).casefold()]
 
-        if not matches:
-            await message.answer("❌ Игра не найдена. Попробуйте написать по-другому (например, на русском или английском):")
+        # 2. Если в локальном кэше мало или нет, парсим живой каталог FunPay с главной страницы
+        live_cats = []
+        try:
+            from ready_plugins.AIMarketRadar import _load_categories_sync
+            parsed_live = await asyncio.to_thread(_load_categories_sync)
+            for c in parsed_live:
+                if query in c["name"].casefold() or query in c["game"].casefold() or query in c["sub"].casefold():
+                    live_cats.append(c)
+        except Exception as exc:
+            logger.warning("Не удалось спарсить живой каталог FunPay: %s", exc)
+
+        if not matches and not live_cats:
+            await message.answer("❌ Категория не найдена на FunPay. Попробуйте написать по-другому (например, часть названия игры):")
             return
 
         rows = []
-        for cat in matches[:25]:
-            rows.append([(clipped(str(cat.name), 42), f"fp_new_cat:{cat.id}")])
+        seen_ids = set()
+
+        # Добавляем разделы из живого парсинга главной страницы FunPay
+        for lc in live_cats[:20]:
+            cid = lc["id"]
+            if cid not in seen_ids:
+                seen_ids.add(cid)
+                rows.append([(clipped(lc["name"], 42), f"fp_new_sub:{cid}")])
+
+        # Добавляем категории аккаунта
+        for cat in matches[:15]:
+            if getattr(cat, "id", None) not in seen_ids:
+                seen_ids.add(cat.id)
+                rows.append([(clipped(f"🎮 {cat.name}", 42), f"fp_new_cat:{cat.id}")])
+
         rows.append([("❌ Отмена", "menu")])
 
         await message.answer(
-            "🎮 <b>Выберите игру / категорию:</b>",
+            f"🔍 <b>Найдено разделов на FunPay по запросу «{html.escape(query)}»:</b>\n"
+            "Выберите подходящий раздел для выставления лота:",
             reply_markup=keyboard(rows),
         )
 
@@ -7807,19 +7833,25 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
         ]
         rows.extend([
             [("➕ Добавить из лотов", "delivery_add")],
-            [(f"{bool_icon(row['auto_delivery_enabled'])} Автовыдача", "toggle:auto_delivery_enabled")],
-            [(f"{bool_icon(row['multi_delivery_enabled'])} Выдавать количество заказа", "toggle:multi_delivery_enabled")],
-            [(f"{bool_icon(row['delivery_auto_restore'])} Автовосстановление", "toggle:delivery_auto_restore")],
-            [(f"{bool_icon(row['delivery_auto_disable'])} Выключать без товара", "toggle:delivery_auto_disable")],
-            [(f"{bool_icon(row['notify_delivery'])} Уведомлять о выдаче", "toggle:notify_delivery")],
+            [(f"{'🟢' if row['auto_delivery_enabled'] else '🔴'} Автовыдача", "toggle:auto_delivery_enabled")],
+            [(f"{'🟢' if row['multi_delivery_enabled'] else '🔴'} Выдавать кол-во заказа ($product)", "toggle:multi_delivery_enabled")],
+            [(f"{'🟢' if row['delivery_auto_restore'] else '🔴'} Автовосстановление лотов", "toggle:delivery_auto_restore")],
+            [(f"{'🟢' if row['delivery_auto_disable'] else '🔴'} Деактивировать без остатка", "toggle:delivery_auto_disable")],
+            [(f"{'🟢' if row['notify_delivery'] else '🔴'} Уведомления о выдаче", "toggle:notify_delivery")],
             [("⬅️ Меню", "menu")],
         ])
         await target.answer(
             "📤 <b>Автовыдача Cardinal</b>\n\n"
-            f"Правил: <b>{len(rules)}</b>. Число справа — остаток штучных товаров. "
-            "Если в шаблоне нет <code>$product</code>, ответ считается безлимитным.\n\n"
-            "Переменные заказа: $order_id, $order_title, $username, $chat_id, $date, $time. "
-            "При $product одна строка запаса выдаётся за каждую купленную единицу.",
+            f"Правил: <b>{len(rules)}</b>. Число справа — остаток товара на складе.\n"
+            "• Без <code>$product</code> в шаблоне выдача работает как <b>вечный/многоразовый автоответ</b>.\n"
+            "• При наличии <code>$product</code> выдаются уникальные строки из склада (по 1 строке на единицу товара).\n\n"
+            "<b>Доступные переменные шаблона:</b>\n"
+            "<code>$product</code> — выданный товар (ключ/аккаунт)\n"
+            "<code>$order_id</code> — номер заказа FunPay\n"
+            "<code>$order_title</code> — название купленного лота\n"
+            "<code>$username</code> — никнейм покупателя\n"
+            "<code>$chat_id</code> — ID чата\n"
+            "<code>$date</code>, <code>$time</code> — дата и время выдачи",
             reply_markup=keyboard(rows),
         )
 
@@ -11449,6 +11481,64 @@ BIND_TO_NEW_MESSAGE = [on_message]
             format_order(order),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
             disable_web_page_preview=True,
+        )
+
+    @router.callback_query(F.data == "pending_orders")
+    async def pending_orders(callback: CallbackQuery) -> None:
+        await callback.answer("Загружаю заказы…")
+        runtime = await require_runtime(callback.message, callback.from_user.id)
+        if not runtime:
+            return
+
+        loading_msg = await callback.message.answer("⏳ <i>Получаю список незавершённых заказов с FunPay…</i>")
+        try:
+            # Получаем заказы в статусе 'paid' (оплаченные и ожидающие выполнения)
+            _, sales, _, _ = await asyncio.to_thread(
+                runtime.account.get_sales,
+                include_paid=True,
+                include_closed=False,
+                include_refunded=False,
+                state="paid",
+            )
+        except Exception as exc:
+            logger.warning("Не удалось загрузить незавершённые заказы: %s", exc, exc_info=True)
+            try:
+                await loading_msg.delete()
+            except Exception:
+                pass
+            await callback.message.answer(
+                f"❌ Ошибка загрузки заказов: {html.escape(clipped(exc, 300))}",
+                reply_markup=keyboard([[("⬅️ Меню", "menu")]]),
+            )
+            return
+
+        try:
+            await loading_msg.delete()
+        except Exception:
+            pass
+
+        if not sales:
+            await callback.message.answer(
+                "🟢 <b>У вас нет незавершённых заказов!</b>\nВсе заказы выполнены либо закрыты.",
+                reply_markup=keyboard([
+                    [("🔍 Найти заказ по ID", "order_lookup")],
+                    [("⬅️ Меню", "menu")],
+                ]),
+            )
+            return
+
+        buttons = []
+        for order in sales[:25]:
+            label = f"📦 #{order.id} · {clipped(order.description, 20)} · {format_money(order.price)} ₽"
+            buttons.append([(label, f"order_view:{order.id}")])
+
+        buttons.append([("🔍 Найти заказ по ID", "order_lookup")])
+        buttons.append([("🔄 Обновить", "pending_orders"), ("⬅️ Меню", "menu")])
+
+        await callback.message.answer(
+            f"📦 <b>Незавершённые заказы ({len(sales)}):</b>\n"
+            "Выберите заказ из списка ниже для просмотра деталей, ответа покупателю или возврата средств:",
+            reply_markup=keyboard(buttons),
         )
 
     @router.callback_query(F.data == "order_lookup")
