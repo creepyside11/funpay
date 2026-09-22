@@ -545,26 +545,7 @@ def _render_settings_view(settings: dict[str, Any]) -> tuple[str, InlineKeyboard
     return text, _markup(*rows)
 
 
-def init(cardinal: Any) -> None:
-    global _cardinal, _poll_future
-    _cardinal = cardinal
-    _sync(_ensure_schema())
-    _poll_future = _spawn(_radar_loop())
-    logger.info("AI Market Radar успешно инициализирован")
-
-
-def stop() -> None:
-    global _cardinal, _poll_future
-    if _poll_future and not _poll_future.done():
-        _poll_future.cancel()
-    for f in list(_futures):
-        if not f.done():
-            f.cancel()
-    _futures.clear()
-    logger.info("AI Market Radar остановлен")
-
-
-def open_settings(chat_id: int) -> None:
+def _show_settings(chat_id: int) -> None:
     settings = _sync(_get_settings())
     trackers = _sync(_db().fetch(
         "SELECT * FROM ai_radar_trackers WHERE telegram_id = $1 ORDER BY id DESC",
@@ -574,27 +555,97 @@ def open_settings(chat_id: int) -> None:
     _bot().send_message(chat_id, text, parse_mode="HTML", reply_markup=markup)
 
 
-def callback_handler(call: Any) -> None:
+def pre_init(cardinal: Any) -> None:
+    global _cardinal
+    _cardinal = cardinal
+    _sync(_ensure_schema())
+    bot = cardinal.telegram.bot
+    bot.register_callback_query_handler(
+        _on_callback,
+        func=lambda call: str(getattr(call, "data", "") or "") == SETTINGS_CALLBACK
+        or str(getattr(call, "data", "") or "").startswith(CALLBACK_PREFIX),
+    )
+    bot.register_message_handler(
+        _on_setting_message,
+        content_types=["text"],
+        func=lambda _message: _pending_input is not None,
+    )
+
+
+def post_start(cardinal: Any) -> None:
+    global _cardinal, _poll_future
+    _cardinal = cardinal
+    _sync(_ensure_schema())
+    if _poll_future is None or _poll_future.done():
+        _poll_future = _spawn(_radar_loop())
+    logger.info("AI Market Radar успешно запущен")
+
+
+def pre_stop(cardinal: Any) -> None:
+    global _cardinal, _poll_future, _pending_input
+    _pending_input = None
+    if _poll_future and not _poll_future.done():
+        _poll_future.cancel()
+    for f in list(_futures):
+        if not f.done():
+            f.cancel()
+    _futures.clear()
+    logger.info("AI Market Radar остановлен")
+
+
+def on_delete(cardinal: Any, callback: Any = None) -> None:
+    pre_stop(cardinal)
+    try:
+        _sync(
+            _db().execute(
+                """
+                DELETE FROM ai_radar_seen_offers WHERE tracker_id IN (
+                    SELECT id FROM ai_radar_trackers WHERE telegram_id = $1
+                );
+                DELETE FROM ai_radar_trackers WHERE telegram_id = $1;
+                DELETE FROM ai_radar_settings WHERE telegram_id = $1;
+                """,
+                _telegram_id(),
+            )
+        )
+    except Exception:
+        pass
+
+
+def open_settings(chat_id: int) -> None:
+    _show_settings(chat_id)
+
+
+def _on_callback(call: Any) -> None:
     global _pending_input
     data = str(getattr(call, "data", ""))
     chat_id = int(call.message.chat.id)
     message_id = int(call.message.message_id)
 
-    if not data.startswith(CALLBACK_PREFIX):
-        return
+    try:
+        _bot().answer_callback_query(call.id)
+    except Exception:
+        pass
 
-    action = data[len(CALLBACK_PREFIX):]
-
-    if action == "refresh":
+    if data == SETTINGS_CALLBACK or data == f"{CALLBACK_PREFIX}refresh":
         settings = _sync(_get_settings())
         trackers = _sync(_db().fetch(
             "SELECT * FROM ai_radar_trackers WHERE telegram_id = $1 ORDER BY id DESC",
             _telegram_id()
         ))
         text, markup = _render_menu(settings, trackers)
-        _bot().edit_message_text(text, chat_id, message_id, parse_mode="HTML", reply_markup=markup)
+        try:
+            _bot().edit_message_text(text, chat_id, message_id, parse_mode="HTML", reply_markup=markup)
+        except Exception:
+            _bot().send_message(chat_id, text, parse_mode="HTML", reply_markup=markup)
+        return
 
-    elif action == "settings":
+    if not data.startswith(CALLBACK_PREFIX):
+        return
+
+    action = data[len(CALLBACK_PREFIX):]
+
+    if action == "settings":
         settings = _sync(_get_settings())
         text, markup = _render_settings_view(settings)
         _bot().edit_message_text(text, chat_id, message_id, parse_mode="HTML", reply_markup=markup)
@@ -606,7 +657,7 @@ def callback_handler(call: Any) -> None:
             "UPDATE ai_radar_settings SET notifications_enabled = $1 WHERE telegram_id = $2",
             new_val, _telegram_id()
         ))
-        callback_handler(type("Call", (), {"data": f"{CALLBACK_PREFIX}refresh", "message": call.message})())
+        _on_callback(type("Call", (), {"data": f"{CALLBACK_PREFIX}refresh", "message": call.message, "id": call.id})())
 
     elif action.startswith("view:"):
         tr_id = int(action.split(":")[1])
@@ -632,7 +683,7 @@ def callback_handler(call: Any) -> None:
                 "UPDATE ai_radar_trackers SET enabled = $1, updated_at = NOW() WHERE id = $2",
                 new_st, tr_id
             ))
-        callback_handler(type("Call", (), {"data": f"{CALLBACK_PREFIX}view:{tr_id}", "message": call.message})())
+        _on_callback(type("Call", (), {"data": f"{CALLBACK_PREFIX}view:{tr_id}", "message": call.message, "id": call.id})())
 
     elif action.startswith("del_tr:"):
         tr_id = int(action.split(":")[1])
@@ -641,7 +692,7 @@ def callback_handler(call: Any) -> None:
             tr_id, _telegram_id()
         ))
         _bot().answer_callback_query(call.id, "Трекер удалён")
-        callback_handler(type("Call", (), {"data": f"{CALLBACK_PREFIX}refresh", "message": call.message})())
+        _on_callback(type("Call", (), {"data": f"{CALLBACK_PREFIX}refresh", "message": call.message, "id": call.id})())
 
     elif action.startswith("check_now:"):
         tr_id = int(action.split(":")[1])
@@ -652,9 +703,8 @@ def callback_handler(call: Any) -> None:
         if not tr:
             _bot().answer_callback_query(call.id, "Трекер не найден")
             return
-        _bot().answer_callback_query(call.id, "Сканирую категорию...")
         
-        # Ручная разовая проверка с выдачей топ-3 подходящих лотов
+        # Ручная разовая проверка с выдачей топ-5 подходящих лотов
         try:
             offers = _fetch_category_offers(tr["category_id"])
             min_p = float(tr["min_price"]) if tr["min_price"] is not None else None
@@ -748,7 +798,7 @@ def callback_handler(call: Any) -> None:
         _bot().edit_message_text(msg, chat_id, message_id, parse_mode="HTML", reply_markup=markup)
 
 
-def message_handler(message: Any) -> bool:
+def _on_setting_message(message: Any) -> bool:
     global _pending_input
     if not _pending_input:
         return False
@@ -775,14 +825,14 @@ def message_handler(message: Any) -> bool:
             enc, _telegram_id()
         ))
         _bot().send_message(chat_id, "✅ API токен нейросети успешно сохранён и зашифрован!")
-        open_settings(chat_id)
+        _show_settings(chat_id)
         return True
 
     elif kind == "url":
         url = text.rstrip("/")
         if not (url.startswith("http://") or url.startswith("https://")):
             _bot().send_message(chat_id, "❌ URL должен начинаться с https:// или http://")
-            open_settings(chat_id)
+            _show_settings(chat_id)
             return True
 
         _sync(_db().execute(
@@ -790,14 +840,14 @@ def message_handler(message: Any) -> bool:
             url, _telegram_id()
         ))
         _bot().send_message(chat_id, f"✅ Base URL обновлён: <code>{html.escape(url)}</code>", parse_mode="HTML")
-        open_settings(chat_id)
+        _show_settings(chat_id)
         return True
 
     elif kind == "model":
         model = text.strip()
         if not model:
             _bot().send_message(chat_id, "❌ Модель не может быть пустой")
-            open_settings(chat_id)
+            _show_settings(chat_id)
             return True
 
         _sync(_db().execute(
@@ -805,7 +855,7 @@ def message_handler(message: Any) -> bool:
             model, _telegram_id()
         ))
         _bot().send_message(chat_id, f"✅ Модель обновлена: <code>{html.escape(model)}</code>", parse_mode="HTML")
-        open_settings(chat_id)
+        _show_settings(chat_id)
         return True
 
     elif kind == "ai_prompt":
@@ -874,3 +924,27 @@ def message_handler(message: Any) -> bool:
             return True
 
     return False
+
+
+BIND_TO_PRE_INIT = [pre_init]
+BIND_TO_POST_INIT = []
+BIND_TO_PRE_START = []
+BIND_TO_POST_START = [post_start]
+BIND_TO_PRE_STOP = [pre_stop]
+BIND_TO_POST_STOP = []
+BIND_TO_INIT_MESSAGE = []
+BIND_TO_MESSAGES_LIST_CHANGED = []
+BIND_TO_LAST_CHAT_MESSAGE_CHANGED = []
+BIND_TO_NEW_MESSAGE = []
+BIND_TO_INIT_ORDER = []
+BIND_TO_NEW_ORDER = []
+BIND_TO_ORDERS_LIST_CHANGED = []
+BIND_TO_ORDER_STATUS_CHANGED = []
+BIND_TO_PRE_DELIVERY = []
+BIND_TO_POST_DELIVERY = []
+BIND_TO_PRE_LOTS_RAISE = []
+BIND_TO_POST_LOTS_RAISE = []
+BIND_TO_TELETHON_READY = []
+BIND_TO_TELETHON_DISCONNECTED = []
+BIND_TO_DELETE = on_delete
+
