@@ -1253,7 +1253,11 @@ class Account:
 
         self.__update_csrf_token(parser)
 
-        username = parser.find("span", {"class": "mr4"}).text
+        mr4_el = parser.find("span", {"class": "mr4"})
+        if mr4_el and mr4_el.text.strip():
+            username = mr4_el.text.strip()
+        else:
+            username = username.text.strip() if hasattr(username, "text") else str(user_id)
         user_status = parser.find("span", {"class": "media-user-status"})
         user_status = user_status.text if user_status else ""
         avatar_link = parser.find("div", {"class": "avatar-photo"}).get("style").split("(")[1].split(")")[0]

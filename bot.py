@@ -11720,6 +11720,10 @@ async def main() -> None:
         BotCommand(command="cancel", description="Отменить текущее действие"),
     ])
     try:
+        await bot.delete_webhook(drop_pending_updates=True)
+    except Exception:
+        logger.warning("Не удалось сбросить webhook перед запуском polling", exc_info=True)
+    try:
         try:
             await manager.start_saved()
         except asyncio.CancelledError:
