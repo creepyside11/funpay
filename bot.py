@@ -2484,26 +2484,6 @@ def _probe_funpay_account(account: Account) -> BaseException | None:
     return None
 
 
-async def _connect_funpay_account(account: Account) -> Account:
-    """Validate a FunPay account without leaking worker implementation frames."""
-    try:
-        probe_error = await asyncio.wait_for(
-            asyncio.to_thread(_probe_funpay_account, account),
-            timeout=FUNPAY_CONNECT_TIMEOUT,
-        )
-    except TimeoutError:
-        raise FunPayConnectionError(
-            f"FunPay не ответил за {FUNPAY_CONNECT_TIMEOUT} сек. "
-            "Проверьте прокси и доступность FunPay."
-        ) from None
-    if probe_error is not None:
-        raise FunPayConnectionError(
-            funpay_connection_error_message(probe_error),
-            original=probe_error,
-        ) from None
-    return account
-
-
 def funpay_connection_error_message(exc: BaseException) -> str:
     """Возвращает безопасную подсказку без вывода прокси-логина и пароля."""
     if isinstance(exc, FunPayConnectionError) and exc.original is not None:
@@ -3903,7 +3883,21 @@ class RuntimeManager:
                 proxy=proxy_dict(proxy),
                 locale="ru",
             )
-            await _connect_funpay_account(account)
+            try:
+                probe_error = await asyncio.wait_for(
+                    asyncio.to_thread(_probe_funpay_account, account),
+                    timeout=FUNPAY_CONNECT_TIMEOUT,
+                )
+            except TimeoutError:
+                raise FunPayConnectionError(
+                    f"FunPay не ответил за {FUNPAY_CONNECT_TIMEOUT} сек. "
+                    "Проверьте прокси и доступность FunPay."
+                ) from None
+            if probe_error is not None:
+                raise FunPayConnectionError(
+                    funpay_connection_error_message(probe_error),
+                    original=probe_error,
+                ) from None
         settings = await self.db.get_user(telegram_id)
         runner = Runner(account)
         runtime = AccountRuntime(
@@ -5204,11 +5198,11 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
             locale="ru",
         )
         try:
-            await _connect_funpay_account(account)
-        except FunPayConnectionError as exc:
-            logger.warning("Проверка FunPay-аккаунта не пройдена: %s", exc)
+            await asyncio.wait_for(asyncio.to_thread(account.get), timeout=45)
+        except Exception as exc:  # noqa: BLE001 - FunPay/requests raises several unrelated network exceptions.
+            logger.warning("Проверка аккаунта не пройдена: %s", type(exc).__name__)
             await wait_message.edit_text(
-                f"❌ {html.escape(funpay_connection_error_message(exc))}\n"
+                f"❌ {funpay_connection_error_message(exc)}\n"
                 "Отправьте golden_key повторно либо начните заново через /cancel и /start."
             )
             return
