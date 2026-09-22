@@ -23,7 +23,7 @@ UUID = "7736a016-3e1e-4d97-8750-821c652fed76"
 
 CALLBACK_PREFIX = "aimr:"
 SETTINGS_CALLBACK = f"47:{UUID}:0"
-DEFAULT_API_URL = "https://emeraldai.beer/v1"
+DEFAULT_API_URL = "https://www.emeraldai.beer/v1"
 DEFAULT_MODEL = "gpt-4o-mini"
 POLL_SECONDS = 30
 MAX_TRACKERS = 20
@@ -107,7 +107,7 @@ async def _ensure_schema() -> None:
         CREATE TABLE IF NOT EXISTS ai_radar_settings (
             telegram_id BIGINT PRIMARY KEY
                 REFERENCES funpay_users(telegram_id) ON DELETE CASCADE,
-            api_base_url TEXT NOT NULL DEFAULT 'https://emeraldai.beer/v1',
+            api_base_url TEXT NOT NULL DEFAULT 'https://www.emeraldai.beer/v1',
             api_token_enc TEXT,
             model_id TEXT NOT NULL DEFAULT 'gpt-4o-mini',
             notifications_enabled BOOLEAN NOT NULL DEFAULT TRUE,
@@ -278,9 +278,20 @@ def _call_ai_parser(prompt: str, settings: dict[str, Any]) -> dict[str, Any]:
         "User-Agent": "FunPayMarketRadar/1.0",
     }
 
+    class _SmartRedirectHandler(urllib.request.HTTPRedirectHandler):
+        def http_error_308(self, req: Any, fp: Any, code: int, msg: str, hdrs: Any) -> Any:
+            new_url = hdrs.get("Location")
+            if not new_url:
+                raise urllib.error.HTTPError(req.full_url, code, msg, hdrs, fp)
+            new_req = urllib.request.Request(
+                new_url, data=req.data, headers=dict(req.headers), method="POST"
+            )
+            return self.parent.open(new_req)
+
+    opener = urllib.request.build_opener(_SmartRedirectHandler())
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers=headers)
-    with urllib.request.urlopen(req, timeout=25) as resp:
+    with opener.open(req, timeout=25) as resp:
         res_json = json.loads(resp.read().decode("utf-8"))
 
     content = res_json["choices"][0]["message"]["content"].strip()
