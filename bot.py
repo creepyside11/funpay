@@ -3263,40 +3263,15 @@ class RuntimeManager:
             try:
                 settings = await self.db.get_user(telegram_id)
                 if marketplace == "funpay":
-                    runtime = None
-                    last_error: BaseException | None = None
-                    for attempt in range(1, FUNPAY_CONNECT_ATTEMPTS + 1):
-                        try:
-                            runtime = await self.start(
-                                telegram_id,
-                                row=row,
-                                make_active=bool(
-                                    settings
-                                    and int(settings["active_funpay_account_id"] or 0)
-                                    == account_key
-                                ),
-                            )
-                            break
-                        except asyncio.CancelledError:
-                            raise
-                        except Exception as exc:
-                            last_error = exc
-                            if attempt >= FUNPAY_CONNECT_ATTEMPTS:
-                                raise
-                            logger.warning(
-                                "FunPay подключение %s/%s для пользователя %s не удалось: %s; "
-                                "повтор через %s сек.",
-                                attempt,
-                                FUNPAY_CONNECT_ATTEMPTS,
-                                telegram_id,
-                                funpay_connection_error_message(exc),
-                                FUNPAY_CONNECT_RETRY_SECONDS,
-                            )
-                            await asyncio.sleep(FUNPAY_CONNECT_RETRY_SECONDS)
-                    if runtime is None:
-                        raise RuntimeError(
-                            "FunPay runtime не создан после повторных попыток"
-                        ) from last_error
+                    runtime = await self.start(
+                        telegram_id,
+                        row=row,
+                        make_active=bool(
+                            settings
+                            and int(settings["active_funpay_account_id"] or 0)
+                            == account_key
+                        ),
+                    )
                     enabled = bool(settings and settings["notify_system"])
                     success_text = "🟢 FunPay Runner восстановлен после запуска бота."
                 else:
@@ -3321,18 +3296,11 @@ class RuntimeManager:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                if marketplace == "funpay" and isinstance(exc, FunPayConnectionError):
-                    logger.warning(
-                        "Не удалось запустить FunPay-аккаунт пользователя %s: %s",
-                        telegram_id,
-                        funpay_connection_error_message(exc),
-                    )
-                else:
-                    logger.exception(
-                        "Не удалось запустить %s-аккаунт пользователя %s",
-                        marketplace,
-                        telegram_id,
-                    )
+                logger.exception(
+                    "Не удалось запустить %s-аккаунт пользователя %s",
+                    marketplace,
+                    telegram_id,
+                )
                 enabled = bool(
                     settings
                     and settings[
@@ -3883,16 +3851,10 @@ class RuntimeManager:
                 proxy=proxy_dict(proxy),
                 locale="ru",
             )
-            try:
-                probe_error = await asyncio.wait_for(
-                    asyncio.to_thread(_probe_funpay_account, account),
-                    timeout=FUNPAY_CONNECT_TIMEOUT,
-                )
-            except TimeoutError:
-                raise FunPayConnectionError(
-                    f"FunPay не ответил за {FUNPAY_CONNECT_TIMEOUT} сек. "
-                    "Проверьте прокси и доступность FunPay."
-                ) from None
+            probe_error = await asyncio.wait_for(
+                asyncio.to_thread(_probe_funpay_account, account),
+                timeout=FUNPAY_CONNECT_TIMEOUT,
+            )
             if probe_error is not None:
                 raise FunPayConnectionError(
                     funpay_connection_error_message(probe_error),
