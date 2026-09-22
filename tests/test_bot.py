@@ -206,6 +206,28 @@ def test_funpay_timeout_has_actionable_message():
     assert "тайм-аут" in message.lower()
 
 
+def test_funpay_worker_probe_returns_network_error_as_data():
+    class BrokenAccount:
+        def get(self):
+            raise requests.exceptions.ProxyError("proxy unavailable")
+
+    error = bot_module._probe_funpay_account(BrokenAccount())
+
+    assert isinstance(error, requests.exceptions.ProxyError)
+
+
+def test_funpay_async_probe_wraps_worker_error_without_thread_traceback_cause():
+    class BrokenAccount:
+        def get(self):
+            raise requests.exceptions.ProxyError("proxy unavailable")
+
+    with pytest.raises(bot_module.FunPayConnectionError) as raised:
+        asyncio.run(bot_module._connect_funpay_account(BrokenAccount()))
+
+    assert raised.value.__cause__ is None
+    assert "прокси" in bot_module.funpay_connection_error_message(raised.value).lower()
+
+
 def test_secret_box_round_trip_and_no_plaintext():
     box = SecretBox("test-secret")
     encrypted = box.encrypt("golden-key-value")
