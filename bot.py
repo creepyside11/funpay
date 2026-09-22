@@ -4675,13 +4675,33 @@ class StatusPluginState(StatesGroup):
     text = State()
 
 
-def keyboard(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text=text, callback_data=data) for text, data in row]
-            for row in rows
-        ]
-    )
+def keyboard(
+    rows: list[list[tuple[str, str] | tuple[str, str, str]]],
+) -> InlineKeyboardMarkup:
+    """Генерирует InlineKeyboardMarkup с поддержкой цветных кнопок Telegram Bot API 8.3+.
+
+    Кнопка может передаваться кортежем из 2 элементов: (text, callback_data),
+    или из 3 элементов: (text, callback_data, style), где style: 'primary', 'success', 'danger'.
+    """
+    inline_keyboard: list[list[InlineKeyboardButton]] = []
+    for row in rows:
+        btn_row: list[InlineKeyboardButton] = []
+        for item in row:
+            text = item[0]
+            data = item[1]
+            style = item[2] if len(item) > 2 else None
+            btn_kwargs: dict[str, Any] = {"text": text, "callback_data": data}
+            if style:
+                try:
+                    # Telegram Bot API 8.3 style parameter (primary, success, danger)
+                    btn = InlineKeyboardButton(**btn_kwargs, style=style)
+                except Exception:
+                    btn = InlineKeyboardButton(**btn_kwargs)
+            else:
+                btn = InlineKeyboardButton(**btn_kwargs)
+            btn_row.append(btn)
+        inline_keyboard.append(btn_row)
+    return InlineKeyboardMarkup(inline_keyboard=inline_keyboard)
 
 
 def main_keyboard(
@@ -4715,10 +4735,10 @@ def main_keyboard(
         switch,
         account_switch,
         [("👤 Подробный профиль", "profile"), ("💰 Баланс", "balance")],
-        [("➕ Выставить лот", "fp_lot_create"), ("⚙️ Настройки AI", "fp_lot_ai_settings")],
-        [("📤 Автовыдача", "delivery"), ("🤖 Автоответчик", "autoreply")],
+        [("➕ Выставить лот", "fp_lot_create", "primary"), ("⚙️ Настройки AI", "fp_lot_ai_settings")],
+        [("📤 Автовыдача", "delivery", "success"), ("🤖 Автоответчик", "autoreply")],
         [("🔔 Уведомления", "notifications"), ("💬 Последние чаты", "chats")],
-        [("📦 Незавершённые заказы", "pending_orders"), ("🆙 Автоподнятие", "auto_raise")],
+        [("📦 Незавершённые заказы", "pending_orders", "primary"), ("🆙 Автоподнятие", "auto_raise")],
         [("⌨️ Команды", "command_replies"), ("🧩 Плагины", "plugins")],
         [("⚙️ Аккаунт", "account")],
     ])
@@ -6484,21 +6504,24 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
         }
 
         params = []
-
-        # 1. Поиск по lot-fields (специфичные поля категорий: номинал, способ, регион и т.д.)
-        lot_fields_div = soup.find("div", class_="lot-fields")
         seen_names = set()
 
-        if lot_fields_div:
-            for g in lot_fields_div.find_all("div", class_="form-group"):
-                fid = g.get("data-id") or ""
-                lbl = g.find("label")
-                label_text = lbl.text.strip() if lbl else ""
-                target_name = f"fields[{fid}]" if fid else ""
+        # Универсальный обход: ищем все селекты и радио-кнопки в lot-field, форме или фильтрах
+        for g in soup.find_all("div", class_="form-group"):
+            fid = g.get("data-id") or ""
+            lbl = g.find("label", class_="control-label") or g.find("label")
+            label_text = lbl.text.strip() if lbl else ""
 
-                # Кнопки radio-box (например, номинал токенов / подписка)
-                rbox = g.find("div", class_="lot-field-radio-box") or g.find("div", class_="btn-group")
-                if rbox:
+            # Радио-кнопки / кнопки выбора (lot-field-radio-box, btn-group)
+            rbox = g.find("div", class_="lot-field-radio-box") or g.find("div", class_="btn-group")
+            if rbox:
+                inp = g.find("input")
+                raw_name = (inp.get("name") if inp else "") or fid or ""
+                clean_name = f"fields[{raw_name[2:]}]" if raw_name.startswith("f-") else (f"fields[{raw_name}]" if not raw_name.startswith("fields[") and raw_name else raw_name)
+                if not clean_name and fid:
+                    clean_name = f"fields[{fid}]"
+
+                if clean_name and clean_name not in standard_names and clean_name not in seen_names:
                     options = []
                     for b in rbox.find_all("button"):
                         val = b.get("value", "").strip()
@@ -6510,27 +6533,26 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
                         inferred_label = label_text or (
                             "Номинал / Количество"
                             if any("кк" in o["value"].lower() or "токен" in o["value"].lower() for o in options)
-                            else ("Тип предложения" if any("подписк" in o["value"].lower() for o in options) else (fid.title() if fid else "Параметр"))
+                            else ("Тип" if any("продажа" in o["value"].lower() or "аренда" in o["value"].lower() for o in options) else (fid.title() if fid else "Параметр"))
                         )
-                        final_name = target_name or f"fields[{fid or 'quantity'}]"
-                        seen_names.add(final_name)
+                        seen_names.add(clean_name)
                         params.append({
-                            "name": final_name,
+                            "name": clean_name,
                             "label": inferred_label,
                             "options": options,
                             "selected": options[0]["value"],
                         })
                         continue
 
-                # Выпадающие списки (select)
-                sel = g.find("select")
-                if sel:
-                    s_name = sel.get("name") or ""
-                    if s_name.startswith("f-"):
-                        s_name = f"fields[{s_name[2:]}]"
-                    elif not s_name.startswith("fields[") and fid:
-                        s_name = f"fields[{fid}]"
+            # Выпадающие списки (select)
+            sel = g.find("select")
+            if sel:
+                raw_name = sel.get("name") or ""
+                clean_name = f"fields[{raw_name[2:]}]" if raw_name.startswith("f-") else (f"fields[{raw_name}]" if not raw_name.startswith("fields[") and raw_name else raw_name)
+                if not clean_name and fid:
+                    clean_name = f"fields[{fid}]"
 
+                if clean_name and clean_name not in standard_names and clean_name not in seen_names:
                     options = []
                     placeholder = ""
                     for opt in sel.find_all("option"):
@@ -6541,68 +6563,14 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
                             continue
                         options.append({"value": v, "label": t or v})
                     if options:
-                        final_name = s_name or target_name
-                        seen_names.add(final_name)
+                        seen_names.add(clean_name)
                         params.append({
-                            "name": final_name,
+                            "name": clean_name,
                             "label": label_text or placeholder or (fid.title() if fid else "Параметр"),
                             "options": options,
                             "selected": options[0]["value"],
                         })
                     continue
-
-        # 2. Дополнительный обход form-group, если не всё было в lot-fields
-        search_root = form if form else soup
-        for g in search_root.find_all("div", class_="form-group"):
-            if "hidden" in g.get("class", []):
-                continue
-            lbl = g.find("label", class_="control-label") or g.find("label")
-            label_text = lbl.text.strip() if lbl else ""
-
-            sel = g.find("select")
-            if sel:
-                raw_name = sel.get("name") or ""
-                clean_name = f"fields[{raw_name[2:]}]" if raw_name.startswith("f-") else raw_name
-                if clean_name and clean_name not in standard_names and clean_name not in seen_names:
-                    seen_names.add(clean_name)
-                    options = []
-                    placeholder = ""
-                    for opt in sel.find_all("option"):
-                        v = opt.get("value", "").strip()
-                        t = opt.text.strip()
-                        if not v:
-                            placeholder = t
-                            continue
-                        options.append({"value": v, "label": t or v})
-                    if options:
-                        params.append({
-                            "name": clean_name,
-                            "label": label_text or placeholder or clean_name,
-                            "options": options,
-                            "selected": options[0]["value"],
-                        })
-                continue
-
-            radios = g.find_all("input", {"type": "radio"})
-            if radios:
-                raw_name = radios[0].get("name") or ""
-                clean_name = f"fields[{raw_name[2:]}]" if raw_name.startswith("f-") else raw_name
-                if clean_name and clean_name not in standard_names and clean_name not in seen_names:
-                    seen_names.add(clean_name)
-                    options = []
-                    for r in radios:
-                        v = r.get("value", "").strip()
-                        r_lbl = r.find_parent("label") or r.find_next_sibling("span") or r.find_next_sibling(text=True)
-                        t = (r_lbl.text if hasattr(r_lbl, "text") else str(r_lbl)).strip() if r_lbl else v
-                        if v:
-                            options.append({"value": v, "label": t or v})
-                    if options:
-                        params.append({
-                            "name": clean_name,
-                            "label": label_text or clean_name,
-                            "options": options,
-                            "selected": options[0]["value"],
-                        })
 
         return {"has_amount": has_amount, "params": params}
 
@@ -6799,37 +6767,36 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
         has_amount = True
         params = []
         try:
-            resp = await asyncio.to_thread(
+            resp_pub = await asyncio.to_thread(
                 runtime.account.method,
                 "get",
-                f"lots/offerEdit?node={sub_id}",
+                f"lots/{sub_id}/",
                 {},
                 {},
                 raise_not_200=True,
             )
-            parsed = parse_funpay_lot_edit_form(resp.content.decode("utf-8", errors="ignore"))
-            has_amount = parsed.get("has_amount", True)
-            params = parsed.get("params", [])
+            parsed_pub = parse_funpay_lot_edit_form(resp_pub.content.decode("utf-8", errors="ignore"))
+            if parsed_pub.get("params"):
+                params = parsed_pub["params"]
+                has_amount = parsed_pub.get("has_amount", has_amount)
         except Exception as exc:
-            logger.warning("Не удалось спарсить форму FunPay offerEdit: %s", exc)
+            logger.warning("Не удалось спарсить публичную страницу FunPay lots/%s: %s", sub_id, exc)
 
-        # Если в offerEdit параметры не нашлись или их мало, пробуем публичную страницу раздела lots/{sub_id}/
         if not params:
             try:
-                resp_pub = await asyncio.to_thread(
+                resp = await asyncio.to_thread(
                     runtime.account.method,
                     "get",
-                    f"lots/{sub_id}/",
+                    f"lots/offerEdit?node={sub_id}",
                     {},
                     {},
                     raise_not_200=True,
                 )
-                parsed_pub = parse_funpay_lot_edit_form(resp_pub.content.decode("utf-8", errors="ignore"))
-                if parsed_pub.get("params"):
-                    params = parsed_pub["params"]
-                    has_amount = parsed_pub.get("has_amount", has_amount)
+                parsed = parse_funpay_lot_edit_form(resp.content.decode("utf-8", errors="ignore"))
+                has_amount = parsed.get("has_amount", has_amount)
+                params = parsed.get("params", [])
             except Exception as exc:
-                logger.warning("Не удалось спарсить публичную страницу FunPay lots/%s: %s", sub_id, exc)
+                logger.warning("Не удалось спарсить форму FunPay offerEdit: %s", exc)
 
         try:
             await loading_msg.delete()
@@ -7968,10 +7935,10 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
             f"Шаблон:\n<pre>{html.escape(clipped(rule['response'], 1500))}</pre>"
             + (f"\nПервые товары:\n{preview}" if preview else ""),
             reply_markup=keyboard([
-                [("➕ Добавить товары", f"delivery_stock:{rule_id}")],
+                [("➕ Добавить товары", f"delivery_stock:{rule_id}", "primary")],
                 [("✏️ Изменить шаблон", f"delivery_edit:{rule_id}")],
-                [("🧹 Очистить запас", f"delivery_clear_ask:{rule_id}")],
-                [("Выключить" if rule["enabled"] else "Включить", f"delivery_toggle:{rule_id}")],
+                [("🧹 Очистить запас", f"delivery_clear_ask:{rule_id}", "danger")],
+                [("Выключить" if rule["enabled"] else "Включить", f"delivery_toggle:{rule_id}", "danger" if rule["enabled"] else "success")],
                 [(
                     f"{bool_icon(not rule['disable_auto_restore'])} Восстанавливать этот лот",
                     f"delivery_rule_restore:{rule_id}",
@@ -7980,7 +7947,7 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
                     f"{bool_icon(not rule['disable_auto_disable'])} Выключать без товара",
                     f"delivery_rule_disable:{rule_id}",
                 )],
-                [("🗑 Удалить", f"delivery_delete_ask:{rule_id}")],
+                [("🗑 Удалить", f"delivery_delete_ask:{rule_id}", "danger")],
                 [("⬅️ Автовыдача", "delivery")],
             ]),
         )
