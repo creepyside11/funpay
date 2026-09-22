@@ -3299,7 +3299,7 @@ class RuntimeManager:
                             break
                         except asyncio.CancelledError:
                             raise
-                        except Exception as exc:
+                        except FunPayConnectionError as exc:
                             last_error = exc
                             if attempt >= FUNPAY_CONNECT_ATTEMPTS:
                                 raise
