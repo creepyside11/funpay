@@ -5112,6 +5112,7 @@ def build_router(db: Database, manager: RuntimeManager, secrets: SecretBox) -> R
             ]),
         )
 
+    @router.message(Command("start"))
     @router.message(CommandStart())
     async def start(message: Message, state: FSMContext) -> None:
         await state.clear()
