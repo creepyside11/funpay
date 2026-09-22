@@ -106,6 +106,7 @@ TELEGRAM_CHANNEL_BOOST_PLUGIN_UUID = "3f4874b9-0797-4d4a-aba6-c69aa63b2e08"
 AUTO_SMM_PLUGIN_UUID = "6a76248a-f44d-4fc3-98d5-d40c0a2663b7"
 AI_ASSISTANT_PLUGIN_UUID = "1d8870db-4d2c-4e8a-9d5f-884cbfa13fe1"
 EMERALD_PROMO_PLUGIN_UUID = "9ee0d7d1-2cef-45c5-b1ac-67c4c1f3ef8a"
+AI_MARKET_RADAR_PLUGIN_UUID = "7736a016-3e1e-4d97-8750-821c652fed76"
 PLUGIN_SETTINGS_CALLBACK_PREFIX = "47"
 PLUGIN_TELETHON_DISCONNECT_ASK_PREFIX = "pt_disc_ask:"
 PLUGIN_TELETHON_DISCONNECT_DO_PREFIX = "pt_disc_do:"
@@ -210,6 +211,18 @@ READY_PLUGINS = (
         "с учётом количества товара, поддерживает несколько лотов, одноразовую команду #free "
         "с проверкой возраста FunPay-аккаунта и настраиваемый бонус за отзыв ровно на 5 звёзд.",
         source_file="EmeraldPromo.py",
+        builtin_settings=False,
+    ),
+    ReadyPluginSpec(
+        AI_MARKET_RADAR_PLUGIN_UUID,
+        "AIMarketRadar.py",
+        "AI Market Radar",
+        "1.0.0",
+        "AI-мониторинг и радар выгодных лотов FunPay для перепродажи",
+        "Принимает произвольный запрос на естественном языке, разбирает категорию, ключевые "
+        "слова, ценовые рамки и автовыдачу с помощью ИИ. В фоновом режиме парсит сайт FunPay "
+        "и мгновенно присылает уведомления со ссылкой на покупку при появлении нужных лотов.",
+        source_file="AIMarketRadar.py",
         builtin_settings=False,
     ),
 )
