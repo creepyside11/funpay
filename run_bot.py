@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import time
 from typing import Any
 
 import bot
 
 
 PLAYEROK_DISABLED_MESSAGE = "Playerok временно отключён"
+RESTART_DELAY_SECONDS = 5
+logger = logging.getLogger("funpay_bot.supervisor")
 _ORIGINAL_FUNPAY_SEND_MESSAGE = bot.Account.send_message
 
 
@@ -89,7 +93,18 @@ def main() -> None:
     # canonical node format as order delivery.
     bot.Account.send_message = _send_message_with_private_node
 
-    asyncio.run(bot.main())
+    while True:
+        try:
+            asyncio.run(bot.main())
+            return
+        except KeyboardInterrupt:
+            return
+        except Exception:
+            logger.exception(
+                "Основной цикл бота аварийно завершился; перезапуск через %s сек.",
+                RESTART_DELAY_SECONDS,
+            )
+            time.sleep(RESTART_DELAY_SECONDS)
 
 
 if __name__ == "__main__":
