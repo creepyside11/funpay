@@ -220,23 +220,21 @@ class Account:
                   "proxies": self.proxy or {},
                   "cookies": cookies}
         response = None
-        rate_limit_attempts = 0
         for attempt in range(1, 11):
             with self._request_lock:
                 response = self.session.request(url=link, data=payload, allow_redirects=False, **kwargs)
                 self.__update_cookies(response)
             if response.status_code == 429:
                 self.last_429_err_time = time.time()
-                rate_limit_attempts += 1
-                if rate_limit_attempts >= 2:
+                if attempt == 10:
                     break
-                # Retry a rate-limited request only once. The caller wraps Account.get()
-                # in asyncio.wait_for(), but cancelling that await cannot stop a worker
-                # thread already blocked in requests. Long retry chains can therefore
-                # exhaust the executor and make the bot appear frozen.
-                wait = 1
+                # Keep rate-limit backoff below the outer account.get() timeout.
+                # asyncio.wait_for() cannot kill a worker thread that is already running,
+                # so long sleeps here would leave orphaned workers and can exhaust the
+                # default executor after repeated reconnect attempts.
+                wait = min(2 ** (attempt - 1), 4)
                 logger.warning(f"Получен код $YELLOW429 (Too Many Requests)$RESET от FunPay "
-                               f"($YELLOW{link}$RESET). Повтор через $YELLOW{wait}$RESET сек.")
+                               f"($YELLOW{link}$RESET). Попытка $YELLOW{attempt}$RESET, жду $YELLOW{wait}$RESET сек.")
                 time.sleep(wait)
                 continue
             elif not (300 <= response.status_code < 400) or 'Location' not in response.headers:
