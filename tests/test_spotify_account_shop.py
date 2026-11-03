@@ -7,6 +7,18 @@ import pytest
 from ready_plugins import SpotifyAccountShop as plugin
 
 
+@pytest.fixture(autouse=True)
+def _reset_plugin_state(monkeypatch):
+    """Модуль плагина живёт между тестами: сбрасываем его глобальное состояние."""
+    monkeypatch.setattr(plugin, "_pending_input", None, raising=False)
+    monkeypatch.setattr(plugin, "_stock_mode", None, raising=False)
+    monkeypatch.setattr(plugin, "_poll_error", None, raising=False)
+    monkeypatch.setattr(plugin, "_poll_failures", 0, raising=False)
+    monkeypatch.setattr(plugin, "_poll_next_at", None, raising=False)
+    monkeypatch.setattr(plugin, "_poll_notice_at", None, raising=False)
+    monkeypatch.setattr(plugin, "_sales_api_broken", False, raising=False)
+
+
 def _async_value(value):
     async def inner(*_args, **_kwargs):
         return value
@@ -1135,3 +1147,88 @@ def test_scrape_paid_orders_returns_empty_when_no_paid_orders(monkeypatch):
 
     monkeypatch.setattr(plugin, "_cardinal", SimpleNamespace(account=Account()))
     assert asyncio.run(plugin._scrape_paid_orders()) == []
+
+
+def test_poll_does_not_repeat_error_notification(monkeypatch):
+    """Успешный цикл не должен сбрасывать паузу уведомлений об ошибке."""
+    notified = []
+
+    async def broken():
+        raise RuntimeError("api down")
+
+    async def fake_notify(text, **_kwargs):
+        notified.append(text)
+
+    monkeypatch.setattr(plugin, "_collect_paid_orders", broken)
+    monkeypatch.setattr(plugin, "_notify_owner", fake_notify)
+
+    asyncio.run(plugin._poll_paid_orders(force=True))
+    asyncio.run(plugin._poll_paid_orders(force=True))
+    asyncio.run(plugin._poll_paid_orders(force=True))
+
+    assert len(notified) == 1, notified
+
+
+def test_poll_respects_backoff_between_cycles(monkeypatch):
+    calls = []
+
+    async def broken():
+        calls.append(1)
+        raise RuntimeError("api down")
+
+    async def fake_notify(_text, **_kwargs):
+        return None
+
+    monkeypatch.setattr(plugin, "_collect_paid_orders", broken)
+    monkeypatch.setattr(plugin, "_notify_owner", fake_notify)
+
+    asyncio.run(plugin._poll_paid_orders(force=True))
+    assert plugin._poll_next_at is not None
+    asyncio.run(plugin._poll_paid_orders())  # внутри бэкоффа — пропуск
+    assert len(calls) == 1
+
+
+def test_poll_reports_recovery_once(monkeypatch):
+    notified = []
+    failing = {"value": True}
+
+    async def flaky():
+        if failing["value"]:
+            raise RuntimeError("api down")
+        return []
+
+    async def fake_notify(text, **_kwargs):
+        notified.append(text)
+
+    monkeypatch.setattr(plugin, "_collect_paid_orders", flaky)
+    monkeypatch.setattr(plugin, "_notify_owner", fake_notify)
+
+    asyncio.run(plugin._poll_paid_orders(force=True))
+    failing["value"] = False
+    asyncio.run(plugin._poll_paid_orders(force=True))
+    asyncio.run(plugin._poll_paid_orders(force=True))
+
+    assert len(notified) == 2
+    assert "Не удалось получить заказы" in notified[0]
+    assert "восстановлена" in notified[1]
+
+
+def test_collect_paid_orders_skips_broken_api_after_first_failure(monkeypatch):
+    calls = {"api": 0, "scrape": 0}
+
+    async def broken_api():
+        calls["api"] += 1
+        raise RuntimeError("UnauthorizedError")
+
+    async def scrape():
+        calls["scrape"] += 1
+        return []
+
+    monkeypatch.setattr(plugin, "_api_paid_orders", broken_api)
+    monkeypatch.setattr(plugin, "_scrape_paid_orders", scrape)
+
+    asyncio.run(plugin._collect_paid_orders())
+    asyncio.run(plugin._collect_paid_orders())
+    asyncio.run(plugin._collect_paid_orders())
+
+    assert calls == {"api": 1, "scrape": 3}

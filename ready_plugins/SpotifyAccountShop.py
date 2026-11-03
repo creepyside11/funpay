@@ -12,7 +12,7 @@ from urllib.parse import urlsplit
 from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 NAME = "Spotify Account Shop"
-VERSION = "1.0.4"
+VERSION = "1.0.5"
 DESCRIPTION = "Склад Spotify-аккаунтов: привязка лотов, автовыдача и напоминание об отзыве"
 CREDITS = "FunPay aiogram bot"
 SETTINGS_PAGE = True
@@ -33,7 +33,9 @@ FOLLOWUP_MAX_ATTEMPTS = 3
 SECRET_PREFIX = "enc1:"
 LOT_PAGE_SIZE = 8
 STOCK_PAGE_SIZE = 8
-POLL_SECONDS = 90
+POLL_SECONDS = 180
+POLL_MAX_BACKOFF_SECONDS = 30 * 60
+POLL_NOTICE_HOURS = 6
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 AMOUNT_RE = re.compile(
     r",\s*\d{1,3}(?:\s?\d{3})*\s*(?:шт|pcs)\.\s*$", re.IGNORECASE
@@ -1404,7 +1406,10 @@ async def _retry_order(order_db_id: int) -> str:
     return await _fulfill_order(order_db_id)
 
 _poll_error: str | None = None
-_poll_error_at: datetime | None = None
+_poll_failures = 0
+_poll_next_at: datetime | None = None
+_poll_notice_at: datetime | None = None
+_sales_api_broken = False
 
 async def _api_paid_orders() -> list[Any]:
     """Возвращает оплаченные заказы прямо из API FunPay.
@@ -1544,10 +1549,8 @@ async def _scrape_paid_orders() -> list[dict[str, Any]]:
         raise RuntimeError("метод account.method недоступен")
     last_error: Exception | None = None
     empty_html = ""
-    for url in (
-        "https://funpay.com/orders/trade?state=paid",
-        "https://funpay.com/orders/trade",
-    ):
+    # Один запрос за цикл: FunPay отвечает защитой на частые обращения.
+    for url in ("https://funpay.com/orders/trade",):
         try:
             response = await asyncio.to_thread(
                 method, "get", url, {}, {}, False, True
@@ -1578,6 +1581,11 @@ async def _scrape_paid_orders() -> list[dict[str, Any]]:
 
 async def _collect_paid_orders() -> list[dict[str, Any]]:
     """Оплаченные заказы: сначала штатный API, затем ручной разбор страницы."""
+    global _sales_api_broken
+    if _sales_api_broken:
+        # Штатный get_sales уже падал: не тратим запросы на заведомо
+        # неработающий путь, иначе FunPay включает защиту от частых обращений.
+        return await _scrape_paid_orders()
     try:
         orders = await _api_paid_orders()
     except Exception as api_error:
@@ -1585,6 +1593,7 @@ async def _collect_paid_orders() -> list[dict[str, Any]]:
             "Штатный get_sales не сработал, разбираю страницу продаж вручную",
             exc_info=True,
         )
+        _sales_api_broken = True
         try:
             return await _scrape_paid_orders()
         except Exception as scrape_error:
@@ -1592,40 +1601,60 @@ async def _collect_paid_orders() -> list[dict[str, Any]]:
                 f"{type(api_error).__name__}: {api_error}; "
                 f"ручной разбор: {type(scrape_error).__name__}: {scrape_error}"
             ) from scrape_error
+    _sales_api_broken = False
     return [
         _order_payload(order)
         for order in orders
         if _order_status_name(order) == "PAID"
     ]
 
-async def _poll_paid_orders() -> None:
+async def _poll_paid_orders(force: bool = False) -> None:
     """Страховка: выдаёт оплаченные заказы даже без события NEW_ORDER."""
-    global _poll_error, _poll_error_at
+    global _poll_error, _poll_failures, _poll_next_at, _poll_notice_at
+    now = datetime.now(timezone.utc)
+    if not force and _poll_next_at is not None and now < _poll_next_at:
+        return
     try:
         paid = await _collect_paid_orders()
     except Exception as exc:
         message = f"{type(exc).__name__}: {exc}"
         logger.warning("Не получены оплаченные заказы FunPay", exc_info=True)
-        now = datetime.now(timezone.utc)
-        should_report = (
-            _poll_error != message
-            or _poll_error_at is None
-            or (now - _poll_error_at) > timedelta(hours=1)
+        _poll_error = message
+        _poll_failures += 1
+        delay = min(
+            POLL_SECONDS * (2 ** min(_poll_failures - 1, 4)),
+            POLL_MAX_BACKOFF_SECONDS,
         )
+        _poll_next_at = now + timedelta(seconds=delay)
+        # Ручная кнопка обходит бэкофф, но не кулдаун уведомлений: иначе
+        # каждое нажатие присылало бы то же сообщение заново.
+        should_report = _poll_notice_at is None or (
+            now - _poll_notice_at
+        ) >= timedelta(hours=POLL_NOTICE_HOURS)
         if should_report:
-            _poll_error = message
-            _poll_error_at = now
+            _poll_notice_at = now
             await _notify_owner(
-                "⚠️ <b>Не удалось получить заказы из API FunPay</b>\n\n"
+                "⚠️ <b>Не удалось получить заказы FunPay</b>\n\n"
                 f"Причина: <code>{html.escape(message[:400])}</code>\n\n"
-                "Автовыдача по событиям может не работать. Проверьте вручную "
-                "кнопкой «🔍 Проверить заказы».",
+                f"Следующая попытка через <b>{delay // 60} мин</b>. "
+                "Пока связь не восстановится, автовыдача идёт только по "
+                "событиям бота. Это сообщение не чаще раза в "
+                f"{POLL_NOTICE_HOURS} ч.",
                 reply_markup=_markup(
                     [("🔍 Проверить заказы", f"{CALLBACK_PREFIX}diag")]
                 ),
             )
         return
+    recovered = _poll_failures > 0
     _poll_error = None
+    _poll_failures = 0
+    _poll_next_at = now + timedelta(seconds=POLL_SECONDS)
+    if recovered and _poll_notice_at is not None:
+        _poll_notice_at = None
+        await _notify_owner(
+            "✅ <b>Связь с FunPay восстановлена</b>\n\n"
+            "Заказы снова читаются, автовыдача работает штатно."
+        )
     processed = 0
     delivered = 0
     paid_total = len(paid)
@@ -1790,10 +1819,7 @@ async def _run_followups() -> None:
             int(row["id"]), followup_status="sent", followup_attempts=0
         )
 
-_last_poll: datetime | None = None
-
 async def _worker_loop() -> None:
-    global _last_poll
     while True:
         try:
             if (
@@ -1801,13 +1827,7 @@ async def _worker_loop() -> None:
                 and _cardinal.plugin_manager.is_enabled(_telegram_id(), UUID)
             ):
                 await _run_followups()
-                now = datetime.now(timezone.utc)
-                if (
-                    _last_poll is None
-                    or (now - _last_poll).total_seconds() >= POLL_SECONDS
-                ):
-                    _last_poll = now
-                    await _poll_paid_orders()
+                await _poll_paid_orders()
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -1862,6 +1882,17 @@ def _reset_input_state() -> None:
     _pending_input = None
     _stock_mode = None
 
+def _poll_status_text() -> str:
+    """Короткий статус опроса заказов для главного экрана."""
+    if not _poll_error:
+        return f"✅ каждые {POLL_SECONDS // 60} мин"
+    if _poll_next_at is None:
+        return "⚠️ ошибка"
+    left = int((_poll_next_at - datetime.now(timezone.utc)).total_seconds())
+    if left <= 0:
+        return "⚠️ ошибка, повторяю"
+    return f"⚠️ ошибка, повтор через {max(1, left // 60)} мин"
+
 def _show_home(chat_id: int) -> None:
     _reset_input_state()
     settings = _sync(_settings())
@@ -1882,7 +1913,7 @@ def _show_home(chat_id: int) -> None:
         f"лотов привязано: <b>{bound}</b>",
         f"Склад: <b>{available}</b> доступно · <b>{sold}</b> продано",
         f"Напоминание об отзыве: {followup_state}",
-        f"Опрос API заказов: {'⚠️ ошибка' if _poll_error else '✅ каждые 90 с'}",
+        f"Опрос заказов: {_poll_status_text()}",
         "",
         "При оплате привязанного лота бот выдаёт аккаунт со склада. Через заданное "
         "время он напишет покупателю и попросит подтвердить заказ и оставить отзыв.",
@@ -2518,7 +2549,7 @@ def _on_callback(call: Any) -> None:
         elif data == f"{CALLBACK_PREFIX}diag":
             _show_diag(chat_id)
         elif data == f"{CALLBACK_PREFIX}pol":
-            _spawn(_poll_paid_orders())
+            _spawn(_poll_paid_orders(force=True))
             _bot().send_message(
                 chat_id,
                 "🔄 Запрашиваю оплаченные заказы из API FunPay… "
@@ -2771,7 +2802,7 @@ def post_start(cardinal: Any) -> None:
     global _cardinal, _worker_future
     _cardinal = cardinal
     _spawn(_resume_state())
-    _spawn(_poll_paid_orders())
+    _spawn(_poll_paid_orders(force=True))
     if _worker_future is None or _worker_future.done():
         _worker_future = _spawn(_worker_loop())
 
