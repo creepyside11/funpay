@@ -12,7 +12,7 @@ from urllib.parse import urlsplit
 from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 NAME = "Spotify Account Shop"
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 DESCRIPTION = "Склад Spotify-аккаунтов: привязка лотов, автовыдача и напоминание об отзыве"
 CREDITS = "FunPay aiogram bot"
 SETTINGS_PAGE = True
@@ -32,6 +32,8 @@ FOLLOWUP_RETRY_MINUTES = 5
 FOLLOWUP_MAX_ATTEMPTS = 3
 SECRET_PREFIX = "enc1:"
 LOT_PAGE_SIZE = 8
+STOCK_PAGE_SIZE = 8
+POLL_SECONDS = 90
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 AMOUNT_RE = re.compile(
     r",\s*\d{1,3}(?:\s?\d{3})*\s*(?:шт|pcs)\.\s*$", re.IGNORECASE
@@ -523,6 +525,56 @@ async def _clear_available(position_id: int) -> int:
         )
     return amount
 
+async def _stock_page(
+    position_id: int, offset: int, limit: int = STOCK_PAGE_SIZE
+) -> tuple[list[Any], int]:
+    row = await _db().fetchrow(
+        """
+        SELECT COUNT(*) AS amount FROM spotify_accounts_items
+         WHERE telegram_id=$1 AND position_id=$2 AND status='available'
+        """,
+        _telegram_id(),
+        position_id,
+    )
+    total = int(_row_get(row, "amount", 0) or 0)
+    items = list(
+        await _db().fetch(
+            """
+            SELECT id, email, activation_key, created_at
+              FROM spotify_accounts_items
+             WHERE telegram_id=$1 AND position_id=$2 AND status='available'
+             ORDER BY id
+             OFFSET $3 LIMIT $4
+            """,
+            _telegram_id(),
+            position_id,
+            max(0, int(offset)),
+            limit,
+        )
+    )
+    return items, total
+
+async def _delete_item(item_id: int) -> int | None:
+    row = await _db().fetchrow(
+        """
+        SELECT position_id FROM spotify_accounts_items
+         WHERE telegram_id=$1 AND id=$2 AND status='available'
+        """,
+        _telegram_id(),
+        item_id,
+    )
+    if not row:
+        return None
+    await _db().execute(
+        """
+        DELETE FROM spotify_accounts_items
+         WHERE telegram_id=$1 AND id=$2 AND status='available'
+        """,
+        _telegram_id(),
+        item_id,
+    )
+    return int(_row_get(row, "position_id") or 0) or None
+
 async def _stock_preview(position_id: int, limit: int = 5) -> list[Any]:
     return list(
         await _db().fetch(
@@ -542,27 +594,37 @@ async def _stock_preview(position_id: int, limit: int = 5) -> list[Any]:
 # Заказы и выдача
 # --------------------------------------------------------------------------- #
 
-async def _insert_order(order: dict[str, Any], position: Any) -> Any | None:
+async def _insert_order(
+    order: dict[str, Any], position: Any | None, status: str = "queued"
+) -> Any | None:
+    position_id = int(position["id"]) if position else None
+    title = (
+        str(position["title"])
+        if position
+        else str(order.get("description") or "")[:300]
+    )
+    days = int(position["subscription_days"]) if position else 0
     return await _db().fetchrow(
-        """
+        f"""
         INSERT INTO spotify_accounts_orders
             (telegram_id, order_id, position_id, lot_id, position_title,
              subscription_days, amount, buyer_username, chat_id, chat_name,
              status)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'queued')
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
         ON CONFLICT (telegram_id, order_id) DO NOTHING
         RETURNING *
         """,
         _telegram_id(),
         str(order["id"]),
-        int(position["id"]),
+        position_id,
         str(order.get("lot_id") or ""),
-        str(position["title"]),
-        int(position["subscription_days"]),
+        title,
+        days,
         max(1, int(order.get("amount") or 1)),
         str(order.get("chat_name") or ""),
         str(order.get("chat_id") or ""),
         str(order.get("chat_name") or ""),
+        status,
     )
 
 async def _order_by_funpay_id(order_id: str) -> Any | None:
@@ -1042,15 +1104,27 @@ def _normalize_title(value: str) -> str:
     text = AMOUNT_RE.sub("", str(value or ""))
     return " ".join(text.split()).casefold()
 
+OFFER_RE = re.compile(
+    r"(?:lots/offer\?id=|/offer\?id=|offer=|data-offer=[\"']|"
+    r"data-lot=[\"']|offerId[\"']?\s*[:=]\s*[\"']?)(\d{3,})",
+    re.I,
+)
+
 def _order_lot_id(order: Any) -> str | None:
-    direct = getattr(order, "lot_id", None)
-    if direct is not None:
-        return str(direct)
-    widget_html = str(getattr(order, "html", "") or "")
-    match = re.search(
-        r"(?:lots/offer\?id=|offer=|data-offer=[\"'])(\d+)", widget_html, re.I
-    )
-    return match.group(1) if match else None
+    """ID лота из события заказа.
+
+    У ``OrderShortcut`` атрибута ``lot_id`` нет, поэтому дополнительно
+    разбираются ссылка и HTML-виджет заказа.
+    """
+    for attribute in ("lot_id", "offer_id", "lotId"):
+        direct = getattr(order, attribute, None)
+        if direct not in (None, "", 0):
+            return str(direct)
+    for source in (getattr(order, "html", ""), getattr(order, "link", "")):
+        match = OFFER_RE.search(str(source or ""))
+        if match:
+            return match.group(1)
+    return None
 
 async def _match_position(lot_id: str | None, description: str) -> Any | None:
     positions = {int(position["id"]): position for position in await _positions()}
@@ -1069,18 +1143,40 @@ async def _match_position(lot_id: str | None, description: str) -> Any | None:
     normalized = _normalize_title(description)
     if not normalized:
         return None
-    matches: dict[int, Any] = {}
-    for binding in bindings:
-        if _normalize_title(str(binding["lot_title"])) != normalized:
-            continue
-        position = enabled.get(int(binding["position_id"]))
-        if position:
-            matches[int(position["id"])] = position
-    if len(matches) == 1:
-        return next(iter(matches.values()))
+    titles = [
+        (int(binding["position_id"]), _normalize_title(str(binding["lot_title"])))
+        for binding in bindings
+        if _normalize_title(str(binding["lot_title"]))
+    ]
+
+    def collect(predicate: Any) -> dict[int, Any]:
+        found: dict[int, Any] = {}
+        for position_id, title in titles:
+            if not predicate(title):
+                continue
+            position = enabled.get(position_id)
+            if position:
+                found[int(position["id"])] = position
+        return found
+
+    exact = collect(lambda title: title == normalized)
+    if len(exact) == 1:
+        return next(iter(exact.values()))
+    if exact:
+        return None
+    # Название в заказе и в лоте FunPay иногда отличается приставкой или
+    # хвостом (локализация, количество, пометки) — сравниваем вхождением.
+    fuzzy = collect(
+        lambda title: len(title) >= 8
+        and (title in normalized or normalized in title)
+    )
+    if len(fuzzy) == 1:
+        return next(iter(fuzzy.values()))
     return None
 
-def _builtin_delivery_conflict(description: str) -> bool:
+def _builtin_delivery_conflict(
+    description: str, lot_id: str | None = None
+) -> bool:
     """Проверяет, сработает ли встроенная автовыдача по тому же лоту."""
     try:
         db = _db()
@@ -1092,7 +1188,24 @@ def _builtin_delivery_conflict(description: str) -> bool:
         if not row or not _row_get(row, "auto_delivery_enabled", False):
             return False
         rule = _sync(find_rule(_telegram_id(), str(description or "")))
-        return bool(rule and _row_get(rule, "enabled", False))
+        if not rule or not _row_get(rule, "enabled", False):
+            return False
+        rule_lot = _row_get(rule, "lot_id")
+        if rule_lot not in (None, "") and lot_id not in (None, ""):
+            # Встроенное правило FunPay ищет лот по подстроке и может зацепить
+            # чужой лот. Сверяем точный ID, чтобы не блокировать выдачу.
+            return str(rule_lot) == str(lot_id)
+        rule_title = _normalize_title(
+            str(_row_get(rule, "lot_title", "") or "")
+        )
+        order_title = _normalize_title(str(description or ""))
+        if rule_title and order_title:
+            return (
+                rule_title == order_title
+                or rule_title in order_title
+                or order_title in rule_title
+            )
+        return True
     except Exception:
         logger.warning(
             "Не удалось проверить встроенную автовыдачу FunPay", exc_info=True
@@ -1103,9 +1216,49 @@ def _builtin_delivery_conflict(description: str) -> bool:
 # Обработка заказов
 # --------------------------------------------------------------------------- #
 
+async def _record_unmatched(order: dict[str, Any]) -> None:
+    inserted = await _insert_order(order, None, status="unmatched")
+    if not inserted:
+        return
+    logger.warning(
+        "Заказ %s не сопоставлен ни с одной позицией: lot_id=%s description=%r",
+        order.get("id"),
+        order.get("lot_id"),
+        str(order.get("description"))[:200],
+    )
+    await _notify_owner(
+        "🟡 <b>Оплаченный заказ не сопоставлен с позицией</b>\n\n"
+        f"Заказ: <code>#{html.escape(str(order.get('id')))}</code>\n"
+        f"Лот FunPay: <b>{html.escape(str(order.get('description'))[:300])}</b>\n"
+        f"Покупатель: <b>{html.escape(str(order.get('chat_name') or '—'))}</b>\n\n"
+        "Аккаунт не выдан. Привяжите этот лот к позиции и нажмите «Выдать» "
+        "в разделе «📋 Заказы».",
+        reply_markup=_markup(
+            [("📋 Заказы", f"{CALLBACK_PREFIX}orders")],
+            [("📦 Позиции", f"{CALLBACK_PREFIX}pos")],
+        ),
+    )
+
 async def _process_new_order(order: dict[str, Any]) -> None:
+    try:
+        await _process_order_safe(order)
+    except Exception as exc:
+        logger.exception(
+            "Не обработан заказ %s Spotify Account Shop", order.get("id")
+        )
+        await _notify_owner(
+            "❌ <b>Ошибка выдачи заказа</b>\n\n"
+            f"Заказ: <code>#{html.escape(str(order.get('id')))}</code>\n"
+            f"Лот: <b>{html.escape(str(order.get('description'))[:300])}</b>\n"
+            f"Причина: <code>{html.escape(str(exc)[:400])}</code>\n\n"
+            "Проверьте раздел «📋 Заказы» и попробуйте выдать вручную.",
+            reply_markup=_markup([("📋 Заказы", f"{CALLBACK_PREFIX}orders")]),
+        )
+
+async def _process_order_safe(order: dict[str, Any]) -> None:
     position = await _match_position(order.get("lot_id"), order["description"])
     if position is None:
+        await _record_unmatched(order)
         return
     if order.get("builtin_conflict"):
         await _notify_owner(
@@ -1162,6 +1315,104 @@ async def _process_order_status(order_id: str, status: str) -> None:
         "Если аккаунт не использовался, верните его на склад.",
         reply_markup=_markup(*[buttons]),
     )
+
+async def _retry_order(order_db_id: int) -> str:
+    """Повторная выдача заказа (кнопка «Выдать» в разделе «Заказы»)."""
+    row = await _db().fetchrow(
+        """
+        SELECT * FROM spotify_accounts_orders
+         WHERE telegram_id=$1 AND id=$2
+        """,
+        _telegram_id(),
+        order_db_id,
+    )
+    if not row:
+        raise RuntimeError("заказ не найден")
+    if _row_get(row, "status") in {"delivered", "refunded", "returned"}:
+        return str(_row_get(row, "status"))
+    position = None
+    if _row_get(row, "position_id"):
+        position = await _position(int(row["position_id"]))
+    if position is None:
+        position = await _match_position(
+            _row_get(row, "lot_id"), str(_row_get(row, "position_title") or "")
+        )
+    if position is None:
+        raise RuntimeError(
+            "позиция для этого лота не найдена — привяжите лот к позиции"
+        )
+    await _db().execute(
+        """
+        UPDATE spotify_accounts_orders
+           SET status='queued', position_id=$3, position_title=$4,
+               subscription_days=$5, error_text=NULL, updated_at=NOW()
+         WHERE telegram_id=$1 AND id=$2
+        """,
+        _telegram_id(),
+        order_db_id,
+        int(position["id"]),
+        str(position["title"]),
+        int(position["subscription_days"]),
+    )
+    return await _fulfill_order(order_db_id)
+
+async def _poll_paid_orders() -> None:
+    """Страховка: выдаёт оплаченные заказы даже без события NEW_ORDER.
+
+    Старые сборки бота могут не доставлять хук о новом заказе в загруженный
+    плагин. Тогда продавец узнаёт о продаже только из FunPay. Здесь мы сами
+    смотрим список оплаченных заказов и выдаём всё, чего ещё нет в базе.
+    """
+    account = getattr(_cardinal, "account", None)
+    get_sales = getattr(account, "get_sales", None)
+    if get_sales is None:
+        return
+    try:
+        data = await asyncio.to_thread(
+            get_sales,
+            include_paid=True,
+            include_closed=False,
+            include_refunded=False,
+        )
+    except Exception:
+        logger.warning("Не получены оплаченные заказы FunPay", exc_info=True)
+        return
+    orders = []
+    if isinstance(data, tuple):
+        for chunk in data:
+            if isinstance(chunk, list):
+                orders = chunk
+                break
+    elif isinstance(data, list):
+        orders = data
+    processed = 0
+    for order in orders:
+        if processed >= 20:
+            break
+        status = getattr(getattr(order, "status", None), "name", "")
+        if status and status != "PAID":
+            continue
+        order_id = str(getattr(order, "id", "") or "")
+        if not order_id:
+            continue
+        existing = await _order_by_funpay_id(order_id)
+        if existing:
+            continue
+        description = str(getattr(order, "description", "") or "")
+        processed += 1
+        await _process_new_order(
+            {
+                "id": order_id,
+                "chat_id": getattr(order, "chat_id", None),
+                "chat_name": str(getattr(order, "buyer_username", "") or ""),
+                "description": description,
+                "amount": max(1, int(getattr(order, "amount", None) or 1)),
+                "lot_id": _order_lot_id(order),
+                "builtin_conflict": _builtin_delivery_conflict(
+                    description, _order_lot_id(order)
+                ),
+            }
+        )
 
 async def _resume_state() -> None:
     await _ensure_schema()
@@ -1300,7 +1551,10 @@ async def _run_followups() -> None:
             int(row["id"]), followup_status="sent", followup_attempts=0
         )
 
+_last_poll: datetime | None = None
+
 async def _worker_loop() -> None:
+    global _last_poll
     while True:
         try:
             if (
@@ -1308,6 +1562,13 @@ async def _worker_loop() -> None:
                 and _cardinal.plugin_manager.is_enabled(_telegram_id(), UUID)
             ):
                 await _run_followups()
+                now = datetime.now(timezone.utc)
+                if (
+                    _last_poll is None
+                    or (now - _last_poll).total_seconds() >= POLL_SECONDS
+                ):
+                    _last_poll = now
+                    await _poll_paid_orders()
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -1326,6 +1587,7 @@ def _status_label(status: str) -> str:
         "failed": "ошибка",
         "refunded": "возврат",
         "returned": "возвращён на склад",
+        "unmatched": "не сопоставлен",
     }.get(status, status)
 
 def _followup_label(status: str) -> str:
@@ -1405,6 +1667,7 @@ def _show_home(chat_id: int) -> None:
             )
     rows: list[list[tuple[str, str]]] = [
         [("📦 Позиции и склад", f"{CALLBACK_PREFIX}pos")],
+        [("📋 Заказы", f"{CALLBACK_PREFIX}orders")],
         [("➕ Новая позиция", f"{CALLBACK_PREFIX}new")],
         [("⏱ Напоминание об отзыве", f"{CALLBACK_PREFIX}fw")],
         [("📝 Шаблон выдачи", f"{CALLBACK_PREFIX}tpl")],
@@ -1479,6 +1742,12 @@ def _show_position(chat_id: int, position_id: int) -> None:
             )
     rows: list[list[tuple[str, str]]] = [
         [("➕ Пополнить склад", f"{CALLBACK_PREFIX}fill:{position_id}")],
+        [
+            (
+                f"📦 Склад ({int(position['available'] or 0)})",
+                f"{CALLBACK_PREFIX}stk:{position_id}:0",
+            )
+        ],
         [("➕ Добавить лот", f"{CALLBACK_PREFIX}bind:{position_id}:0")],
         [("📅 Срок подписки", f"{CALLBACK_PREFIX}days:{position_id}")],
         [("✏️ Название", f"{CALLBACK_PREFIX}name:{position_id}")],
@@ -1502,6 +1771,112 @@ def _show_position(chat_id: int, position_id: int) -> None:
             [("⬅️ Все позиции", f"{CALLBACK_PREFIX}pos")],
         ]
     )
+    _bot().send_message(chat_id, "\n".join(lines), reply_markup=_markup(*rows))
+
+def _show_stock(chat_id: int, position_id: int, offset: int) -> None:
+    _reset_input_state()
+    position = _sync(_position(position_id))
+    if not position:
+        raise RuntimeError("позиция не найдена")
+    items, total = _sync(_stock_page(position_id, offset))
+    if not total:
+        _bot().send_message(
+            chat_id,
+            f"📦 <b>Склад «{html.escape(_short(position['title'], 40))}»</b>\n\n"
+            "Свободных аккаунтов нет. Нажмите «Пополнить склад», чтобы добавить "
+            "строки <code>почта:пароль</code>.",
+            reply_markup=_markup(
+                [("➕ Пополнить склад", f"{CALLBACK_PREFIX}fill:{position_id}")],
+                [("⬅️ Позиция", f"{CALLBACK_PREFIX}pos:{position_id}")],
+            ),
+        )
+        return
+    offset = max(0, min(offset, total - 1))
+    pages = (total + STOCK_PAGE_SIZE - 1) // STOCK_PAGE_SIZE
+    page_no = offset // STOCK_PAGE_SIZE + 1
+    rows: list[list[tuple[str, str]]] = []
+    for item in items:
+        key = " 🔑" if item["activation_key"] else ""
+        rows.append(
+            [
+                (
+                    f"🗑 {_mask_email(str(item['email']))}{key}",
+                    f"{CALLBACK_PREFIX}id:{item['id']}",
+                )
+            ]
+        )
+    nav: list[tuple[str, str]] = []
+    if offset > 0:
+        nav.append(
+            (
+                "⬅️",
+                f"{CALLBACK_PREFIX}stk:{position_id}:"
+                f"{max(0, offset - STOCK_PAGE_SIZE)}",
+            )
+        )
+    if offset + STOCK_PAGE_SIZE < total:
+        nav.append(
+            (
+                "➡️",
+                f"{CALLBACK_PREFIX}stk:{position_id}:"
+                f"{offset + STOCK_PAGE_SIZE}",
+            )
+        )
+    if nav:
+        rows.append(nav)
+    rows.append(
+        [("➕ Пополнить склад", f"{CALLBACK_PREFIX}fill:{position_id}")]
+    )
+    rows.append([("⬅️ Позиция", f"{CALLBACK_PREFIX}pos:{position_id}")])
+    _bot().send_message(
+        chat_id,
+        f"📦 <b>Склад «{html.escape(_short(position['title'], 40))}»</b>\n\n"
+        f"Страница <b>{page_no}/{pages}</b> · свободных аккаунтов: "
+        f"<b>{total}</b>\n\n"
+        "Нажмите на аккаунт, чтобы удалить его со склада.",
+        reply_markup=_markup(*rows),
+    )
+
+def _show_orders(chat_id: int) -> None:
+    _reset_input_state()
+    orders = _sync(_recent_orders(10))
+    if not orders:
+        _bot().send_message(
+            chat_id,
+            "📋 <b>Заказы</b>\n\nПока ни одного заказа.",
+            reply_markup=_markup([("⬅️ Назад", SETTINGS_CALLBACK)]),
+        )
+        return
+    lines = ["📋 <b>Заказы</b>", ""]
+    rows: list[list[tuple[str, str]]] = []
+    for order in orders:
+        status = str(order["status"])
+        lines.append(
+            f"• <code>#{html.escape(str(order['order_id']))}</code> — "
+            f"<b>{html.escape(_status_label(status))}</b> · "
+            f"{html.escape(_short(str(order['position_title'] or '—'), 40))}"
+        )
+        if order["error_text"]:
+            lines.append(
+                f"   ↳ <code>{html.escape(_short(str(order['error_text']), 120))}</code>"
+            )
+        if status in {"queued", "failed", "unmatched"}:
+            rows.append(
+                [
+                    (
+                        f"▶️ Выдать #{_short(str(order['order_id']), 18)}",
+                        f"{CALLBACK_PREFIX}go:{order['id']}",
+                    )
+                ]
+            )
+    lines.extend(
+        [
+            "",
+            "«Выдать» выдаёт аккаунт со склада повторно: полезно, если позиция "
+            "была не привязана или склад был пуст.",
+        ]
+    )
+    rows.append([("⬅️ Назад", SETTINGS_CALLBACK)])
     _bot().send_message(chat_id, "\n".join(lines), reply_markup=_markup(*rows))
 
 def _load_lots() -> dict[str, str]:
@@ -1848,6 +2223,44 @@ def _on_callback(call: Any) -> None:
         elif data == f"{CALLBACK_PREFIX}pos":
             _stock_mode = None
             _show_positions(chat_id)
+        elif data == f"{CALLBACK_PREFIX}orders":
+            _show_orders(chat_id)
+        elif data.startswith(f"{CALLBACK_PREFIX}stk:"):
+            _, _, tail = data.split(":", 2)
+            position_id, offset = tail.split(":")
+            _show_stock(chat_id, int(position_id), int(offset))
+        elif data.startswith(f"{CALLBACK_PREFIX}idy:"):
+            item_id = int(data.rsplit(":", 1)[1])
+            position_id = _sync(_delete_item(item_id))
+            if position_id is None:
+                raise RuntimeError("аккаунт уже выдан или удалён")
+            _bot().send_message(chat_id, "🗑 Аккаунт удалён со склада.")
+            _show_stock(chat_id, position_id, 0)
+        elif data.startswith(f"{CALLBACK_PREFIX}id:"):
+            item_id = int(data.rsplit(":", 1)[1])
+            _bot().send_message(
+                chat_id,
+                "Удалить этот аккаунт со склада? Действие необратимо.",
+                reply_markup=_markup(
+                    [("Да, удалить", f"{CALLBACK_PREFIX}idy:{item_id}")],
+                    [("Отмена", SETTINGS_CALLBACK)],
+                ),
+            )
+        elif data.startswith(f"{CALLBACK_PREFIX}go:"):
+            order_db_id = int(data.rsplit(":", 1)[1])
+            result = _sync(_retry_order(order_db_id))
+            _bot().send_message(
+                chat_id,
+                {
+                    "delivered": "✅ Аккаунт выдан покупателю.",
+                    "no_stock": "🛑 На складе нет свободных аккаунтов. "
+                    "Пополните склад — заказ выдастся автоматически.",
+                    "handled": "Заказ уже обработан.",
+                    "error": "❌ Выдача завершилась ошибкой, подробности ушли "
+                    "в уведомления.",
+                }.get(str(result), f"Состояние заказа: {html.escape(str(result))}"),
+            )
+            _show_orders(chat_id)
         elif data == f"{CALLBACK_PREFIX}new":
             _prompt(
                 chat_id,
@@ -2059,6 +2472,7 @@ def post_start(cardinal: Any) -> None:
     global _cardinal, _worker_future
     _cardinal = cardinal
     _spawn(_resume_state())
+    _spawn(_poll_paid_orders())
     if _worker_future is None or _worker_future.done():
         _worker_future = _spawn(_worker_loop())
 
@@ -2077,7 +2491,9 @@ def new_order(cardinal: Any, event: Any) -> None:
                 "description": description,
                 "amount": max(1, int(getattr(order, "amount", None) or 1)),
                 "lot_id": _order_lot_id(order),
-                "builtin_conflict": _builtin_delivery_conflict(description),
+                "builtin_conflict": _builtin_delivery_conflict(
+                    description, _order_lot_id(order)
+                ),
             }
         )
     )

@@ -645,3 +645,255 @@ def test_stock_mode_routes_text_through_pending_input(monkeypatch):
         SimpleNamespace(text="b@example.com:pw", chat=SimpleNamespace(id=5))
     )
     assert plugin._pending_input is None
+
+
+def test_match_position_falls_back_to_containment(monkeypatch):
+    positions = [{"id": 3, "title": "Spotify", "enabled": True}]
+    bindings = [
+        {"lot_id": "10", "position_id": 3, "lot_title": "Spotify Premium 30 дней"}
+    ]
+    monkeypatch.setattr(plugin, "_positions", lambda: _async_value(positions))
+    monkeypatch.setattr(plugin, "_all_bindings", lambda: _async_value(bindings))
+
+    matched = asyncio.run(
+        plugin._match_position(None, "Spotify Premium 30 дней (автовыдача)")
+    )
+    assert matched["id"] == 3
+
+
+def test_unmatched_order_is_recorded_and_reported(monkeypatch):
+    notified = []
+
+    async def fake_match(_lot_id, _description):
+        return None
+
+    async def fake_insert(_order, _position, status="queued"):
+        assert status == "unmatched"
+        return {"id": 1}
+
+    async def fake_notify(text, **_kwargs):
+        notified.append(text)
+
+    monkeypatch.setattr(plugin, "_match_position", fake_match)
+    monkeypatch.setattr(plugin, "_insert_order", fake_insert)
+    monkeypatch.setattr(plugin, "_notify_owner", fake_notify)
+
+    asyncio.run(
+        plugin._process_new_order(
+            {
+                "id": "ORDER-9",
+                "description": "Чужой лот",
+                "lot_id": None,
+                "amount": 1,
+                "builtin_conflict": False,
+            }
+        )
+    )
+
+    assert notified and "не сопоставлен" in notified[0]
+    assert "ORDER-9" in notified[0]
+
+
+def test_poll_paid_orders_delivers_only_new_ones(monkeypatch):
+    processed = []
+
+    class FakeAccount:
+        @staticmethod
+        def get_sales(**kwargs):
+            assert kwargs["include_paid"] is True
+            return (
+                None,
+                [
+                    SimpleNamespace(
+                        id="111",
+                        description="Spotify Premium 30",
+                        status=SimpleNamespace(name="PAID"),
+                        buyer_username="buyer",
+                        chat_id="users-1-1",
+                        amount=1,
+                    ),
+                    SimpleNamespace(
+                        id="222",
+                        description="Spotify Premium 30",
+                        status=SimpleNamespace(name="PAID"),
+                        buyer_username="buyer2",
+                        chat_id="users-1-2",
+                        amount=1,
+                    ),
+                ],
+                "ru",
+                {},
+            )
+
+    async def known(_order_id):
+        return {"id": 5} if _order_id == "222" else None
+
+    async def fake_process(order):
+        processed.append(order["id"])
+
+    monkeypatch.setattr(
+        plugin, "_cardinal", SimpleNamespace(account=FakeAccount())
+    )
+    monkeypatch.setattr(plugin, "_telegram_id", lambda: 1)
+    monkeypatch.setattr(plugin, "_order_by_funpay_id", known)
+    monkeypatch.setattr(plugin, "_process_new_order", fake_process)
+    monkeypatch.setattr(
+        plugin, "_builtin_delivery_conflict", lambda *_a, **_k: False
+    )
+
+    asyncio.run(plugin._poll_paid_orders())
+    assert processed == ["111"]
+
+
+def test_retry_order_requeues_and_delivers(monkeypatch):
+    executed = []
+
+    class FakeDatabase:
+        @staticmethod
+        async def fetchrow(_query, *_args):
+            return {
+                "id": 7,
+                "order_id": "ORDER-7",
+                "position_id": 3,
+                "position_title": "Spotify",
+                "lot_id": "10",
+                "status": "unmatched",
+                "error_text": None,
+            }
+
+        @staticmethod
+        async def execute(query, *args):
+            executed.append((" ".join(query.split()), args))
+            return "UPDATE 1"
+
+    async def fake_position(_position_id):
+        return {"id": 3, "title": "Spotify", "subscription_days": 30}
+
+    async def fake_fulfill(_order_db_id):
+        return "delivered"
+
+    monkeypatch.setattr(plugin, "_db", lambda: FakeDatabase())
+    monkeypatch.setattr(plugin, "_telegram_id", lambda: 1)
+    monkeypatch.setattr(plugin, "_position", fake_position)
+    monkeypatch.setattr(plugin, "_fulfill_order", fake_fulfill)
+
+    assert asyncio.run(plugin._retry_order(7)) == "delivered"
+    assert executed and "status='queued'" in executed[0][0]
+
+
+def test_delete_item_returns_position_for_navigation(monkeypatch):
+    deleted = []
+
+    class FakeDatabase:
+        @staticmethod
+        async def fetchrow(_query, *_args):
+            return {"position_id": 4}
+
+        @staticmethod
+        async def execute(_query, *args):
+            deleted.append(args)
+            return "DELETE 1"
+
+    monkeypatch.setattr(plugin, "_db", lambda: FakeDatabase())
+    monkeypatch.setattr(plugin, "_telegram_id", lambda: 1)
+
+    assert asyncio.run(plugin._delete_item(15)) == 4
+    assert deleted == [(1, 15)]
+
+
+def test_delete_item_reports_missing_account(monkeypatch):
+    class FakeDatabase:
+        @staticmethod
+        async def fetchrow(_query, *_args):
+            return None
+
+    monkeypatch.setattr(plugin, "_db", lambda: FakeDatabase())
+    monkeypatch.setattr(plugin, "_telegram_id", lambda: 1)
+    assert asyncio.run(plugin._delete_item(15)) is None
+
+
+class ScreenBot:
+    def __init__(self):
+        self.sent = []
+
+    def send_message(self, chat_id, text, reply_markup=None):
+        rows = []
+        if reply_markup is not None:
+            for row in reply_markup.keyboard:
+                for button in row:
+                    rows.append(button.callback_data or button.url or "")
+        self.sent.append((chat_id, text, rows))
+
+
+def _screen_bot(monkeypatch):
+    bot = ScreenBot()
+    monkeypatch.setattr(plugin, "_bot", lambda: bot)
+    monkeypatch.setattr(
+        plugin,
+        "_sync",
+        lambda awaitable, timeout=60: asyncio.run(awaitable),
+    )
+    return bot
+
+
+def test_stock_screen_lists_accounts_and_delete_buttons(monkeypatch):
+    bot = _screen_bot(monkeypatch)
+    monkeypatch.setattr(
+        plugin,
+        "_position",
+        lambda _position_id: _async_value({"id": 2, "title": "Spotify"}),
+    )
+    monkeypatch.setattr(
+        plugin,
+        "_stock_page",
+        lambda _position_id, _offset: _async_value(
+            (
+                [
+                    {"id": 51, "email": "one@example.com", "activation_key": "K"},
+                    {"id": 52, "email": "two@example.com", "activation_key": None},
+                ],
+                2,
+            )
+        ),
+    )
+
+    plugin._show_stock(1, 2, 0)
+
+    _, text, callbacks = bot.sent[0]
+    assert "Склад" in text and "Страница <b>1/1</b>" in text
+    assert "sps:id:51" in callbacks and "sps:id:52" in callbacks
+    assert all(len(value.encode()) < 64 for value in callbacks)
+
+
+def test_orders_screen_offers_manual_delivery(monkeypatch):
+    bot = _screen_bot(monkeypatch)
+    monkeypatch.setattr(
+        plugin,
+        "_recent_orders",
+        lambda _limit=10: _async_value(
+            [
+                {
+                    "id": 9,
+                    "order_id": "ORDER-9",
+                    "status": "unmatched",
+                    "position_title": "Чужой лот",
+                    "error_text": None,
+                },
+                {
+                    "id": 10,
+                    "order_id": "ORDER-10",
+                    "status": "delivered",
+                    "position_title": "Spotify",
+                    "error_text": None,
+                },
+            ]
+        ),
+    )
+
+    plugin._show_orders(1)
+
+    _, text, callbacks = bot.sent[0]
+    assert "не сопоставлен" in text
+    assert "sps:go:9" in callbacks
+    assert "sps:go:10" not in callbacks
+    assert all(len(value.encode()) < 64 for value in callbacks)
