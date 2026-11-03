@@ -553,3 +553,95 @@ def test_fulfill_order_releases_partial_claim_when_stock_short(monkeypatch):
 
     assert asyncio.run(plugin._fulfill_order(5)) == "no_stock"
     assert released == [61]
+
+
+class FakeBot:
+    def __init__(self):
+        self.messages = []
+        self.handlers = []
+        self.callback_handlers = []
+
+    def send_message(self, chat_id, text, **_kwargs):
+        self.messages.append((chat_id, text))
+
+    def register_message_handler(self, callback, **filters):
+        self.handlers.append((callback, filters))
+
+    def register_callback_query_handler(self, callback, func=None):
+        self.callback_handlers.append((callback, func))
+
+
+def _cardinal_with_bot(bot):
+    return SimpleNamespace(
+        telegram=SimpleNamespace(bot=bot, loop=None), plugin_manager=None
+    )
+
+
+def test_pre_init_registers_conventional_settings_handler(monkeypatch):
+    bot = FakeBot()
+    def fake_sync(awaitable, timeout=60):
+        close = getattr(awaitable, "close", None)
+        if close is not None:
+            close()
+        return None
+
+    monkeypatch.setattr(plugin, "_sync", fake_sync)
+    plugin.pre_init(_cardinal_with_bot(bot))
+    assert [callback for callback, _ in bot.handlers] == [plugin._on_setting_message]
+    assert plugin._on_text_message is not None
+
+
+def test_title_input_creates_position_and_asks_for_days(monkeypatch):
+    """Без этого мастер зависал: текст названия не создавал позицию."""
+    created = []
+    prompts = []
+
+    monkeypatch.setattr(plugin, "_telegram_id", lambda: 1)
+    monkeypatch.setattr(
+        plugin,
+        "_create_position",
+        lambda title, days: _async_value({"id": 9, "title": title, "days": days}),
+    )
+    monkeypatch.setattr(
+        plugin,
+        "_update_position",
+        lambda *_args: _async_value(None),
+    )
+    monkeypatch.setattr(plugin, "_sync", lambda awaitable, timeout=60: asyncio.run(awaitable) if asyncio.iscoroutine(awaitable) else None)
+    monkeypatch.setattr(
+        plugin,
+        "_prompt",
+        lambda chat_id, key, text, context=None: prompts.append((key, context)),
+    )
+
+    plugin._pending_input = ("new_title", None)
+    plugin._handle_pending_input(
+        SimpleNamespace(text="Spotify Premium 30", chat=SimpleNamespace(id=5))
+    )
+
+    assert plugin._pending_input is None
+    assert prompts == [("new_days", 9)]
+
+
+def test_stock_mode_routes_text_through_pending_input(monkeypatch):
+    handled = []
+
+    monkeypatch.setattr(
+        plugin, "_handle_stock_input", lambda message: handled.append(message.text)
+    )
+    plugin._stock_mode = {"position_id": 3, "added": 0}
+    plugin._pending_input = (plugin.STOCK_PENDING_KEY, 3)
+
+    plugin._handle_pending_input(
+        SimpleNamespace(text="a@example.com:pw", chat=SimpleNamespace(id=5))
+    )
+
+    assert handled == ["a@example.com:pw"]
+    assert plugin._pending_input == (plugin.STOCK_PENDING_KEY, 3)
+
+    plugin._stock_mode = None
+    plugin._pending_input = (plugin.STOCK_PENDING_KEY, 3)
+    plugin._handle_pending_input(
+        SimpleNamespace(text="b@example.com:pw", chat=SimpleNamespace(id=5))
+    )
+    assert plugin._pending_input is None

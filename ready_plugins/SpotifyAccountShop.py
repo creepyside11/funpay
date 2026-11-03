@@ -12,7 +12,7 @@ from urllib.parse import urlsplit
 from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 NAME = "Spotify Account Shop"
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 DESCRIPTION = "Склад Spotify-аккаунтов: привязка лотов, автовыдача и напоминание об отзыве"
 CREDITS = "FunPay aiogram bot"
 SETTINGS_PAGE = True
@@ -20,6 +20,7 @@ TELETHON = False
 UUID = "9d378672-7534-41b2-ab16-87057c697f37"
 
 CALLBACK_PREFIX = "sps:"
+STOCK_PENDING_KEY = "__stock__"
 PLUGIN_SETTINGS_PREFIX = "47"
 SETTINGS_CALLBACK = f"{PLUGIN_SETTINGS_PREFIX}:{UUID}:0"
 DEFAULT_POSITION_DAYS = 30
@@ -1478,7 +1479,7 @@ def _show_position(chat_id: int, position_id: int) -> None:
             )
     rows: list[list[tuple[str, str]]] = [
         [("➕ Пополнить склад", f"{CALLBACK_PREFIX}fill:{position_id}")],
-        [("🔗 Привязать лот", f"{CALLBACK_PREFIX}bind:{position_id}:0")],
+        [("➕ Добавить лот", f"{CALLBACK_PREFIX}bind:{position_id}:0")],
         [("📅 Срок подписки", f"{CALLBACK_PREFIX}days:{position_id}")],
         [("✏️ Название", f"{CALLBACK_PREFIX}name:{position_id}")],
         [
@@ -1568,11 +1569,16 @@ def _show_bind_lots(chat_id: int, position_id: int, offset: int) -> None:
     if nav:
         rows.append(nav)
     rows.append([("⬅️ Позиция", f"{CALLBACK_PREFIX}pos:{position_id}")])
+    pages = (len(free) + LOT_PAGE_SIZE - 1) // LOT_PAGE_SIZE
+    page_no = offset // LOT_PAGE_SIZE + 1
     _bot().send_message(
         chat_id,
-        f"🔗 <b>Лот → «{html.escape(_short(position['title'], 40))}»</b>\n\n"
-        f"Свободных лотов: <b>{len(free)}</b>. Выберите лот — при оплате его "
-        "заказов аккаунт будет выдаваться с этого склада.",
+        f"➕ <b>Добавить лот в «{html.escape(_short(position['title'], 40))}»</b>\n\n"
+        f"Страница <b>{page_no}/{pages}</b> · всего свободных лотов: "
+        f"<b>{len(free)}</b>\n"
+        "Нажмите лот, чтобы привязать его к этой позиции: при оплате его "
+        "заказов аккаунт будет выдаваться с этого склада.\n\n"
+        "Лоты, уже занятые другой позицией, в списке не показываются.",
         reply_markup=_markup(*rows),
     )
 
@@ -1641,7 +1647,7 @@ def _enter_stock(chat_id: int, position_id: int) -> None:
     position = _sync(_position(position_id))
     if not position:
         raise RuntimeError("позиция не найдена")
-    _pending_input = None
+    _pending_input = (STOCK_PENDING_KEY, position_id)
     _stock_mode = {"position_id": position_id, "added": 0}
     _bot().send_message(
         chat_id,
@@ -1731,6 +1737,14 @@ def _handle_pending_input(message: Any) -> None:
         return
     key, context = _pending_input
     _pending_input = None
+    if key == STOCK_PENDING_KEY:
+        _handle_stock_input(message)
+        if _stock_mode is not None:
+            _pending_input = (
+                STOCK_PENDING_KEY,
+                int(_stock_mode["position_id"]),
+            )
+        return
     value = str(message.text or "").strip()
     chat_id = int(message.chat.id)
     try:
@@ -1999,7 +2013,15 @@ def _on_callback(call: Any) -> None:
         logger.exception("Ошибка callback Spotify Account Shop")
         _bot().send_message(chat_id, f"❌ {html.escape(str(exc)[:500])}")
 
-def _on_text_message(message: Any) -> None:
+def _on_setting_message(message: Any) -> None:
+    """Обработчик ввода настроек плагина.
+
+    Имя важно: старые сборки FunPayCardinal вызывают именно
+    ``_on_setting_message`` напрямую, когда у плагина заполнен
+    ``_pending_input``. Иначе сообщение проходит через общий telebot-dispatch
+    и может не дойти до плагина — тогда после отправки названия позиции
+    визуально ничего не происходит.
+    """
     try:
         if _pending_input is not None:
             _handle_pending_input(message)
@@ -2008,6 +2030,10 @@ def _on_text_message(message: Any) -> None:
             _handle_stock_input(message)
     except Exception:
         logger.exception("Ошибка обработки текста Spotify Account Shop")
+
+def _on_text_message(message: Any) -> None:
+    # Совместимый алиас для регистраций, сохранённых старой версией плагина.
+    _on_setting_message(message)
 
 # --------------------------------------------------------------------------- #
 # Хуки плагина
@@ -2023,7 +2049,7 @@ def pre_init(cardinal: Any) -> None:
         func=lambda call: _is_own_callback(str(call.data or "")),
     )
     bot.register_message_handler(
-        _on_text_message,
+        _on_setting_message,
         content_types=["text"],
         func=lambda _message: _pending_input is not None
         or _stock_mode is not None,
