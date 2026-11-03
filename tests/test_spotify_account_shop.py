@@ -981,19 +981,11 @@ def test_diag_screen_marks_orders_missing_from_database(monkeypatch):
     bot = _screen_bot(monkeypatch)
     monkeypatch.setattr(
         plugin,
-        "_api_paid_orders",
+        "_collect_paid_orders",
         lambda: _async_value(
             [
-                SimpleNamespace(
-                    id="501",
-                    status=SimpleNamespace(name="PAID"),
-                    description="Spotify Premium 30",
-                ),
-                SimpleNamespace(
-                    id="502",
-                    status=SimpleNamespace(name="PAID"),
-                    description="Spotify Premium 90",
-                ),
+                {"id": "501", "description": "Spotify Premium 30"},
+                {"id": "502", "description": "Spotify Premium 90"},
             ]
         ),
     )
@@ -1006,6 +998,140 @@ def test_diag_screen_marks_orders_missing_from_database(monkeypatch):
     plugin._show_diag(1)
 
     _, text, callbacks = bot.sent[0]
-    assert "оплаченных: <b>2</b>" in text
+    assert "Оплаченных заказов найдено: <b>2</b>" in text
     assert "✅" in text and "⬜" in text
     assert "sps:pol" in callbacks
+
+
+TRADE_PAGE_HTML = """
+<html><body data-app-data='{"userId": 100, "locale": "en", "csrf-token": "x"}'>
+<div class="user-link-name">seller</div>
+<h1 class="page-header page-header-no-hr">My sales</h1>
+<a class="tc-item info" href="/orders/ABC123/">
+  <div class="tc-order">#ABC123</div>
+  <div class="order-desc"><div>Spotify Premium 30 дней, 2 шт.</div></div>
+  <div class="tc-price">199 ₽</div>
+  <div class="media-user-name"><span data-href="/users/555/">buyer</span></div>
+  <div class="text-muted">Spotify</div>
+  <div class="tc-date-time">today 10:00</div>
+</a>
+<a class="tc-item warning" href="/orders/OLD1/">
+  <div class="tc-order">#OLD1</div>
+  <div class="order-desc"><div>Spotify Premium 30 дней</div></div>
+</a>
+</body></html>
+"""
+
+
+def test_parse_trade_html_reads_paid_orders_regardless_of_locale():
+    from types import SimpleNamespace as NS
+
+    account = NS(id=100)
+    payloads = plugin._parse_trade_html(TRADE_PAGE_HTML, account)
+
+    assert len(payloads) == 1
+    order = payloads[0]
+    assert order["id"] == "ABC123"
+    assert order["description"].startswith("Spotify Premium 30")
+    assert order["amount"] == 2
+    assert order["chat_name"] == "buyer"
+    assert order["chat_id"] == "users-100-555"
+
+
+def test_collect_paid_orders_falls_back_to_page_scraping(monkeypatch):
+    async def broken():
+        raise RuntimeError("UnauthorizedError: Ошибка запроса к orders/trade")
+
+    async def scraped():
+        return [{"id": "ABC123", "description": "Spotify", "amount": 1}]
+
+    monkeypatch.setattr(plugin, "_api_paid_orders", broken)
+    monkeypatch.setattr(plugin, "_scrape_paid_orders", scraped)
+
+    paid = asyncio.run(plugin._collect_paid_orders())
+    assert [item["id"] for item in paid] == ["ABC123"]
+
+
+def test_collect_paid_orders_reports_both_failures(monkeypatch):
+    async def broken():
+        raise RuntimeError("api down")
+
+    async def broken_scrape():
+        raise RuntimeError("scrape down")
+
+    monkeypatch.setattr(plugin, "_api_paid_orders", broken)
+    monkeypatch.setattr(plugin, "_scrape_paid_orders", broken_scrape)
+
+    with pytest.raises(RuntimeError) as error:
+        asyncio.run(plugin._collect_paid_orders())
+    text = str(error.value)
+    assert "api down" in text and "scrape down" in text
+
+
+def test_scrape_paid_orders_uses_account_method(monkeypatch):
+    calls = []
+
+    class Response:
+        content = TRADE_PAGE_HTML.encode("utf-8")
+
+    class Account:
+        id = 100
+
+        @staticmethod
+        def method(*args, **kwargs):
+            calls.append((args, kwargs))
+            return Response()
+
+    monkeypatch.setattr(plugin, "_cardinal", SimpleNamespace(account=Account()))
+
+    payloads = asyncio.run(plugin._scrape_paid_orders())
+    assert payloads and payloads[0]["id"] == "ABC123"
+    assert calls and "funpay.com/orders/trade" in str(calls[0][0][1])
+
+
+LOGIN_PAGE_HTML = """
+<html><body>
+<form action="https://funpay.com/account/login" method="post">
+<input name="login">
+<input name="password">
+</form>
+</body></html>
+"""
+
+
+def test_scrape_paid_orders_reports_expired_session(monkeypatch):
+    class Response:
+        content = LOGIN_PAGE_HTML.encode("utf-8")
+
+    class Account:
+        id = 100
+
+        @staticmethod
+        def method(*_args, **_kwargs):
+            return Response()
+
+    monkeypatch.setattr(plugin, "_cardinal", SimpleNamespace(account=Account()))
+
+    with pytest.raises(RuntimeError) as error:
+        asyncio.run(plugin._scrape_paid_orders())
+    assert "сессия истекла" in str(error.value)
+
+
+def test_scrape_paid_orders_returns_empty_when_no_paid_orders(monkeypatch):
+    html = (
+        '<html><body><div class="user-link-name">seller</div>'
+        '<h1 class="page-header">Мои продажи</h1></body></html>'
+    )
+
+    class Response:
+        content = html.encode("utf-8")
+
+    class Account:
+        id = 100
+
+        @staticmethod
+        def method(*_args, **_kwargs):
+            return Response()
+
+    monkeypatch.setattr(plugin, "_cardinal", SimpleNamespace(account=Account()))
+    assert asyncio.run(plugin._scrape_paid_orders()) == []

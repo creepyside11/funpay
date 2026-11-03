@@ -12,7 +12,7 @@ from urllib.parse import urlsplit
 from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 NAME = "Spotify Account Shop"
-VERSION = "1.0.3"
+VERSION = "1.0.4"
 DESCRIPTION = "Склад Spotify-аккаунтов: привязка лотов, автовыдача и напоминание об отзыве"
 CREDITS = "FunPay aiogram bot"
 SETTINGS_PAGE = True
@@ -1456,11 +1456,153 @@ def _order_status_name(order: Any) -> str:
     text = str(status)
     return text.rsplit(".", 1)[-1]
 
+
+_ORDER_ID_FROM_HREF = re.compile(r"/orders/([A-Za-z0-9]+)/")
+_BUYER_ID_RE = re.compile(r"/users/(\d+)/")
+
+def _amount_from_title(description: str) -> int:
+    match = AMOUNT_RE.search(str(description or ""))
+    if not match:
+        return 1
+    digits = re.sub(r"\D", "", match.group(0))
+    try:
+        return max(1, int(digits))
+    except ValueError:
+        return 1
+
+def _parse_trade_html(html_text: str, account: Any) -> list[dict[str, Any]]:
+    """Разбирает страницу «Мои продажи» без строгих проверок локали.
+
+    Штатный ``Account.get_sales`` падает с UnauthorizedError, если заголовок
+    страницы не совпал с ожидаемым переводом, хотя сессия жива. Здесь тот же
+    разбор, но терпимый к языку интерфейса.
+    """
+    try:
+        from bs4 import BeautifulSoup
+    except Exception as exc:  # pragma: no cover - bs4 всегда есть у бота
+        raise RuntimeError("модуль bs4 недоступен для разбора страницы") from exc
+
+    parser = BeautifulSoup(html_text, "lxml")
+    own_id = getattr(account, "id", None)
+    result: list[dict[str, Any]] = []
+    for widget in parser.find_all("a", {"class": "tc-item"}):
+        classes = widget.get("class") or []
+        if "warning" in classes:
+            continue
+        if "info" not in classes:
+            continue
+        order_id = ""
+        order_div = widget.find("div", {"class": "tc-order"})
+        if order_div is not None:
+            order_id = str(order_div.text or "").lstrip("#").strip()
+        if not order_id:
+            match = _ORDER_ID_FROM_HREF.search(str(widget.get("href") or ""))
+            order_id = match.group(1) if match else ""
+        if not order_id:
+            continue
+        description = ""
+        desc_div = widget.find("div", {"class": "order-desc"})
+        if desc_div is not None:
+            inner = desc_div.find("div")
+            description = str((inner or desc_div).text or "").strip()
+        buyer_username = ""
+        buyer_id = None
+        buyer_box = widget.find("div", {"class": "media-user-name"})
+        if buyer_box is not None:
+            span = buyer_box.find("span")
+            if span is not None:
+                buyer_username = str(span.text or "").strip()
+                match = _BUYER_ID_RE.search(str(span.get("data-href") or ""))
+                if match:
+                    buyer_id = int(match.group(1))
+        chat_id = None
+        if buyer_id and own_id:
+            first, second = sorted([int(buyer_id), int(own_id)])
+            chat_id = f"users-{first}-{second}"
+        result.append(
+            {
+                "id": order_id,
+                "chat_id": chat_id,
+                "chat_name": buyer_username,
+                "description": description,
+                "amount": _amount_from_title(description),
+                "lot_id": (
+                    OFFER_RE.search(str(widget)).group(1)
+                    if OFFER_RE.search(str(widget))
+                    else None
+                ),
+                "builtin_conflict": False,
+            }
+        )
+    return result
+
+async def _scrape_paid_orders() -> list[dict[str, Any]]:
+    """Забирает оплаченные заказы со страницы продаж вручную."""
+    account = getattr(_cardinal, "account", None)
+    method = getattr(account, "method", None)
+    if method is None:
+        raise RuntimeError("метод account.method недоступен")
+    last_error: Exception | None = None
+    empty_html = ""
+    for url in (
+        "https://funpay.com/orders/trade?state=paid",
+        "https://funpay.com/orders/trade",
+    ):
+        try:
+            response = await asyncio.to_thread(
+                method, "get", url, {}, {}, False, True
+            )
+        except TypeError:
+            response = await asyncio.to_thread(method, "get", url, {}, {})
+        except Exception as exc:
+            last_error = exc
+            continue
+        html_text = (getattr(response, "content", b"") or b"").decode(
+            "utf-8", errors="replace"
+        )
+        payloads = await asyncio.to_thread(
+            _parse_trade_html, html_text, account
+        )
+        if payloads:
+            return payloads
+        empty_html = html_text
+    if last_error is not None:
+        raise last_error
+    probe = empty_html.lower()
+    if not empty_html or "account/login" in probe or "user-link-name" not in probe:
+        raise RuntimeError(
+            "FunPay отдал страницу входа вместо продаж — сессия истекла. "
+            "Отправьте боту golden_key заново (FunPay-аккаунт → сменить cookie)."
+        )
+    return []
+
+async def _collect_paid_orders() -> list[dict[str, Any]]:
+    """Оплаченные заказы: сначала штатный API, затем ручной разбор страницы."""
+    try:
+        orders = await _api_paid_orders()
+    except Exception as api_error:
+        logger.warning(
+            "Штатный get_sales не сработал, разбираю страницу продаж вручную",
+            exc_info=True,
+        )
+        try:
+            return await _scrape_paid_orders()
+        except Exception as scrape_error:
+            raise RuntimeError(
+                f"{type(api_error).__name__}: {api_error}; "
+                f"ручной разбор: {type(scrape_error).__name__}: {scrape_error}"
+            ) from scrape_error
+    return [
+        _order_payload(order)
+        for order in orders
+        if _order_status_name(order) == "PAID"
+    ]
+
 async def _poll_paid_orders() -> None:
     """Страховка: выдаёт оплаченные заказы даже без события NEW_ORDER."""
     global _poll_error, _poll_error_at
     try:
-        orders = await _api_paid_orders()
+        paid = await _collect_paid_orders()
     except Exception as exc:
         message = f"{type(exc).__name__}: {exc}"
         logger.warning("Не получены оплаченные заказы FunPay", exc_info=True)
@@ -1486,14 +1628,11 @@ async def _poll_paid_orders() -> None:
     _poll_error = None
     processed = 0
     delivered = 0
-    paid_total = 0
-    for order in orders:
+    paid_total = len(paid)
+    for payload in paid:
         if processed >= 25:
             break
-        if _order_status_name(order) != "PAID":
-            continue
-        paid_total += 1
-        order_id = str(getattr(order, "id", "") or "")
+        order_id = str(payload.get("id") or "")
         if not order_id:
             continue
         existing = await _order_by_funpay_id(order_id)
@@ -1501,7 +1640,7 @@ async def _poll_paid_orders() -> None:
             continue
         processed += 1
         try:
-            await _process_new_order(_order_payload(order))
+            await _process_new_order(payload)
             delivered += 1
         except Exception:
             logger.exception("Не выдан заказ %s при опросе API", order_id)
@@ -1943,7 +2082,7 @@ def _show_diag(chat_id: int) -> None:
     """Диагностика: что реально отдаёт API FunPay по оплаченным заказам."""
     _reset_input_state()
     try:
-        orders = _sync(_api_paid_orders())
+        paid = _sync(_collect_paid_orders())
     except Exception as exc:
         _bot().send_message(
             chat_id,
@@ -1953,27 +2092,23 @@ def _show_diag(chat_id: int) -> None:
             reply_markup=_markup([("⬅️ Назад", SETTINGS_CALLBACK)]),
         )
         return
-    paid = [
-        order for order in orders if _order_status_name(order) == "PAID"
-    ]
     lines = [
-        "🔍 <b>Проверка заказов через API</b>",
+        "🔍 <b>Проверка заказов</b>",
         "",
-        f"Всего заказов в ответе: <b>{len(orders)}</b> · "
-        f"оплаченных: <b>{len(paid)}</b>",
+        f"Оплаченных заказов найдено: <b>{len(paid)}</b>",
         "",
     ]
     known = _sync(_recent_orders(50))
     known_ids = {str(order["order_id"]) for order in known}
     missing = 0
-    for order in paid[:10]:
-        order_id = str(getattr(order, "id", "") or "")
+    for payload in paid[:10]:
+        order_id = str(payload.get("id") or "")
         in_db = order_id in known_ids
         if not in_db:
             missing += 1
         lines.append(
             f"{'✅' if in_db else '⬜'} <code>#{html.escape(order_id)}</code> — "
-            f"{html.escape(_short(str(getattr(order, 'description', '')), 60))}"
+            f"{html.escape(_short(str(payload.get('description')), 60))}"
         )
     if not paid:
         lines.append("Оплаченных заказов API не вернул.")
