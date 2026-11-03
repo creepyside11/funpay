@@ -12,7 +12,7 @@ from urllib.parse import urlsplit
 from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 NAME = "Spotify Account Shop"
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 DESCRIPTION = "Склад Spotify-аккаунтов: привязка лотов, автовыдача и напоминание об отзыве"
 CREDITS = "FunPay aiogram bot"
 SETTINGS_PAGE = True
@@ -275,6 +275,39 @@ async def _ensure_schema() -> None:
             ON spotify_accounts_orders (telegram_id, status, created_at);
         CREATE INDEX IF NOT EXISTS spotify_accounts_followup_idx
             ON spotify_accounts_orders (telegram_id, followup_status, followup_at);
+
+        -- Таблицы могли быть созданы прошлой версией плагина. Без этих
+        -- ALTER-ов INSERT в заказы падал на отсутствующей колонке, поэтому
+        -- оплаченный заказ не сохранялся и не выдавался.
+        ALTER TABLE spotify_accounts_orders
+            ADD COLUMN IF NOT EXISTS amount INTEGER NOT NULL DEFAULT 1,
+            ADD COLUMN IF NOT EXISTS item_ids BIGINT[] NOT NULL DEFAULT '{}',
+            ADD COLUMN IF NOT EXISTS error_text TEXT,
+            ADD COLUMN IF NOT EXISTS delivered_at TIMESTAMPTZ,
+            ADD COLUMN IF NOT EXISTS followup_at TIMESTAMPTZ,
+            ADD COLUMN IF NOT EXISTS followup_status TEXT NOT NULL DEFAULT 'none',
+            ADD COLUMN IF NOT EXISTS followup_attempts INTEGER NOT NULL DEFAULT 0,
+            ADD COLUMN IF NOT EXISTS chat_id TEXT,
+            ADD COLUMN IF NOT EXISTS chat_name TEXT,
+            ADD COLUMN IF NOT EXISTS buyer_username TEXT;
+
+        ALTER TABLE spotify_accounts_items
+            ADD COLUMN IF NOT EXISTS activation_key TEXT,
+            ADD COLUMN IF NOT EXISTS reserved_order_id TEXT,
+            ADD COLUMN IF NOT EXISTS order_id TEXT,
+            ADD COLUMN IF NOT EXISTS sold_at TIMESTAMPTZ;
+
+        ALTER TABLE spotify_accounts_positions
+            ADD COLUMN IF NOT EXISTS low_stock_notified BOOLEAN NOT NULL DEFAULT FALSE;
+
+        ALTER TABLE spotify_accounts_settings
+            ADD COLUMN IF NOT EXISTS followup_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+            ADD COLUMN IF NOT EXISTS followup_delay_minutes INTEGER NOT NULL DEFAULT 60,
+            ADD COLUMN IF NOT EXISTS review_url TEXT NOT NULL
+                DEFAULT 'https://funpay.com/orders/',
+            ADD COLUMN IF NOT EXISTS delivery_template TEXT,
+            ADD COLUMN IF NOT EXISTS followup_template TEXT,
+            ADD COLUMN IF NOT EXISTS low_stock_threshold INTEGER NOT NULL DEFAULT 2;
         """
     )
     await _db().execute(
@@ -1216,6 +1249,20 @@ def _builtin_delivery_conflict(
 # Обработка заказов
 # --------------------------------------------------------------------------- #
 
+def _order_payload(order: Any) -> dict[str, Any]:
+    """Нормализует заказ FunPay (событие или элемент списка продаж)."""
+    description = str(getattr(order, "description", "") or "")
+    lot_id = _order_lot_id(order)
+    return {
+        "id": str(getattr(order, "id", "") or ""),
+        "chat_id": getattr(order, "chat_id", None),
+        "chat_name": str(getattr(order, "buyer_username", "") or ""),
+        "description": description,
+        "amount": max(1, int(getattr(order, "amount", None) or 1)),
+        "lot_id": lot_id,
+        "builtin_conflict": _builtin_delivery_conflict(description, lot_id),
+    }
+
 async def _record_unmatched(order: dict[str, Any]) -> None:
     inserted = await _insert_order(order, None, status="unmatched")
     if not inserted:
@@ -1356,62 +1403,115 @@ async def _retry_order(order_db_id: int) -> str:
     )
     return await _fulfill_order(order_db_id)
 
-async def _poll_paid_orders() -> None:
-    """Страховка: выдаёт оплаченные заказы даже без события NEW_ORDER.
+_poll_error: str | None = None
+_poll_error_at: datetime | None = None
 
-    Старые сборки бота могут не доставлять хук о новом заказе в загруженный
-    плагин. Тогда продавец узнаёт о продаже только из FunPay. Здесь мы сами
-    смотрим список оплаченных заказов и выдаём всё, чего ещё нет в базе.
+async def _api_paid_orders() -> list[Any]:
+    """Возвращает оплаченные заказы прямо из API FunPay.
+
+    Полностью независимо от события NEW_ORDER и от Runner: обычный HTTP-запрос
+    к странице продаж, поэтому работает даже если бот не присылает уведомления.
     """
     account = getattr(_cardinal, "account", None)
-    get_sales = getattr(account, "get_sales", None)
+    get_sales = getattr(account, "get_sales", None) or getattr(
+        account, "get_sells", None
+    )
     if get_sales is None:
-        return
-    try:
-        data = await asyncio.to_thread(
-            get_sales,
-            include_paid=True,
-            include_closed=False,
-            include_refunded=False,
-        )
-    except Exception:
-        logger.warning("Не получены оплаченные заказы FunPay", exc_info=True)
-        return
-    orders = []
-    if isinstance(data, tuple):
-        for chunk in data:
-            if isinstance(chunk, list):
-                orders = chunk
-                break
-    elif isinstance(data, list):
-        orders = data
-    processed = 0
-    for order in orders:
-        if processed >= 20:
-            break
-        status = getattr(getattr(order, "status", None), "name", "")
-        if status and status != "PAID":
+        raise RuntimeError("метод get_sales недоступен у аккаунта FunPay")
+    attempts = (
+        {"include_paid": True, "include_refunded": False},
+        {"include_paid": True},
+        {},
+    )
+    last_error: Exception | None = None
+    for kwargs in attempts:
+        try:
+            data = await asyncio.to_thread(get_sales, **kwargs)
+        except TypeError as exc:
+            last_error = exc
             continue
+        except Exception as exc:
+            last_error = exc
+            break
+        orders: list[Any] = []
+        if isinstance(data, tuple):
+            for chunk in data:
+                if isinstance(chunk, list):
+                    orders = chunk
+                    break
+        elif isinstance(data, list):
+            orders = data
+        return orders
+    if last_error is not None:
+        raise last_error
+    return []
+
+def _order_status_name(order: Any) -> str:
+    status = getattr(order, "status", None)
+    if status is None:
+        return ""
+    name = getattr(status, "name", None)
+    if name:
+        return str(name)
+    text = str(status)
+    return text.rsplit(".", 1)[-1]
+
+async def _poll_paid_orders() -> None:
+    """Страховка: выдаёт оплаченные заказы даже без события NEW_ORDER."""
+    global _poll_error, _poll_error_at
+    try:
+        orders = await _api_paid_orders()
+    except Exception as exc:
+        message = f"{type(exc).__name__}: {exc}"
+        logger.warning("Не получены оплаченные заказы FunPay", exc_info=True)
+        now = datetime.now(timezone.utc)
+        should_report = (
+            _poll_error != message
+            or _poll_error_at is None
+            or (now - _poll_error_at) > timedelta(hours=1)
+        )
+        if should_report:
+            _poll_error = message
+            _poll_error_at = now
+            await _notify_owner(
+                "⚠️ <b>Не удалось получить заказы из API FunPay</b>\n\n"
+                f"Причина: <code>{html.escape(message[:400])}</code>\n\n"
+                "Автовыдача по событиям может не работать. Проверьте вручную "
+                "кнопкой «🔍 Проверить заказы».",
+                reply_markup=_markup(
+                    [("🔍 Проверить заказы", f"{CALLBACK_PREFIX}diag")]
+                ),
+            )
+        return
+    _poll_error = None
+    processed = 0
+    delivered = 0
+    paid_total = 0
+    for order in orders:
+        if processed >= 25:
+            break
+        if _order_status_name(order) != "PAID":
+            continue
+        paid_total += 1
         order_id = str(getattr(order, "id", "") or "")
         if not order_id:
             continue
         existing = await _order_by_funpay_id(order_id)
         if existing:
             continue
-        description = str(getattr(order, "description", "") or "")
         processed += 1
-        await _process_new_order(
-            {
-                "id": order_id,
-                "chat_id": getattr(order, "chat_id", None),
-                "chat_name": str(getattr(order, "buyer_username", "") or ""),
-                "description": description,
-                "amount": max(1, int(getattr(order, "amount", None) or 1)),
-                "lot_id": _order_lot_id(order),
-                "builtin_conflict": _builtin_delivery_conflict(
-                    description, _order_lot_id(order)
-                ),
-            }
+        try:
+            await _process_new_order(_order_payload(order))
+            delivered += 1
+        except Exception:
+            logger.exception("Не выдан заказ %s при опросе API", order_id)
+    if processed and not delivered:
+        await _notify_owner(
+            "🟡 <b>Опрос API нашёл заказы, но выдачи не было</b>\n\n"
+            f"Оплаченных заказов: <b>{paid_total}</b>, обработано: "
+            f"<b>{processed}</b>.\n"
+            "Проверьте привязку лотов к позиции.",
+            reply_markup=_markup([("📋 Заказы", f"{CALLBACK_PREFIX}orders")]),
         )
 
 async def _resume_state() -> None:
@@ -1643,6 +1743,7 @@ def _show_home(chat_id: int) -> None:
         f"лотов привязано: <b>{bound}</b>",
         f"Склад: <b>{available}</b> доступно · <b>{sold}</b> продано",
         f"Напоминание об отзыве: {followup_state}",
+        f"Опрос API заказов: {'⚠️ ошибка' if _poll_error else '✅ каждые 90 с'}",
         "",
         "При оплате привязанного лота бот выдаёт аккаунт со склада. Через заданное "
         "время он напишет покупателю и попросит подтвердить заказ и оставить отзыв.",
@@ -1668,6 +1769,7 @@ def _show_home(chat_id: int) -> None:
     rows: list[list[tuple[str, str]]] = [
         [("📦 Позиции и склад", f"{CALLBACK_PREFIX}pos")],
         [("📋 Заказы", f"{CALLBACK_PREFIX}orders")],
+        [("🔍 Проверить заказы", f"{CALLBACK_PREFIX}diag")],
         [("➕ Новая позиция", f"{CALLBACK_PREFIX}new")],
         [("⏱ Напоминание об отзыве", f"{CALLBACK_PREFIX}fw")],
         [("📝 Шаблон выдачи", f"{CALLBACK_PREFIX}tpl")],
@@ -1836,6 +1938,59 @@ def _show_stock(chat_id: int, position_id: int, offset: int) -> None:
         "Нажмите на аккаунт, чтобы удалить его со склада.",
         reply_markup=_markup(*rows),
     )
+
+def _show_diag(chat_id: int) -> None:
+    """Диагностика: что реально отдаёт API FunPay по оплаченным заказам."""
+    _reset_input_state()
+    try:
+        orders = _sync(_api_paid_orders())
+    except Exception as exc:
+        _bot().send_message(
+            chat_id,
+            "🔍 <b>Проверка заказов</b>\n\n"
+            f"❌ API FunPay недоступен: <code>{html.escape(str(exc)[:400])}</code>\n\n"
+            "Пока API не отвечает, автовыдача невозможна.",
+            reply_markup=_markup([("⬅️ Назад", SETTINGS_CALLBACK)]),
+        )
+        return
+    paid = [
+        order for order in orders if _order_status_name(order) == "PAID"
+    ]
+    lines = [
+        "🔍 <b>Проверка заказов через API</b>",
+        "",
+        f"Всего заказов в ответе: <b>{len(orders)}</b> · "
+        f"оплаченных: <b>{len(paid)}</b>",
+        "",
+    ]
+    known = _sync(_recent_orders(50))
+    known_ids = {str(order["order_id"]) for order in known}
+    missing = 0
+    for order in paid[:10]:
+        order_id = str(getattr(order, "id", "") or "")
+        in_db = order_id in known_ids
+        if not in_db:
+            missing += 1
+        lines.append(
+            f"{'✅' if in_db else '⬜'} <code>#{html.escape(order_id)}</code> — "
+            f"{html.escape(_short(str(getattr(order, 'description', '')), 60))}"
+        )
+    if not paid:
+        lines.append("Оплаченных заказов API не вернул.")
+    elif missing:
+        lines.append("")
+        lines.append(
+            f"⬜ Не обработано: <b>{missing}</b>. Нажмите «Выдать оплаченные», "
+            "чтобы плагин забрал их из API и выдал аккаунты."
+        )
+    else:
+        lines.extend(["", "✅ Все оплаченные заказы уже обработаны."])
+    rows: list[list[tuple[str, str]]] = [
+        [("▶️ Выдать оплаченные", f"{CALLBACK_PREFIX}pol")],
+        [("📋 Заказы", f"{CALLBACK_PREFIX}orders")],
+        [("⬅️ Назад", SETTINGS_CALLBACK)],
+    ]
+    _bot().send_message(chat_id, "\n".join(lines), reply_markup=_markup(*rows))
 
 def _show_orders(chat_id: int) -> None:
     _reset_input_state()
@@ -2225,6 +2380,15 @@ def _on_callback(call: Any) -> None:
             _show_positions(chat_id)
         elif data == f"{CALLBACK_PREFIX}orders":
             _show_orders(chat_id)
+        elif data == f"{CALLBACK_PREFIX}diag":
+            _show_diag(chat_id)
+        elif data == f"{CALLBACK_PREFIX}pol":
+            _spawn(_poll_paid_orders())
+            _bot().send_message(
+                chat_id,
+                "🔄 Запрашиваю оплаченные заказы из API FunPay… "
+                "Результат придёт уведомлением.",
+            )
         elif data.startswith(f"{CALLBACK_PREFIX}stk:"):
             _, _, tail = data.split(":", 2)
             position_id, offset = tail.split(":")
@@ -2477,26 +2641,16 @@ def post_start(cardinal: Any) -> None:
         _worker_future = _spawn(_worker_loop())
 
 def new_order(cardinal: Any, event: Any) -> None:
-    order = event.order
-    status = getattr(getattr(order, "status", None), "name", "")
-    if status and status != "PAID":
+    global _cardinal
+    if _cardinal is None:
+        _cardinal = cardinal
+    order = getattr(event, "order", None)
+    if order is None:
         return
-    description = str(getattr(order, "description", "") or "")
-    _spawn(
-        _process_new_order(
-            {
-                "id": str(order.id),
-                "chat_id": getattr(order, "chat_id", None),
-                "chat_name": str(getattr(order, "buyer_username", "") or ""),
-                "description": description,
-                "amount": max(1, int(getattr(order, "amount", None) or 1)),
-                "lot_id": _order_lot_id(order),
-                "builtin_conflict": _builtin_delivery_conflict(
-                    description, _order_lot_id(order)
-                ),
-            }
-        )
-    )
+    status = _order_status_name(order)
+    if status in {"REFUNDED", "PARTIALLY_REFUNDED", "UNPAID"}:
+        return
+    _spawn(_process_new_order(_order_payload(order)))
 
 def order_status_changed(cardinal: Any, event: Any) -> None:
     status = getattr(getattr(event.order, "status", None), "name", "")

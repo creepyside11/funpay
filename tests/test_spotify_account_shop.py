@@ -897,3 +897,115 @@ def test_orders_screen_offers_manual_delivery(monkeypatch):
     assert "sps:go:9" in callbacks
     assert "sps:go:10" not in callbacks
     assert all(len(value.encode()) < 64 for value in callbacks)
+
+
+def test_schema_adds_columns_for_tables_from_older_versions(monkeypatch):
+    executed = []
+
+    class FakeDatabase:
+        @staticmethod
+        async def execute(query, *args):
+            executed.append(" ".join(query.split()))
+            return "OK"
+
+        @staticmethod
+        async def fetchrow(_query, *_args):
+            return None
+
+        @staticmethod
+        async def fetch(_query, *_args):
+            return []
+
+    monkeypatch.setattr(plugin, "_db", lambda: FakeDatabase())
+    monkeypatch.setattr(plugin, "_telegram_id", lambda: 1)
+
+    asyncio.run(plugin._ensure_schema())
+
+    ddl = executed[0]
+    assert "ADD COLUMN IF NOT EXISTS amount" in ddl
+    assert "ADD COLUMN IF NOT EXISTS item_ids" in ddl
+    assert "spotify_accounts_items" in ddl
+
+
+def test_api_paid_orders_falls_back_when_kwargs_unsupported(monkeypatch):
+    calls = []
+
+    class OldAccount:
+        @staticmethod
+        def get_sales(**kwargs):
+            calls.append(kwargs)
+            if kwargs:
+                raise TypeError("unexpected keyword argument")
+            return (
+                None,
+                [SimpleNamespace(id="77", status=SimpleNamespace(name="PAID"))],
+                "ru",
+                {},
+            )
+
+    monkeypatch.setattr(
+        plugin, "_cardinal", SimpleNamespace(account=OldAccount())
+    )
+
+    orders = asyncio.run(plugin._api_paid_orders())
+    assert [order.id for order in orders] == ["77"]
+    assert len(calls) >= 2
+
+
+def test_api_paid_orders_reports_missing_method(monkeypatch):
+    monkeypatch.setattr(plugin, "_cardinal", SimpleNamespace(account=SimpleNamespace()))
+    with pytest.raises(RuntimeError):
+        asyncio.run(plugin._api_paid_orders())
+
+
+def test_poll_reports_api_failure_to_owner(monkeypatch):
+    notified = []
+
+    async def broken():
+        raise RuntimeError("нет доступа")
+
+    async def fake_notify(text, **_kwargs):
+        notified.append(text)
+
+    monkeypatch.setattr(plugin, "_api_paid_orders", broken)
+    monkeypatch.setattr(plugin, "_notify_owner", fake_notify)
+    monkeypatch.setattr(plugin, "_poll_error", None, raising=False)
+    monkeypatch.setattr(plugin, "_poll_error_at", None, raising=False)
+
+    asyncio.run(plugin._poll_paid_orders())
+
+    assert notified and "Не удалось получить заказы" in notified[0]
+
+
+def test_diag_screen_marks_orders_missing_from_database(monkeypatch):
+    bot = _screen_bot(monkeypatch)
+    monkeypatch.setattr(
+        plugin,
+        "_api_paid_orders",
+        lambda: _async_value(
+            [
+                SimpleNamespace(
+                    id="501",
+                    status=SimpleNamespace(name="PAID"),
+                    description="Spotify Premium 30",
+                ),
+                SimpleNamespace(
+                    id="502",
+                    status=SimpleNamespace(name="PAID"),
+                    description="Spotify Premium 90",
+                ),
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        plugin,
+        "_recent_orders",
+        lambda _limit=50: _async_value([{"order_id": "501"}]),
+    )
+
+    plugin._show_diag(1)
+
+    _, text, callbacks = bot.sent[0]
+    assert "оплаченных: <b>2</b>" in text
+    assert "✅" in text and "⬜" in text
+    assert "sps:pol" in callbacks
