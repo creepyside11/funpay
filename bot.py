@@ -107,6 +107,7 @@ AUTO_SMM_PLUGIN_UUID = "6a76248a-f44d-4fc3-98d5-d40c0a2663b7"
 AI_ASSISTANT_PLUGIN_UUID = "1d8870db-4d2c-4e8a-9d5f-884cbfa13fe1"
 EMERALD_PROMO_PLUGIN_UUID = "9ee0d7d1-2cef-45c5-b1ac-67c4c1f3ef8a"
 AI_MARKET_RADAR_PLUGIN_UUID = "7736a016-3e1e-4d97-8750-821c652fed76"
+SPOTIFY_ACCOUNT_SHOP_PLUGIN_UUID = "9d378672-7534-41b2-ab16-87057c697f37"
 PLUGIN_SETTINGS_CALLBACK_PREFIX = "47"
 PLUGIN_TELETHON_DISCONNECT_ASK_PREFIX = "pt_disc_ask:"
 PLUGIN_TELETHON_DISCONNECT_DO_PREFIX = "pt_disc_do:"
@@ -223,6 +224,20 @@ READY_PLUGINS = (
         "слова, ценовые рамки и автовыдачу с помощью ИИ. В фоновом режиме парсит сайт FunPay "
         "и мгновенно присылает уведомления со ссылкой на покупку при появлении нужных лотов.",
         source_file="AIMarketRadar.py",
+        builtin_settings=False,
+    ),
+    ReadyPluginSpec(
+        SPOTIFY_ACCOUNT_SHOP_PLUGIN_UUID,
+        "SpotifyAccountShop.py",
+        "Spotify Account Shop",
+        "1.0.0",
+        "Склад Spotify-аккаунтов с автовыдачей по привязанным лотам",
+        "Принимает товар в формате почта:пароль или почта:пароль:ключ активации, "
+        "хранит позиции со сроком подписки и привязкой одного или нескольких лотов. "
+        "При оплате лота атомарно выдаёт аккаунт со склада, а через заданное время "
+        "(по умолчанию час) пишет покупателю и просит подтвердить заказ и оставить "
+        "отзыв. Умеет возвращать аккаунт на склад при возврате средств.",
+        source_file="SpotifyAccountShop.py",
         builtin_settings=False,
     ),
 )
